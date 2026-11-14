@@ -13,12 +13,9 @@
 // .STRIDE_IN_VPC); varmask, the FS's varying locations without the position's, is the complement of VPC_VAR_DISABLE;
 // cnt is SP_VS_PRIMITIVE_CNTL.OUT.
 //
-// Where this port is stricter than Mesa: ir3_link_shaders gives an FS varying that no VS output serves the register
-// regid(63, 0) (default_regid with pack_vs_out) and the FS then reads zeros through it -- a quiet black. Here that is
-// refused by slot, so that a vertex function and a fragment function whose varyings do not match are told apart from
-// a draw that happened. The COL/BFC fallback of ir3_find_output (ir3_shader.h:1197-1215, GL's two-sided colour) is
-// not ported: hakios's front end assigns VARYING_SLOT_VAR0 + n to every Metal varying and never COL0/BFC0
-// (air_to_nir.c translate_output / translate_input), so the fallback could never fire on a Stage from it.
+// Missing vertex outputs use VPC INTERP_ZERO, avoiding stale varying memory and
+// a pipeline-creation failure that CoreAnimation treats as a fatal server error.
+// As in Mesa, no vertex register is allocated for a missing output.
 #include "hakios-metal/render.hpp"
 
 #include "hakios-metal/a6xx.hpp"
@@ -30,7 +27,6 @@ namespace {
 // gl_varying_slot numbers the Stage tables use (Mesa src/compiler/shader_enums.h:320, 359): POS is 0 and the generic
 // varyings start at 32, VARn = 32 + n; the slots between are GL's fixed-function ones, which the front end never emits
 constexpr uint8_t kVaryingSlotPos = 0;
-constexpr uint8_t kVaryingSlotVar0 = 32;
 constexpr uint8_t kVaryingSlotPsiz = 12;   // gl_varying_slot's VARYING_SLOT_PSIZ: a VS's [[point_size]]
 constexpr uint8_t kVaryingSlotPntc = 25;   // [[point_coord]] (compiler.cpp lowers it to this input), filled by the VPC
 
@@ -42,12 +38,6 @@ constexpr uint32_t kInterpOne = 3;
 // VPC_VARYING_PS_REPL_MODE's: the point sprite's S and T (a6xx.xml.h enum a6xx_varying_ps_repl_mode)
 constexpr uint32_t kPsReplS = 1;
 constexpr uint32_t kPsReplT = 2;
-
-std::string slotName(uint8_t slot) {
-    if (slot == kVaryingSlotPos) return "POS";
-    if (slot >= kVaryingSlotVar0) return "VAR" + std::to_string(slot - kVaryingSlotVar0);
-    return "slot " + std::to_string(slot);
-}
 
 // util_last_bit over a compmask: how many components the mask spans, counting from .x
 uint32_t lastBit(uint32_t mask) {
@@ -122,8 +112,12 @@ bool link(const Stage& vs, const Stage& fs, Linkage* out, std::string* why) {
         }
         int k = findOutput(vs, in.slot);
         if (k < 0) {
-            return refuse(why, "the fragment stage reads varying slot " + std::to_string(in.slot) + " (" + slotName(in.slot) +
-                                   "), which the vertex stage does not write");
+            if (!linkAdd(l, in.slot, a6xx::kRegidNone, in.compmask, in.inloc)) return false;
+            for (uint32_t c = 0; c < lastBit(in.compmask); ++c) {
+                const uint32_t loc = in.inloc + c;
+                l.interpMode[loc / 16] |= kInterpZero << ((loc % 16) * 2);
+            }
+            continue;
         }
         if (!linkAdd(l, in.slot, vs.outputs[k].regid, in.compmask, in.inloc)) {
             return refuse(why, "the link holds " + std::to_string(kMaxStageOutputs) + " entries and the fragment stage reads more varyings than that");

@@ -206,8 +206,8 @@ TEST(link_tri_color_puts_the_varying_first_and_the_position_at_4) {
     CHECK_EQ(l.cnt, 1u);
 }
 
-// an unused varying is fine (the VS writes VAR0, the FS reads nothing); a varying the VS does not write is not
-TEST(link_refuses_a_varying_the_vertex_stage_does_not_write) {
+// an unused varying is fine (the VS writes VAR0, the FS reads nothing); a varying the VS does not write reads zero
+TEST(link_zeros_a_varying_the_vertex_stage_does_not_write) {
     Linkage l{};
     std::string why;
     CHECK(render::link(kernels::tri_color_vs_air, kernels::tri_flat_fs_air, &l, &why));
@@ -215,14 +215,14 @@ TEST(link_refuses_a_varying_the_vertex_stage_does_not_write) {
     CHECK_EQ(l.maxLoc, 4u);
     CHECK(sameVar(l.var[0], kSlotPos, uint8_t(regid(3, 1)), 0xf, 0));
     // the fixtures crossed the other way
-    CHECK(!render::link(kernels::tri_flat_vs_air, kernels::tri_color_fs_air, &l, &why));
-    expectRefusal(why, "the fragment stage reads varying slot 32 (VAR0), which the vertex stage does not write");
+    CHECK(render::link(kernels::tri_flat_vs_air, kernels::tri_color_fs_air, &l, &why));
+    CHECK_EQ(l.interpMode[0] & 0xff, 0xaau);
     // built by hand: the FS wants VAR1, the VS writes VAR0
     Stage fs = kernels::tri_color_fs_air;
     fs.inputs[0].slot = kSlotVar1;
-    CHECK(!render::link(kernels::tri_color_vs_air, fs, &l, &why));
-    expectRefusal(why, "the fragment stage reads varying slot 33 (VAR1), which the vertex stage does not write");
-    // and the VS renamed to serve it links again: the refusal was about the slot and nothing else
+    CHECK(render::link(kernels::tri_color_vs_air, fs, &l, &why));
+    CHECK_EQ(l.interpMode[0] & 0xff, 0xaau);
+    // and the VS renamed to serve it links again: the matching slot is linked to its register
     Stage vs = kernels::tri_color_vs_air;
     vs.outputs[1].slot = kSlotVar1;
     CHECK(render::link(vs, fs, &l, &why));

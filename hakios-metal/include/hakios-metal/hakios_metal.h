@@ -27,6 +27,29 @@ typedef struct hakios_metal_kernel hakios_metal_kernel;
 typedef struct hakios_metal_queue hakios_metal_queue;
 typedef struct hakios_metal_cb hakios_metal_cb;
 
+/* Compiled graphics stages since the last call, across this process's threads.
+ * Hits include the second lookup after waiting for another compiler. Times are wall time;
+ * compile time excludes the lock wait, lookup and disk write. No compiler lock is taken. */
+typedef struct hakios_metal_stage_cache_stats {
+	uint64_t hits, seed_hits, misses, failures, writes, write_failures;
+	uint64_t lookup_ns, wait_ns, compile_ns, compile_max_ns;
+	/* All Mesa users, including compute/layout: foreground wait sum; depth excludes
+	 * the active turn. Prewarm hits are independent copies served from process RAM. */
+	uint64_t foreground_wait_ns, queue_depth, queue_peak;
+	uint64_t prewarm_hits, prewarm_loaded, prewarm_compiles, prewarm_failures, warm_write_failures;
+	/* Recipes (the prewarm lane's inputs, /var/db/hakios-metal-cache/warm-*): files written, and writes skipped
+	 * because the file was already there (its name is the hash of its bytes) and nothing had to be written. */
+	uint64_t warm_writes, warm_write_skips;
+} hakios_metal_stage_cache_stats;
+void hakios_metal_stage_cache_take_stats(hakios_metal_stage_cache_stats *out);
+const char *hakios_metal_stage_cache_build(void);
+/* Per-thread compiler priority. Restore the returned previous value after background work. */
+bool hakios_metal_compiler_set_background(bool background);
+/* Opt-in: HAKIOS_METAL_CACHE/prewarm-on. Configure at device creation, then replay
+ * this executable's recorded stage inputs on a background queue. No GPU access. */
+bool hakios_metal_stage_cache_set_process(const char *executable);
+void hakios_metal_stage_cache_prewarm(void);
+
 enum hakios_metal_status {
 	HAKIOS_METAL_NOT_ENQUEUED = 0,  /* as MTLCommandBufferStatus numbers them */
 	HAKIOS_METAL_ENQUEUED = 1,
@@ -70,7 +93,7 @@ bool hakios_metal_chip_known(uint32_t chip);
 /* (for the tests: a device on the fake GPU, which runs the packets in this process) */
 hakios_metal_device *hakios_metal_open_fake(void);
 void hakios_metal_close(hakios_metal_device *device);
-/* the chip id (0x06030500 on the phone: the kernel's GPU_ID is 0, the chip id is what names the GPU) */
+/* the chip id (0x06050002 on the phone: the kernel's GPU_ID is 0, the chip id is what names the GPU) */
 uint64_t hakios_metal_gpu_id(hakios_metal_device *device);
 /* whether kernels can be compiled in this build (MESA=1); without it hakios_metal_kernel_compile* refuse by name */
 int hakios_metal_has_compiler(void);
@@ -103,6 +126,9 @@ typedef struct hakios_metal_constant {
 } hakios_metal_constant;
 hakios_metal_kernel *hakios_metal_kernel_compile_bitcode_constants(const void *bitcode, size_t size,
     const hakios_metal_constant *constants, unsigned count);
+/* The function constants one AIR module declares: their indices, at most MAX of them into INDICES (which may be NULL
+ * with MAX 0); the number declared is returned. 0 for a module that declares none, or without the compiler. */
+unsigned hakios_metal_bitcode_function_constants(const void *bitcode, size_t size, unsigned *indices, unsigned max);
 void hakios_metal_kernel_free(hakios_metal_kernel *kernel);
 const char *hakios_metal_kernel_name(hakios_metal_kernel *kernel);
 /* the argument buffer at [[buffer(SET)]] of the function in BITCODE, as MTLFunction's -newArgumentEncoderWithBufferIndex:
@@ -156,6 +182,11 @@ hakios_metal_texture *hakios_metal_texture_new_iosurface(hakios_metal_device *de
  * CHROMA_ROW_BYTES its rows; both planes are sampled as one texture. */
 hakios_metal_texture *hakios_metal_texture_new_iosurface2(hakios_metal_device *device, unsigned surface_id, unsigned plane,
     unsigned pixel_format, unsigned width, unsigned height, unsigned usage, uint64_t chroma_offset, unsigned chroma_row_bytes);
+/* One raw plane of 420f/420v, from IOSurface's plane getters. R8 luma, RG8 chroma, or wider packed texels whose
+ * bytes fit the plane's logical row. No colour conversion. OFFSET is relative to the surface allocation. */
+hakios_metal_texture *hakios_metal_texture_new_iosurface_plane(hakios_metal_device *device, unsigned surface_id, unsigned plane,
+    unsigned pixel_format, unsigned width, unsigned height, unsigned usage, uint64_t offset, unsigned row_bytes,
+    unsigned plane_width, unsigned plane_height);
 /* -[MTLBuffer newTextureWithDescriptor:offset:bytesPerRow:]: a texture over BUFFER's bytes from OFFSET, BYTES_PER_ROW apart
  * (the same memory). NULL with the reason: a pitch or start that is not a multiple of 64 bytes, rows past the buffer, a
  * format, type or level count a buffer does not take. */
@@ -228,6 +259,9 @@ int hakios_metal_texture_replace(hakios_metal_texture *texture, unsigned x, unsi
 /* -getBytes:bytesPerRow:fromRegion:mipmapLevel:, the other way */
 int hakios_metal_texture_read(hakios_metal_texture *texture, unsigned x, unsigned y, unsigned w, unsigned h,
     void *bytes, uint64_t bytes_per_row);
+/* Resource completion covers every committed use of the backing, including views and IOSurface imports. */
+int hakios_metal_texture_is_complete(hakios_metal_texture *texture);
+int hakios_metal_texture_sync(hakios_metal_texture *texture);
 /* the two of mip level LEVEL (the region inside that level's size) */
 int hakios_metal_texture_replace_level(hakios_metal_texture *texture, unsigned level, unsigned x, unsigned y, unsigned w,
     unsigned h, const void *bytes, uint64_t bytes_per_row);
@@ -277,20 +311,44 @@ hakios_metal_program *hakios_metal_program_new_bitcode(const void *vs_bitcode, s
 /* ...each function specialised by its own constants, as each MTLFunction of a pipeline carries its own. FS_BITCODE
  * NULL (or FS_SIZE 0) is a pipeline with no fragment function: a built-in one that writes nothing is drawn, so only
  * depth and stencil come out (a depth-only pass's pipeline). */
+/* Compile an exact fragment configuration from its original generic AIR. */
+hakios_metal_program *hakios_metal_program_new_bitcode_config(const void *vs, size_t vs_size,
+    const void *fs, size_t fs_size, const void *config, size_t config_size, unsigned color_format);
+
 hakios_metal_program *hakios_metal_program_new_bitcode_constants(const void *vs_bitcode, size_t vs_size,
     const hakios_metal_constant *vs_constants, unsigned vs_count, const void *fs_bitcode, size_t fs_size,
     const hakios_metal_constant *fs_constants, unsigned fs_count, unsigned color_pixel_format);
+/* The same, compiled for the raster sample count: MSAA framebuffer fetch reads the
+ * current sample with per-sample execution. Set_samples alone does not recompile AIR. */
+hakios_metal_program *hakios_metal_program_new_bitcode_samples(const void *vs_bitcode, size_t vs_size,
+    const hakios_metal_constant *vs_constants, unsigned vs_count, const void *fs_bitcode, size_t fs_size,
+    const hakios_metal_constant *fs_constants, unsigned fs_count, unsigned color_pixel_format, unsigned samples);
+bool hakios_metal_program_framebuffer_fetch(hakios_metal_program *program);
 /* BASE again with its fragment stage (FS_BITCODE and FS_CONSTANTS, as BASE was made) compiled for the LENGTH BYTES its
  * constant buffer at [[buffer(BINDING)]] holds (compileStage's KnownBuffer): the branches those bytes decide are decided
  * at compile time. Draws whose buffer holds exactly these bytes may use it in BASE's place; BASE's blending, vertex
  * descriptor and sample count come with it. NULL with the reason. */
 hakios_metal_program *hakios_metal_program_specialize(hakios_metal_program *base, const void *fs_bitcode, size_t fs_size,
-    const hakios_metal_constant *fs_constants, unsigned fs_count, unsigned binding, const void *bytes, size_t length);
+    const hakios_metal_constant *fs_constants, unsigned fs_count, unsigned binding, const void *bytes, const uint8_t *mask, size_t length);
+/* The same, only when the stage is in the compiled-stage cache: never compiles and never waits for the compiler, so a
+ * draw may ask it before it hands the compile to another thread. NULL ("not in the cache") otherwise. */
+hakios_metal_program *hakios_metal_program_specialize_cached(hakios_metal_program *base, const void *fs_bitcode, size_t fs_size,
+    const hakios_metal_constant *fs_constants, unsigned fs_count, unsigned binding, const void *bytes, const uint8_t *mask, size_t length);
+/* MASK[0..LENGTH) for the constant buffer at [[buffer(BINDING)]] of STAGE (0 vertex, 1 fragment): 0xff for each byte
+ * the stage may load, 0 for one it never does. hakios_metal_program_specialize folds only the bytes MASK keeps, and a
+ * specialisation is filed under those alone: two contents that differ only where the stage never reads (a struct's
+ * padding) are one specialisation. */
+void hakios_metal_program_constant_reads(hakios_metal_program *program, unsigned stage, unsigned binding, uint8_t *mask, size_t length);
 /* STAGE 0 = vertex, 1 = fragment: how many instruction words that stage compiled to */
 unsigned hakios_metal_program_stage_words(hakios_metal_program *program, unsigned stage);
 void hakios_metal_program_free(hakios_metal_program *program);
 /* the buffers made from the kernel and those taken again from a queue's pool since the last call, and the bytes made */
 void hakios_metal_buffer_counts(unsigned *made, unsigned *reused, unsigned long long *bytes);
+/* of those made, the ones for attachments (multisample, depth or stencil textures: Metal's memoryless ones among them), since the last call */
+void hakios_metal_attachment_counts(unsigned *made, unsigned long long *bytes);
+/* since the last call: the longest command stream submitted, in words, and how many were cut into pieces for being
+ * longer than one CP_INDIRECT_BUFFER runs (pm4::kMaxIbWords) */
+void hakios_metal_stream_counts(unsigned *longest, unsigned *cut);
 const char *hakios_metal_program_name(hakios_metal_program *program);   /* "vs+fs" */
 /* STAGE 0 = vertex, 1 = fragment: the resources that stage binds, as hakios_metal_kernel_resource reports a kernel's */
 unsigned hakios_metal_program_resource_count(hakios_metal_program *program, unsigned stage);
@@ -318,7 +376,10 @@ int hakios_metal_program_set_samples(hakios_metal_program *program, unsigned sam
 int hakios_metal_program_set_blend_at(hakios_metal_program *program, unsigned index, int enabled, unsigned rgb_op, unsigned alpha_op,
     unsigned src_rgb, unsigned dst_rgb, unsigned src_alpha, unsigned dst_alpha, unsigned write_mask);
 
-struct hakios_metal_viewport { double x, y, width, height, znear, zfar; };   /* MTLViewport: origin top left, NDC y up */
+#define HAKIOS_METAL_GL_DEPTH          1u
+#define HAKIOS_METAL_GL_NO_XFORM       4u
+#define HAKIOS_METAL_GL_PROVOKING_LAST 8u
+struct hakios_metal_viewport { double x, y, width, height, znear, zfar; };   /* MTLViewport: origin top left, NDC y up; a negative height turns it over */
 struct hakios_metal_scissor { unsigned x, y, width, height; };              /* MTLScissorRect */
 
 /* MTLRenderPassDescriptor's colour attachment 0, as the plug-in reads it */
@@ -376,6 +437,14 @@ struct hakios_metal_render_pass {
 	unsigned color0_slice;                    /* color0's layer, face or plane drawn into (MTLRenderPassAttachmentDescriptor.slice) */
 	unsigned depth_level;                     /* the depth attachment's mip level drawn into */
 	unsigned depth_slice;                     /* a depth 2D array's layer drawn into (MTLRenderPassDepthAttachmentDescriptor.slice) */
+	/* OpenGL ES through Metal (AppleMetalGLRenderer), each draw reads it; 0 is Metal. HAKIOS_METAL_GL_DEPTH: the clip volume
+	 * is GL's, z from -w to w (the pass's private openGLModeEnabled: GRAS_CL_CNTL without ZERO_GB_SCALE_Z; the viewport's
+	 * depth words stay Metal's, since the renderer hands znear = GL's z offset, zfar - znear its scale); HAKIOS_METAL_GL_NO_XFORM:
+	 * the position is already a window coordinate in pixels (-setViewportTransformEnabled:NO, the renderer's own blits:
+	 * turnip's r3d CLIP_DISABLE | VP_XFORM_DISABLE | PERSP_DIVISION_DISABLE); HAKIOS_METAL_GL_PROVOKING_LAST: flat varyings
+	 * from a primitive's last vertex (-setProvokingVertexMode:1, GL's rule: PC_PRIMITIVE_CNTL_0.PROVOKING_VTX_LAST). GL's y
+	 * is not here: the renderer turns GL's framebuffer over itself, with a viewport of negative height, which the draws take. */
+	unsigned gl_mode;
 };
 
 /* One draw: PROGRAM over VERTEX_COUNT vertices from VERTEX_START, PRIMITIVE an MTLPrimitiveType (Point 0, Line 1,
@@ -437,8 +506,9 @@ int hakios_metal_cb_clear(hakios_metal_cb *cb, const struct hakios_metal_render_
 hakios_metal_queue *hakios_metal_queue_new(hakios_metal_device *device);
 void hakios_metal_queue_free(hakios_metal_queue *queue);
 /* Deferred recording, off by default: with ON, what each command buffer of this queue is told to record (draws, clears,
- * the state the draws read, the commit) is done by a thread of the queue's own, in the order it was told, and the call
- * returns at once -- a draw's encoding then runs beside the caller's next work. A refused draw or clear is reported
+ * the state the draws read) is done by a thread of the queue's own, in the order it was told, and the recording call
+ * returns at once -- a draw's encoding then runs beside the caller's next work. Commit drains submission synchronously
+ * so that the real IOSurface fence is published before it returns. A refused draw or clear is reported
  * there (stderr) and fails its command buffer, as hakios_metal_cb_refuse would; the call itself returns 0. Copies,
  * fills, blits, dispatches and anything asked back wait for what was told before them. Set it with no command buffer
  * of the queue being recorded. */
@@ -466,6 +536,10 @@ int hakios_metal_cb_blit_rotated(hakios_metal_cb *cb, hakios_metal_texture *from
  * wrong in it. hakios_metal_cb_refuse is the caller's own refusal of a piece of work, by the same rule; it returns -1,
  * and hakios_metal_cb_skipped how many were left out and the last reason. */
 void hakios_metal_cb_skip_refused(hakios_metal_cb *cb, int on);
+/* CB takes PARENT's switches as its own (CommandBuffer::inheritSettings): gmem, pass-wfi, profile, skip-refused and
+ * GMEM's refinements -- what a parallel render encoder's sub-encoders are given, so that metal_gmem=0's sysmem reaches
+ * the passes recorded there (a new command buffer is GMEM-eligible by default). Before anything is recorded on CB. */
+void hakios_metal_cb_inherit_settings(hakios_metal_cb *cb, const hakios_metal_cb *parent);
 /* CB's passes timed by the GPU's own counter (CommandBuffer::setProfile, before anything is recorded) and, once it has
  * completed, pass I's kind (0 draw, 1 copy, 2 clear, 3 dispatch), target size, draws and microseconds; the count of
  * passes timed is returned, -1 for an I past them (any pointer may be NULL) */
@@ -473,6 +547,14 @@ void hakios_metal_cb_set_profile(hakios_metal_cb *cb, int on);
 int hakios_metal_cb_pass_time(hakios_metal_cb *cb, unsigned i, unsigned *kind, unsigned *width, unsigned *height, unsigned *draws, double *us);
 /* what CB holds so far (CommandBuffer::counts): passes opened, draws, dispatches, copies and clears; any pointer NULL */
 void hakios_metal_cb_counts(hakios_metal_cb *cb, unsigned *passes, unsigned *draws, unsigned *dispatches, unsigned *copies, unsigned *clears);
+/* every pass with its own full tail and batch start, each a wait for idle (ON: as before 9 November, boot-arg
+ * metal_pass_wfi=1), or draw passes chained with only the barriers their hazards need (0, the default:
+ * CommandBuffer::setPassWfi); before CB's first draw */
+void hakios_metal_cb_set_pass_wfi(hakios_metal_cb *cb, int on);
+/* what CB's passes cost in synchronization so far (CommandBuffer::Counts): full tails written, barriers inside a pass,
+ * waits for idle before a pass that writes what an earlier one sampled, passes opened without the batch start; any
+ * pointer NULL */
+void hakios_metal_cb_sync_counts(hakios_metal_cb *cb, unsigned *flushes, unsigned *barriers, unsigned *waits, unsigned *chained);
 /* tiled rendering (render::Options::gmem) for CB's passes from now on, on by default; and of what CB holds, the passes
  * drawn in GMEM and their tiles, and pass I's tiles as profiled (0: in sysmem, -1 past them) */
 void hakios_metal_cb_set_gmem(hakios_metal_cb *cb, int on);
@@ -484,6 +566,9 @@ void hakios_metal_cb_set_gmem_tuned(hakios_metal_cb *cb, int on);
 void hakios_metal_cb_set_gmem_min_draws(hakios_metal_cb *cb, unsigned draws);
 /* CB's GMEM passes binned by the hardware first, each tile drawing only the draws that reach it (CommandBuffer::setGmemBinning) */
 void hakios_metal_cb_set_gmem_binning(hakios_metal_cb *cb, int on);
+/* a multisample pass, and one with depth or stencil, tiled too where it can be: its multisample attachments and its depth
+ * and stencil cleared in the tile and never stored, each resolve done from the tile (CommandBuffer::setGmemMsaaZs) */
+void hakios_metal_cb_set_gmem_msaa_zs(hakios_metal_cb *cb, int on);
 /* every fragment texture of CB's draws the null texture (CommandBuffer::setNullFsTextures): for measuring only */
 void hakios_metal_cb_set_null_fs_textures(hakios_metal_cb *cb, int on);
 /* each draw of CB's sysmem passes timed alone (CommandBuffer::setProfileDraws, before anything is recorded) and, once it
@@ -540,6 +625,27 @@ void hakios_metal_cb_set_threadgroup_length(hakios_metal_cb *cb, unsigned length
 void hakios_metal_cb_fail(hakios_metal_cb *cb, const char *why);
 /* CALLBACK(CB, CONTEXT) runs once, after completion or error, on the queue's thread; may be NULL */
 void hakios_metal_cb_commit(hakios_metal_cb *cb, void (*callback)(hakios_metal_cb *cb, void *context), void *context);
+/* Synchronous submission barrier for serially recorded CBs of QUEUE, in array order. All entries must be unique,
+ * uncommitted CBs of this queue. Recording is drained once, then all CBs enter the existing bounded submit merger.
+ * Every successful submission's real IOSurface fence is published before return; callbacks retire in array order.
+ * Entries and context pointer values are copied; callback may free its CB. No GPU completion wait. COUNT may be zero. */
+struct hakios_metal_commit {
+    hakios_metal_cb *cb;
+    void (*callback)(hakios_metal_cb *cb, void *context);
+    void *context;
+};
+void hakios_metal_queue_commit_batch(hakios_metal_queue *queue, const struct hakios_metal_commit *commits, unsigned count);
+/* Dependency-driven staging. SCHEDULED runs on the queue worker after a real submit, before completion.
+ * REASONS has COUNT values; IDLE allows deferral. IOSurface writes always force SURFACE.
+ * Callers must arrange an idle drain on their runloop/submission worker. */
+enum hakios_metal_drain_reason { HAKIOS_METAL_DRAIN_SURFACE, HAKIOS_METAL_DRAIN_CPU_SYNC,
+    HAKIOS_METAL_DRAIN_CROSS_QUEUE, HAKIOS_METAL_DRAIN_LIMIT, HAKIOS_METAL_DRAIN_IDLE };
+void hakios_metal_queue_stage_batch(hakios_metal_queue *queue, const struct hakios_metal_commit *commits, unsigned count,
+    void (*scheduled)(hakios_metal_cb *, void *), const unsigned *reasons);
+void hakios_metal_queue_drain(hakios_metal_queue *queue, unsigned reason);
+void hakios_metal_drain_all(unsigned reason);
+int hakios_metal_buffer_sync(hakios_metal_buffer *buffer);
+int hakios_metal_surface_sync(unsigned surface);
 void hakios_metal_cb_wait(hakios_metal_cb *cb);
 enum hakios_metal_status hakios_metal_cb_status(hakios_metal_cb *cb);
 /* why it ended in HAKIOS_METAL_ERROR, or "" */

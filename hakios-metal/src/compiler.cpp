@@ -1,10 +1,24 @@
 #include "hakios-metal/compiler.hpp"
+#include "hakios-metal/compiler_queue.hpp"
+#include "hakios-metal/hakios_metal.h"
 
 #include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cerrno>
+#include <condition_variable>
+#include <deque>
+#include <thread>
+#include <utility>
+#include <unistd.h>
+#include <sys/stat.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <unordered_map>
+#include <unordered_set>
+#include <dirent.h>
 
 #ifdef HAKIOS_METAL_MESA
 // Mesa's headers carry their own C++ guards (and templates behind them: no extern "C" around these) and are not clean
@@ -19,7 +33,92 @@
 #include "hakios-metal/a6xx.hpp"
 #endif
 
+namespace {
+thread_local bool gBackgroundCompile = false;
+hakios::metal::CompilerQueue gCompilerQueue;
+struct CompilerTurn {
+    CompilerTurn() { gCompilerQueue.lock(gBackgroundCompile); }
+    ~CompilerTurn() { gCompilerQueue.unlock(); }
+};
+std::mutex gStageStatsLock;
+hakios_metal_stage_cache_stats gStageStats{};
+// Recipes (the prewarm lane's inputs) written, skipped and failed, from the render thread and from the writer thread:
+// atomics, not gStageStats under its lock, because the writer may still be finishing one while the process leaves and
+// a global's destructor must not be running under it. take_stats moves them into the window.
+std::atomic<uint64_t> gRecipeWrites{0}, gRecipeSkips{0}, gRecipeFailures{0};
+enum RecipeWrite { kRecipeWritten, kRecipeSkipped, kRecipeFailed };
+void recipeWriteStat(RecipeWrite what) {
+    if (what == kRecipeWritten) gRecipeWrites.fetch_add(1, std::memory_order_relaxed);
+    else if (what == kRecipeSkipped) gRecipeSkips.fetch_add(1, std::memory_order_relaxed);
+    else gRecipeFailures.fetch_add(1, std::memory_order_relaxed);
+}
+#ifdef HAKIOS_METAL_MESA
+using CacheClock = std::chrono::steady_clock;
+uint64_t cacheNanos(CacheClock::time_point start) {
+    return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(CacheClock::now() - start).count());
+}
+struct StageCacheMeasure {
+    hakios_metal_stage_cache_stats stats{};
+    ~StageCacheMeasure() {
+        std::lock_guard<std::mutex> lock(gStageStatsLock);
+        gStageStats.hits += stats.hits;
+        gStageStats.seed_hits += stats.seed_hits;
+        gStageStats.misses += stats.misses;
+        gStageStats.failures += stats.failures;
+        gStageStats.writes += stats.writes;
+        gStageStats.write_failures += stats.write_failures;
+        gStageStats.prewarm_hits += stats.prewarm_hits;
+        gStageStats.prewarm_loaded += stats.prewarm_loaded;
+        gStageStats.prewarm_compiles += stats.prewarm_compiles;
+        gStageStats.prewarm_failures += stats.prewarm_failures;
+        gStageStats.warm_write_failures += stats.warm_write_failures;
+        gStageStats.lookup_ns += stats.lookup_ns;
+        gStageStats.wait_ns += stats.wait_ns;
+        gStageStats.compile_ns += stats.compile_ns;
+        gStageStats.compile_max_ns = std::max(gStageStats.compile_max_ns, stats.compile_max_ns);
+    }
+};
+#endif
+}
+
+void hakios_metal_stage_cache_take_stats(hakios_metal_stage_cache_stats* out) {
+    std::lock_guard<std::mutex> lock(gStageStatsLock);
+    *out = gStageStats;
+    gStageStats = {};
+    out->warm_writes += gRecipeWrites.exchange(0, std::memory_order_relaxed);
+    out->warm_write_skips += gRecipeSkips.exchange(0, std::memory_order_relaxed);
+    out->warm_write_failures += gRecipeFailures.exchange(0, std::memory_order_relaxed);
+    const auto queue = gCompilerQueue.takeStats();
+    out->foreground_wait_ns = queue.foregroundWaitNs;
+    out->queue_depth = queue.depth;
+    out->queue_peak = queue.peak;
+}
+
+bool hakios_metal_compiler_set_background(bool background) {
+    const bool previous = gBackgroundCompile;
+    gBackgroundCompile = background;
+    return previous;
+}
+
+const char* hakios_metal_stage_cache_build(void) {
+#ifdef HAKIOS_METAL_CACHE_BUILD
+    return HAKIOS_METAL_CACHE_BUILD;
+#else
+    return __DATE__ " " __TIME__;
+#endif
+}
+
 namespace hakios::metal {
+
+void constantReadMask(const CompiledStage& stage, uint32_t binding, uint8_t* mask, size_t length) {
+    memset(mask, 0, length);
+    for (const CompiledStage::ConstantReads& r : stage.constantReads) {
+        if (r.binding != binding && r.binding != ~0u) continue;
+        for (size_t i = 0; i < length; i++) {
+            if (r.any || (i < r.bytes.size() && r.bytes[i])) mask[i] = 0xff;
+        }
+    }
+}
 
 #ifndef HAKIOS_METAL_MESA
 
@@ -30,7 +129,7 @@ std::unique_ptr<CompiledKernel> compileAir(const void*, size_t, std::string* why
     return nullptr;
 }
 
-std::unique_ptr<CompiledStage> compileStage(const void*, size_t, std::string* why, const FunctionConstants&, uint32_t, const KnownBuffer*) {
+std::unique_ptr<CompiledStage> compileStage(const void*, size_t, std::string* why, const FunctionConstants&, uint32_t, const KnownBuffer*, bool, uint32_t) {
     *why = "no compiler in this build: it is linked in with MESA_BUILD= (tools/compiler.mk), and was not";
     return nullptr;
 }
@@ -45,13 +144,16 @@ bool argumentBufferLayout(const void*, size_t, uint32_t, std::vector<std::pair<u
     return false;
 }
 
+std::vector<uint32_t> functionConstantIndices(const void*, size_t) { return {}; }
+
 #else
 
 namespace {
 
-std::mutex gCompilerLock;   // ir3 keeps state in the compiler object; one compilation at a time
+// ir3_compiler::shader_count and has_preamble are mutable shared state.
+// All AIR/NIR/ir3 users take a priority turn; cached stages do not enter Mesa.
 
-// one compiler for the chip, as the kernel names it: Mesa's table resolves 0x06030500 to the Adreno 7c+ Gen 3 row
+// one compiler for the chip, as the kernel names it: Mesa's table resolves 0x06050002 to the Adreno 650 row
 ir3_compiler* theCompiler() {
     static ir3_compiler* compiler = [] {
         fd_dev_id id{};
@@ -232,6 +334,7 @@ struct Translation {
     ir3_shader* shader = nullptr;         // the hand-built shader; its variant hangs off it
     ir3_shader_variant* v = nullptr;
     uint32_t* bin = nullptr;              // the assembled binary (ralloc'd under the variant)
+    uint32_t framebufferSamples = 1;
     uint8_t fbTargets[kMaxTextureSlots] = {};   // lowerFbRead's slots: n + 1 where colour attachment n is read
     Translation() = default;
     Translation(const Translation&) = delete;
@@ -253,6 +356,9 @@ bool foldKnownLoad(nir_builder* b, nir_intrinsic_instr* intr, void* data) {
     const unsigned bits = intr->def.bit_size, comps = intr->def.num_components;
     const uint64_t at = nir_src_as_uint(intr->src[1]);
     if (bits % 8 != 0 || at + uint64_t(comps) * (bits / 8) > known->bytes.size()) return false;
+    for (uint64_t i = at; !known->mask.empty() && i < at + uint64_t(comps) * (bits / 8); i++) {
+        if (known->mask[i] == 0) return false;
+    }
     nir_const_value values[NIR_MAX_VEC_COMPONENTS];
     for (unsigned c = 0; c < comps; c++) {
         uint64_t v = 0;
@@ -262,6 +368,146 @@ bool foldKnownLoad(nir_builder* b, nir_intrinsic_instr* intr, void* data) {
     b->cursor = nir_before_instr(&intr->instr);
     nir_def_replace(&intr->def, nir_build_imm(b, comps, bits, values));
     return true;
+}
+
+// CompiledStage::constantReads of NIR as translate leaves it: every load_ubo's bytes (past the first 256, or not at a
+// constant offset, or not a whole number of bytes: any byte of that buffer; of a buffer not constant: any buffer)
+std::vector<CompiledStage::ConstantReads> constantReadsOf(nir_shader* nir) {
+    std::vector<CompiledStage::ConstantReads> reads;
+    nir_foreach_function_impl(impl, nir) {
+        nir_foreach_block(block, impl) {
+            nir_foreach_instr(instr, block) {
+                if (instr->type != nir_instr_type_intrinsic || nir_instr_as_intrinsic(instr)->intrinsic != nir_intrinsic_load_ubo) continue;
+                const nir_intrinsic_instr* intr = nir_instr_as_intrinsic(instr);
+                const uint32_t binding = nir_src_is_const(intr->src[0]) ? uint32_t(nir_src_as_uint(intr->src[0])) : ~0u;
+                auto r = std::find_if(reads.begin(), reads.end(), [&](const auto& x) { return x.binding == binding; });
+                if (r == reads.end()) r = reads.insert(reads.end(), {binding, false, {}});
+                const uint64_t at = nir_src_is_const(intr->src[1]) ? nir_src_as_uint(intr->src[1]) : ~0ull;
+                const uint64_t n = uint64_t(intr->def.num_components) * (intr->def.bit_size / 8);
+                if (binding == ~0u || intr->def.bit_size % 8 != 0 || at > 256 || at + n > 256) {
+                    r->any = true;
+                    continue;
+                }
+                if (r->bytes.size() < at + n) r->bytes.resize(at + n);
+                std::fill(r->bytes.begin() + at, r->bytes.begin() + at + n, 1);
+            }
+        }
+    }
+    return reads;
+}
+
+bool maskKnownOutput(nir_builder*, nir_intrinsic_instr* in, void* data) {
+    const auto* known = static_cast<const KnownBuffer*>(data);
+    if (in->intrinsic != nir_intrinsic_store_deref) return false;
+    nir_variable* var = nir_deref_instr_get_variable(nir_src_as_deref(in->src[0]));
+    if (!var || var->data.mode != nir_var_shader_out || var->data.location < FRAG_RESULT_DATA0) return false;
+    unsigned target = var->data.location - FRAG_RESULT_DATA0;
+    if (target >= 8 || (known->colorOutputs & (1u << target))) return false;
+    nir_instr_remove(&in->instr);
+    return true;
+}
+
+// A load of private memory (scratch) at a constant offset whose bytes are known: every store that writes them is a
+// constant at a constant offset in ONE block outside any loop, that block runs before the load (it dominates it, or it
+// is the load's own and the stores come first), and the reaching store of each byte is the last of them there. This
+// is how iOS 16.5's CoreAnimation uber shaders specialise. Their air.static_init copies the 58 function constants into
+// program-scope variables, the 31 of the FragmentShaderConfig into ONE zero-initialised struct
+// (fc_fragment_shader_config) field by field. The front end folds a scalar such variable (plan_global_folding); the
+// struct goes to scratch, so without this every branch on texture_function, blend_function, dest_index ... stayed in
+// the code -- 22 000 lines of NIR, every texture slot taken, and "reads its render targets through slots past the 16"
+// for every specialisation. Sound only while no store can reach a byte the scan did not see: one store at a
+// non-constant offset turns the pass off, and a byte also written by a value not constant, or in a second block or a
+// loop, is never answered.
+bool inLoop(nir_block* block) {
+    for (nir_cf_node* n = block->cf_node.parent; n != nullptr; n = n->parent)
+        if (n->type == nir_cf_node_loop) return true;
+    return false;
+}
+
+bool forwardConstantScratch(nir_shader* nir) {
+    struct Write { nir_intrinsic_instr* store; uint8_t value; bool constant; };
+    std::vector<std::vector<Write>> bytes;
+    bool usable = true, loads = false;
+    nir_foreach_function_impl(impl, nir) {
+        nir_metadata_require(impl, nir_metadata_dominance | nir_metadata_instr_index);
+        nir_foreach_block(block, impl) {
+            nir_foreach_instr(instr, block) {
+                if (instr->type != nir_instr_type_intrinsic) continue;
+                nir_intrinsic_instr* in = nir_instr_as_intrinsic(instr);
+                if (in->intrinsic == nir_intrinsic_load_scratch) {
+                    loads = true;
+                    continue;
+                }
+                if (in->intrinsic != nir_intrinsic_store_scratch) continue;
+                if (!nir_src_is_const(in->src[1]) || in->src[0].ssa->bit_size % 8 != 0) {
+                    usable = false;
+                    continue;
+                }
+                const unsigned width = in->src[0].ssa->bit_size / 8, mask = nir_intrinsic_write_mask(in);
+                const uint64_t at = nir_src_as_uint(in->src[1]);
+                const bool constant = nir_src_is_const(in->src[0]);
+                for (unsigned c = 0; c < in->src[0].ssa->num_components && usable; c++) {
+                    if (!(mask & (1u << c))) continue;
+                    const uint64_t v = constant ? nir_src_comp_as_uint(in->src[0], c) : 0;
+                    for (unsigned k = 0; k < width; k++) {
+                        const uint64_t at_b = at + c * width + k;
+                        if (at_b >= (1u << 20)) {
+                            usable = false;
+                            break;
+                        }
+                        if (at_b >= bytes.size()) bytes.resize(at_b + 1);
+                        bytes[at_b].push_back(Write{in, uint8_t(v >> (8 * k)), constant});
+                    }
+                }
+            }
+        }
+    }
+    if (!usable || !loads || bytes.empty()) return false;
+    bool progress = false;
+    nir_foreach_function_impl(impl, nir) {
+        nir_builder b = nir_builder_create(impl);
+        nir_foreach_block(block, impl) {
+            nir_foreach_instr_safe(instr, block) {
+                if (instr->type != nir_instr_type_intrinsic) continue;
+                nir_intrinsic_instr* in = nir_instr_as_intrinsic(instr);
+                if (in->intrinsic != nir_intrinsic_load_scratch || !nir_src_is_const(in->src[0]) || in->def.bit_size % 8 != 0) continue;
+                const unsigned width = in->def.bit_size / 8, comps = in->def.num_components;
+                const uint64_t at = nir_src_as_uint(in->src[0]);
+                if (at + uint64_t(width) * comps > bytes.size()) continue;
+                bool ok = true;
+                nir_const_value values[NIR_MAX_VEC_COMPONENTS];
+                for (unsigned c = 0; c < comps && ok; c++) {
+                    uint64_t v = 0;
+                    for (unsigned k = 0; k < width && ok; k++) {
+                        const Write* reaching = nullptr;
+                        for (const Write& w : bytes[at + c * width + k]) {
+                            nir_block* wb = w.store->instr.block;
+                            ok = w.constant && nir_cf_node_get_function(&wb->cf_node) == impl && !inLoop(wb) &&
+                                 (reaching == nullptr || reaching->store->instr.block == wb);
+                            if (!ok) break;
+                            const bool before = wb == block ? w.store->instr.index < instr->index : nir_block_dominates(wb, block);
+                            if (!before) {
+                                ok = wb != block;   // after the load in its own block: it does not reach the load
+                                if (!ok) break;
+                                ok = false;          // in a block that does not run first: not answered
+                                break;
+                            }
+                            if (reaching == nullptr || reaching->store->instr.index < w.store->instr.index) reaching = &w;
+                        }
+                        ok = ok && reaching != nullptr;
+                        if (ok) v |= uint64_t(reaching->value) << (8 * k);
+                    }
+                    values[c] = nir_const_value_for_raw_uint(v, in->def.bit_size);
+                }
+                if (!ok) continue;
+                b.cursor = nir_before_instr(instr);
+                nir_def_replace(&in->def, nir_build_imm(&b, comps, in->def.bit_size, values));
+                progress = true;
+            }
+        }
+        nir_metadata_preserve(impl, nir_metadata_control_flow);
+    }
+    return progress;
 }
 
 bool translate(const void* bitcode, size_t size, Translation& t, std::string* why, const FunctionConstants& supplied, const KnownBuffer* known = nullptr) {
@@ -282,15 +528,45 @@ bool translate(const void* bitcode, size_t size, Translation& t, std::string* wh
     const char* error = nullptr;
     t.nir = air_to_nir(t.mem, bitcode, size, nullptr, &options, ir3_get_compiler_options(theCompiler()), &t.info, &error);
     if (t.nir == nullptr) return refuse(why, std::string("the front end refused it: ") + (error ? error : "no reason given"));
+    // AIR numbers varyings by declaration order. Specialized CA stages omit
+    // unused declarations, so that order is not a cross-stage interface.
+    // Give CA's named interface stable slots, including the generic fallback.
+    if (t.nir->info.name && !strncmp(t.nir->info.name, "fixed_", 6)) {
+        const char* names[] = {"texcoord0A", "texcoord1A", "texcoord0B", "texcoord1B", "color"};
+        nir_foreach_variable_with_modes(var, t.nir, nir_var_shader_in | nir_var_shader_out) {
+            if (var->data.location < VARYING_SLOT_VAR0 || !var->name) continue;
+            for (unsigned i = 0; i < 5; ++i)
+                if (!strcmp(var->name, names[i])) var->data.location = VARYING_SLOT_VAR0 + i;
+        }
+    }
+    if (known && known->colorOutputs != ~0u && t.nir->info.stage == MESA_SHADER_FRAGMENT) {
+        nir_shader_intrinsics_pass(t.nir, maskKnownOutput, nir_metadata_control_flow, const_cast<KnownBuffer*>(known));
+        nir_foreach_variable_with_modes_safe(var, t.nir, nir_var_shader_out) {
+            int target = var->data.location - FRAG_RESULT_DATA0;
+            if (target >= 0 && target < 8 && !(known->colorOutputs & (1u << target))) exec_node_remove(&var->node);
+        }
+    }
     // the known buffer's reads folded, its offsets folded first (a field's offset is the front end's arithmetic on the
     // pointer), until nothing more folds: a value read may decide the offset of another read
     // (called directly, not under NIR_PASS: a debug build validates the whole shader after each, and an uber shader
     // takes rounds of this. nir_copy_prop's own answer does not count: on CoreAnimation's uber shader it says it made
     // progress every time, 21 000 rounds and on)
-    for (bool progress = known != nullptr; progress;) {
+    // (and the constant program-scope struct CoreAnimation's uber shaders keep in scratch, forwardConstantScratch)
+    bool scratch = false;
+    nir_foreach_function_impl(impl, t.nir) {
+        nir_foreach_block(block, impl) {
+            nir_foreach_instr(instr, block) {
+                scratch |= instr->type == nir_instr_type_intrinsic && nir_instr_as_intrinsic(instr)->intrinsic == nir_intrinsic_load_scratch;
+            }
+        }
+    }
+    for (bool progress = known != nullptr || scratch; progress;) {
         nir_copy_prop(t.nir);
         progress = nir_opt_constant_folding(t.nir);
-        progress = nir_shader_intrinsics_pass(t.nir, foldKnownLoad, nir_metadata_control_flow, const_cast<KnownBuffer*>(known)) || progress;
+        if (known != nullptr) progress = nir_shader_intrinsics_pass(t.nir, foldKnownLoad, nir_metadata_control_flow, const_cast<KnownBuffer*>(known)) || progress;
+        progress = forwardConstantScratch(t.nir) || progress;
+        progress = nir_opt_dead_cf(t.nir) || progress;
+        progress = nir_opt_dce(t.nir) || progress;
     }
     return true;
 }
@@ -387,15 +663,13 @@ enum class PassOrder { kCompute, kGraphics };
 // command-line compiler builds them (ir3_cmdline.c:491-507) with what alloc_variant would have set (ir3_shader.c:
 // 279-355), ir3_compile_shader_nir, one ir3_shader_assemble (it frees the constant data it appends to the binary, so
 // there is no second call)
-// A framebuffer fetch lowered here, before ir3_nir_post_finalize would do it, so that the layer and the sample it reads
-// can be what they always are on this road: 0. nir_lower_fb_read builds txf_ms_fb's coordinate from load_layer_id
-// (which ir3 then makes a flat varying of VARYING_SLOT_LAYER, which no vertex stage here writes: layered targets are
-// refused) and its sample from load_sample_id (which makes ir3 load the sample id: MSAA is refused too). Only reads the
-// lowering itself added are zeroed: one the shader made of its own is left for the draw to refuse by name.
-// tools/mesa/ir3-dump.patch runs the same, so that a fixture and a compile here agree.
+// Lower framebuffer fetch before ir3's default lowering so each attachment has one
+// explicit texture slot. Single-sample fetch keeps layer/sample zero; MSAA retains
+// the sample id and uses txf_ms with per-sample execution, as Metal requires.
 namespace {
 struct FbReadCounts {
     unsigned layer = 0, sample = 0;
+    bool multisample = false;
 };
 bool countLayerSample(nir_builder*, nir_intrinsic_instr* in, void* data) {
     auto* c = static_cast<FbReadCounts*>(data);
@@ -405,7 +679,7 @@ bool countLayerSample(nir_builder*, nir_intrinsic_instr* in, void* data) {
 }
 bool zeroLayerSample(nir_builder* b, nir_intrinsic_instr* in, void* data) {
     const auto* own = static_cast<const FbReadCounts*>(data);
-    if (!((in->intrinsic == nir_intrinsic_load_layer_id && own->layer == 0) || (in->intrinsic == nir_intrinsic_load_sample_id && own->sample == 0))) {
+    if (!((in->intrinsic == nir_intrinsic_load_layer_id && own->layer == 0) || (in->intrinsic == nir_intrinsic_load_sample_id && own->sample == 0 && !own->multisample))) {
         return false;
     }
     b->cursor = nir_before_instr(&in->instr);
@@ -563,7 +837,8 @@ bool lowerHalfDerivative(nir_builder* b, nir_intrinsic_instr* intr, void*) {
     return true;
 }
 
-// Each fetch then becomes an ordinary texel fetch (txf, lod 0) of a texture slot of its target's own: the lowest slot
+// Each fetch becomes txf (lod 0) for one sample or txf_ms (current sample) for MSAA,
+// through a texture slot of its target's own: the lowest slot
 // the function does not sample, taken in the order the targets are first read. (Not one past the highest sampled slot:
 // the front end's null texture sits high in the table, and CoreAnimation's fixed_frag_lph_cpf, which samples it and
 // reads its target, would then need a 17th.) ir3's own non-bindless fetch gives every fetch
@@ -571,12 +846,34 @@ bool lowerHalfDerivative(nir_builder* b, nir_intrinsic_instr* intr, void*) {
 // [[color(1)]] could not be told from one of [[color(0)]]; here two reads of a target share a slot and each target has
 // one, which the draw fills with that attachment's view (KernelTexture::fbTarget). FB_TARGETS: n + 1 at each such slot.
 // False with *WHY when the slots would run past the table.
-bool lowerFbRead(nir_shader* nir, uint8_t fbTargets[kMaxTextureSlots], std::string* why) {
+bool lowerFbRead(nir_shader* nir, uint8_t fbTargets[kMaxTextureSlots], std::string* why, uint32_t samples) {
     if (nir->info.stage != MESA_SHADER_FRAGMENT || !nir->info.fs.uses_fbfetch_output) return true;
     FbReadCounts own;
+    own.multisample = samples > 1;
+    if (own.multisample) nir->info.fs.uses_sample_shading = true;
     nir_shader_intrinsics_pass(nir, countLayerSample, nir_metadata_all, &own);
     nir_lower_fb_read(nir);
     nir_shader_intrinsics_pass(nir, zeroLayerSample, nir_metadata_control_flow, &own);
+    // the slots something samples: textures_used is every texture the function DECLARES (the front end sets it from
+    // the metadata), and iOS 16.5's CoreAnimation uber shader declares 15 behind function-constant predicates, of which
+    // a specialisation samples a few -- taken as used, no slot was left for its render targets
+    BITSET_DECLARE(sampled, kMaxTextureSlots) = {};
+    nir_foreach_function_impl(impl, nir) {
+        nir_foreach_block(block, impl) {
+            nir_foreach_instr(instr, block) {
+                if (instr->type != nir_instr_type_tex) continue;
+                nir_tex_instr* tex = nir_instr_as_tex(instr);
+                if (tex->op == nir_texop_txf_ms_fb) continue;
+                if (nir_tex_instr_src_index(tex, nir_tex_src_texture_deref) >= 0 || nir_tex_instr_src_index(tex, nir_tex_src_texture_handle) >= 0 ||
+                    nir_tex_instr_src_index(tex, nir_tex_src_texture_offset) >= 0 || tex->texture_index >= kMaxTextureSlots) {
+                    BITSET_COPY(sampled, nir->info.textures_used);   // not a plain index: as declared, as before
+                    goto counted;
+                }
+                BITSET_SET(sampled, tex->texture_index);
+            }
+        }
+    }
+counted:
     int slotOf[kMaxTextureSlots];   // a target's slot, -1 before its first read
     for (int& x : slotOf) x = -1;
     unsigned nextFree = 0;
@@ -595,7 +892,7 @@ bool lowerFbRead(nir_shader* nir, uint8_t fbTargets[kMaxTextureSlots], std::stri
                     continue;
                 }
                 if (slotOf[target] < 0) {
-                    while (nextFree < kMaxTextureSlots && BITSET_TEST(nir->info.textures_used, nextFree)) nextFree++;
+                    while (nextFree < kMaxTextureSlots && BITSET_TEST(sampled, nextFree)) nextFree++;
                     if (nextFree >= kMaxTextureSlots) {
                         ok = false;
                         continue;
@@ -606,14 +903,16 @@ bool lowerFbRead(nir_shader* nir, uint8_t fbTargets[kMaxTextureSlots], std::stri
                 b.cursor = nir_before_instr(instr);
                 nir_def* coord = fb->src[c].src.ssa;
                 nir_tex_instr* tx = nir_tex_instr_create(nir, 2);
-                tx->op = nir_texop_txf;
-                tx->sampler_dim = GLSL_SAMPLER_DIM_2D;
+                tx->op = samples > 1 ? nir_texop_txf_ms : nir_texop_txf;
+                tx->sampler_dim = samples > 1 ? GLSL_SAMPLER_DIM_MS : GLSL_SAMPLER_DIM_2D;
                 tx->coord_components = 2;
                 tx->dest_type = nir_type_float32;
                 tx->texture_index = slot;
                 tx->sampler_index = 0;
                 tx->src[0] = nir_tex_src_for_ssa(nir_tex_src_coord, nir_trim_vector(&b, coord, 2));
-                tx->src[1] = nir_tex_src_for_ssa(nir_tex_src_lod, nir_imm_int(&b, 0));
+                tx->src[1] = samples > 1
+                    ? nir_tex_src_for_ssa(nir_tex_src_ms_index, nir_load_sample_id(&b))
+                    : nir_tex_src_for_ssa(nir_tex_src_lod, nir_imm_int(&b, 0));
                 nir_def_init(&tx->instr, &tx->def, 4, 32);
                 nir_builder_instr_insert(&b, &tx->instr);
                 nir_def_rewrite_uses(&fb->def, &tx->def);
@@ -671,6 +970,103 @@ bool usesSubgroup(nir_shader* nir) {
     return false;
 }
 
+// Stores to private memory (scratch) that no load can read, removed. The front end gives every program-scope variable
+// that is not folded bytes in scratch, and an air.static_init that copies function constants into them runs at the top
+// of EVERY invocation: once forwardConstantScratch and the unrolling have answered the loads, the stores stay behind --
+// VideoToolbox's VTMTSComputeFunction, compiled without its constants, kept 533 stp and 2 KB of private memory a
+// thread. A load reads [its offset, + its size); at an offset not constant, from the constant it adds (when that sum
+// cannot wrap; else from 0) to past nir_unsigned_upper_bound -- an alloca's array, after the program-scope variables. A
+// store at an offset not constant is kept unless nothing loads at all. With no scratch access left, no private memory.
+bool removeUnreadScratchStores(nir_shader* nir) {
+    std::vector<nir_intrinsic_instr*> loads, stores;
+    uint64_t limit = nir->scratch_size;
+    nir_foreach_function_impl(impl, nir) {
+        nir_foreach_block(block, impl) {
+            nir_foreach_instr(instr, block) {
+                if (instr->type != nir_instr_type_intrinsic) continue;
+                nir_intrinsic_instr* in = nir_instr_as_intrinsic(instr);
+                if (in->intrinsic == nir_intrinsic_load_scratch) loads.push_back(in);
+                if (in->intrinsic != nir_intrinsic_store_scratch) continue;
+                stores.push_back(in);
+                if (nir_src_is_const(in->src[1]))
+                    limit = std::max(limit, nir_src_as_uint(in->src[1]) + uint64_t(in->src[0].ssa->num_components) * in->src[0].ssa->bit_size / 8);
+            }
+        }
+    }
+    if (loads.empty() && stores.empty()) nir->scratch_size = 0;
+    if (stores.empty()) return false;
+    std::vector<bool> read(limit);
+    hash_table* ranges = _mesa_pointer_hash_table_create(nullptr);
+    for (nir_intrinsic_instr* in : loads) {
+        const uint64_t size = uint64_t(in->def.num_components) * in->def.bit_size / 8;
+        const nir_scalar at = nir_get_scalar(in->src[0].ssa, 0);
+        uint64_t lo = 0, hi;
+        if (nir_scalar_is_const(at)) {
+            lo = nir_scalar_as_uint(at);
+            hi = lo + size;
+        } else {
+            if (nir_scalar_is_alu(at) && nir_scalar_alu_op(at) == nir_op_iadd) {
+                for (unsigned s = 0; s < 2; s++) {
+                    const nir_scalar c = nir_scalar_chase_alu_src(at, s), x = nir_scalar_chase_alu_src(at, 1 - s);
+                    if (nir_scalar_is_const(c) && !nir_addition_might_overflow(nir, ranges, x, uint32_t(nir_scalar_as_uint(c)), nullptr)) {
+                        lo = nir_scalar_as_uint(c);
+                        break;
+                    }
+                }
+            }
+            hi = uint64_t(nir_unsigned_upper_bound(nir, ranges, at, nullptr)) + size;
+        }
+        std::fill(read.begin() + std::min(lo, limit), read.begin() + std::min(hi, limit), true);
+    }
+    _mesa_hash_table_destroy(ranges, nullptr);
+    bool progress = false, left = !loads.empty();
+    for (nir_intrinsic_instr* in : stores) {
+        bool unread = loads.empty();
+        if (!unread && nir_src_is_const(in->src[1])) {
+            const unsigned width = in->src[0].ssa->bit_size / 8, mask = nir_intrinsic_write_mask(in);
+            const uint64_t at = nir_src_as_uint(in->src[1]);
+            unread = true;
+            for (unsigned c = 0; c < in->src[0].ssa->num_components && unread; c++) {
+                if (!(mask & (1u << c))) continue;
+                for (unsigned k = 0; k < width && unread; k++) unread = !read[at + c * width + k];
+            }
+        }
+        if (!unread) {
+            left = true;
+            continue;
+        }
+        nir_instr_remove(&in->instr);
+        progress = true;
+    }
+    if (!left) nir->scratch_size = 0;
+    if (progress) {
+        nir_foreach_function_impl(impl, nir) nir_metadata_preserve(impl, nir_metadata_control_flow);
+        nir_opt_dce(nir);
+    }
+    return progress;
+}
+
+// Private memory every access of which is at a constant offset, made registers: nir_lower_scratch_to_var gives the bytes
+// back as one array of words, which nir_lower_vars_to_ssa takes apart when no index is dynamic. That is the shape a
+// specialised AIR module leaves once ir3_finalize_nir has unrolled its loops: its program-scope variables (each copied
+// from function constants in air.static_init, at the top of every invocation) and its fixed-size allocas, all at known
+// offsets. VideoToolbox's VTMTSComputeFunction for SpringBoard's BGRA->420f transfer kept 402 ldp and 175 stp a thread
+// (1.5 KB of private memory each), 41-48 ms a 13x54 dispatch on the phone; as values it is a third of the code and no
+// private memory. One dynamic offset and nothing is done: ir3 would put the whole array back, in 32-bit pieces.
+void promoteConstantScratch(nir_shader* nir) {
+    nir_foreach_function_impl(impl, nir) {
+        nir_foreach_block(block, impl) {
+            nir_foreach_instr(instr, block) {
+                if (instr->type != nir_instr_type_intrinsic) continue;
+                nir_intrinsic_instr* in = nir_instr_as_intrinsic(instr);
+                if (in->intrinsic == nir_intrinsic_load_scratch && !nir_src_is_const(in->src[0])) return;
+                if (in->intrinsic == nir_intrinsic_store_scratch && !nir_src_is_const(in->src[1])) return;
+            }
+        }
+    }
+    nir_lower_scratch_to_var(nir);
+}
+
 bool compileVariant(Translation& t, PassOrder order, std::string* why) {
     ir3_compiler* compiler = theCompiler();
     nir_shader* nir = t.nir;
@@ -694,7 +1090,9 @@ bool compileVariant(Translation& t, PassOrder order, std::string* why) {
     nir_shader_instructions_pass(nir, lowerUclz, nir_metadata_control_flow, nullptr);
     ir3_nir_lower_io_to_temporaries(nir);
     ir3_finalize_nir(compiler, &nirOptions, nir);
-    if (!lowerFbRead(nir, t.fbTargets, why)) return false;
+    removeUnreadScratchStores(nir);
+    promoteConstantScratch(nir);
+    if (!lowerFbRead(nir, t.fbTargets, why, t.framebufferSamples)) return false;
 
     t.shader = static_cast<ir3_shader*>(rzalloc_size(nullptr, sizeof(ir3_shader)));
     t.shader->compiler = compiler;
@@ -1067,10 +1465,22 @@ const char* className(uint8_t element) { return element == kElemFloat ? "floats"
 
 bool hasCompiler() { return theCompiler() != nullptr; }
 
+std::vector<uint32_t> functionConstantIndices(const void* bitcode, size_t size) {
+    // Metadata-only AIR parser, with its own ralloc context: no NIR/ir3 or
+    // shared compiler state. Exact CA validation must not wait for specialization.
+    void* mem = ralloc_context(nullptr);
+    air_constant_value* constants = nullptr;
+    unsigned n = air_module_function_constants(mem, bitcode, size, &constants);
+    std::vector<uint32_t> out;
+    for (unsigned i = 0; i < n; i++) out.push_back(constants[i].index);
+    ralloc_free(mem);
+    return out;
+}
+
 std::unique_ptr<CompiledKernel> compileAir(const void* bitcode, size_t size, std::string* why, const FunctionConstants& constants) {
-    std::lock_guard<std::mutex> g(gCompilerLock);
+    CompilerTurn g;
     if (theCompiler() == nullptr) {
-        refuse(why, "ir3 has no compiler for chip 0x06030500");
+        refuse(why, "ir3 has no compiler for chip 0x06050002");
         return nullptr;
     }
     Translation t;
@@ -1097,7 +1507,7 @@ std::unique_ptr<CompiledKernel> compileAir(const void* bitcode, size_t size, std
 
 namespace {
 std::unique_ptr<CompiledStage> compileStageOnce(const void* bitcode, size_t size, std::string* why, const FunctionConstants& constants, uint32_t iboBase,
-                                                const KnownBuffer* known);
+                                                const KnownBuffer* known, uint32_t framebufferSamples);
 }  // namespace
 
 // A stage compiled as turnip compiles it, unless that spills: ir3's preamble pass hoists what is uniform into a
@@ -1138,24 +1548,20 @@ struct CacheReader {
     }
 };
 constexpr uint32_t kCacheMagic = 0x53434d48;   // "HMCS"
-// What the compiler is, for the cache's key: the Makefile's hash of this file, the driver's headers and the Mesa
+// What the compiler is, for the cache's key: the Makefile's hash of this file, compiler.hpp, kernel.hpp and the Mesa
 // archives linked in (HAKIOS_METAL_CACHE_BUILD), so that a stage compiled before stays good across a rebuild of the
 // library that changed nothing of the compiler -- with __DATE__ and __TIME__ every rebuild of the plug-in (any file
 // of the core recompiles them all) emptied a cache that var_store had kept across boots, and the window server paid
 // its 66 to 103 first compiles again. Without the define, the old key: a build is its own.
-#ifdef HAKIOS_METAL_CACHE_BUILD
-const char* const kCacheBuild = HAKIOS_METAL_CACHE_BUILD;
-#else
-const char* const kCacheBuild = __DATE__ " " __TIME__;
-#endif
+const char* const kCacheBuild = hakios_metal_stage_cache_build();
+// What the hash above does not see and a cached stage still depends on: Stage's fields (render.hpp) as fillStage fills
+// them, makeSampler's words for a constexpr sampler (texture.cpp), kChipId (a6xx.hpp). Bump it with such a change.
+constexpr uint32_t kStageCacheVersion = 1;
 
-// The file name of a stage in the cache (no directory), "" when no cache is configured: the writable directory
+// The key of a stage, also its file name (no directory) when a cache is configured: the writable directory
 // HAKIOS_METAL_CACHE, and the read-only ones HAKIOS_METAL_CACHE_SEED (':' between them) -- stages compiled on an
 // earlier boot and put into the system image, looked in after the writable one and never written.
-std::string stageCacheName(const void* bitcode, size_t size, const FunctionConstants& constants, uint32_t iboBase, const KnownBuffer* known) {
-    const char* dir = getenv("HAKIOS_METAL_CACHE");
-    const char* seed = getenv("HAKIOS_METAL_CACHE_SEED");
-    if ((dir == nullptr || dir[0] == 0) && (seed == nullptr || seed[0] == 0)) return {};
+std::string stageCacheName(const void* bitcode, size_t size, const FunctionConstants& constants, uint32_t iboBase, const KnownBuffer* known, uint32_t framebufferSamples) {
     uint64_t h[2] = {0xcbf29ce484222325ull, 0x84222325cbf29ce4ull};
     auto mix = [&](const void* p, size_t n) {
         for (size_t i = 0; i < n; i++) {
@@ -1164,21 +1570,44 @@ std::string stageCacheName(const void* bitcode, size_t size, const FunctionConst
             h[1] = (h[1] ^ b) * 0x1000193ull + (h[1] >> 29);
         }
     };
-    const uint32_t layout[3] = {uint32_t(sizeof(Stage)), uint32_t(sizeof(Kernel)), iboBase};
+    const uint32_t layout[6] = {uint32_t(sizeof(Stage)), uint32_t(sizeof(Kernel)), iboBase, kStageCacheVersion, uint32_t(sizeof(Sampler)), framebufferSamples};
     mix(kCacheBuild, strlen(kCacheBuild));
     mix(layout, sizeof(layout));
     mix(bitcode, size);
-    for (const FunctionConstant& c : constants) {
+    // Metal's dictionary enumeration order is not a shader input. Keep equal-index
+    // entries in their original order (the frontend's duplicate-value semantics).
+    FunctionConstants ordered = constants;
+    std::stable_sort(ordered.begin(), ordered.end(), [](const auto& a, const auto& b) { return a.index < b.index; });
+    for (const FunctionConstant& c : ordered) {
         mix(&c.index, sizeof(c.index));
         mix(&c.bits, sizeof(c.bits));
     }
     if (known != nullptr) {
+        mix(&known->colorOutputs, sizeof(known->colorOutputs));
         mix(&known->binding, sizeof(known->binding));
-        mix(known->bytes.data(), known->bytes.size());
+        for (size_t i = 0; i < known->bytes.size(); i++) {
+            const uint8_t byte = known->mask.empty() || known->mask[i] ? known->bytes[i] : 0;   // a byte not known is not folded
+            mix(&byte, 1);
+        }
+        mix(known->mask.data(), known->mask.size());
     }
     char name[64];
     snprintf(name, sizeof(name), "/%016llx%016llx.stage", (unsigned long long)h[0], (unsigned long long)h[1]);
     return name;
+}
+
+// Process-local only: unsupported AIR must not be compiled each frame. The full
+// specialization key includes sample count and compiler build. Restarting with a
+// new compiler always retries; no failure poisons the persistent shader cache.
+std::mutex gStageFailuresLock;
+std::unordered_map<std::string, std::string> gStageFailures;
+
+bool stageFailure(const std::string& key, std::string* why) {
+    std::lock_guard<std::mutex> lock(gStageFailuresLock);
+    const auto it = gStageFailures.find(key);
+    if (it == gStageFailures.end()) return false;
+    if (why != nullptr) *why = it->second;
+    return true;
 }
 
 // the writable cache's path for NAME, "" when there is none
@@ -1188,7 +1617,22 @@ std::string stageCacheWritable(const std::string& name) {
     return std::string(dir) + name;
 }
 
-void stageCacheSave(const std::string& path, const CompiledStage& s) {
+bool cacheFileSave(const std::string& path, const std::string& data) {
+    // Processes share /var/db: each writer needs its own temporary inode. Readers
+    // only open the final name, published atomically after all bytes are closed.
+    std::string tmp = path + ".XXXXXX";
+    int fd = mkstemp(tmp.data());
+    if (fd < 0) return false;
+    if (fchmod(fd, 0644) != 0) { close(fd); remove(tmp.c_str()); return false; }
+    FILE* f = fdopen(fd, "wb");
+    if (f == nullptr) { close(fd); remove(tmp.c_str()); return false; }
+    bool written = fwrite(data.data(), 1, data.size(), f) == data.size();
+    if (fclose(f) != 0) written = false;
+    if (written && rename(tmp.c_str(), path.c_str()) == 0) return true;
+    remove(tmp.c_str());
+    return false;
+}
+bool stageCacheSave(const std::string& path, const CompiledStage& s) {
     CacheWriter w;
     w.u32(kCacheMagic);
     w.raw(&s.stage, sizeof(s.stage));
@@ -1218,12 +1662,14 @@ void stageCacheSave(const std::string& path, const CompiledStage& s) {
     w.u32(s.writesMemory ? 1 : 0);
     w.str(s.name);
     w.str(s.listing);
-    const std::string tmp = path + ".tmp";
-    FILE* f = fopen(tmp.c_str(), "wb");
-    if (f == nullptr) return;
-    const bool written = fwrite(w.out.data(), 1, w.out.size(), f) == w.out.size();
-    fclose(f);
-    if (!written || rename(tmp.c_str(), path.c_str()) != 0) remove(tmp.c_str());
+    w.u32(uint32_t(s.constantReads.size()));
+    for (const CompiledStage::ConstantReads& c : s.constantReads) {
+        w.u32(c.binding);
+        w.u32(c.any ? 1 : 0);
+        w.u32(uint32_t(c.bytes.size()));
+        w.raw(c.bytes.data(), c.bytes.size());
+    }
+    return cacheFileSave(path, w.out);
 }
 
 std::unique_ptr<CompiledStage> stageCacheLoad(const std::string& path) {
@@ -1264,6 +1710,13 @@ std::unique_ptr<CompiledStage> stageCacheLoad(const std::string& path) {
     s->writesMemory = r.u32() != 0;
     s->name = r.str();
     s->listing = r.str();
+    s->constantReads.resize(r.u32());
+    for (CompiledStage::ConstantReads& c : s->constantReads) {
+        c.binding = r.u32();
+        c.any = r.u32() != 0;
+        c.bytes.resize(r.u32());
+        r.raw(c.bytes.data(), c.bytes.size());
+    }
     if (!r.ok || r.p != r.end) return nullptr;
     s->stage.k.words = s->words.data();
     s->stage.k.numWords = uint32_t(s->words.size());
@@ -1273,51 +1726,336 @@ std::unique_ptr<CompiledStage> stageCacheLoad(const std::string& path) {
     s->stage.k.source = "";
     return s;
 }
+// Opt-in process recipes contain the actual compiler inputs, not pipeline pointers
+// or library paths. Replaying them recomputes the normal stage key on this build.
+std::mutex gWarmLock;
+std::string gWarmDirectory;
+std::unordered_set<std::string> gWarmRecorded;
+std::unordered_set<std::string> gWarmOnDisk;   // recipe files this process knows are there (replayed, or handed to the writer)
+std::unordered_map<std::string, std::shared_ptr<CompiledStage>> gWarmStages;
+thread_local bool gReplaying = false;
+constexpr size_t kWarmStages = 256;
+constexpr uint32_t kWarmMagic = 0x31574d48; // HMW1
+
+uint64_t warmHash(const std::string& bytes) {
+    uint64_t h = 0xcbf29ce484222325ull;
+    for (uint8_t b : bytes) h = (h ^ b) * 0x100000001b3ull;
+    return h;
+}
+
+std::string cacheFileRead(const std::string& path) {
+    FILE* f = fopen(path.c_str(), "rb");
+    if (f == nullptr) return {};
+    std::string data;
+    char chunk[65536];
+    for (size_t n; (n = fread(chunk, 1, sizeof(chunk), f)) > 0;) data.append(chunk, n);
+    fclose(f);
+    return data;
+}
+
+// Recipes are filed under the hash of their own bytes (/<hash>.warm), so the name says the content: a file already
+// there holds exactly these bytes, and writing it again only costs the device a file create, a write and a rename.
+// That cost is not small here: /var is HFS on UFS, where a cache file of a few tens of KB took 30 ms to 2 s to read
+// (the "stage-cache: ... lookup ..." of v29q) and a recipe some 35 to 45 ms to write. Written from the render thread
+// inside pipeline creation, two of them (the vertex stage's and the fragment stage's) were the "slow-pipeline: render
+// ... 70.0 ms" / "89.1 ms" first-use builds of v29q -- 70 to 89 ms wall with 4 to 8 ms of CPU, and nothing in the
+// lookup or compile counters, because the record is neither (logs/v29-snap/v29q-user-1005.log:72100, :80518).
+// So: a recipe already on disk is not written at all, and one that is not goes to a writer of its own.
+
+// /var/db/hakios-metal-cache/pipeline-prewarm-off: the same kind of switch as the directory's other "-off" files
+// (bo-cache-off, batch-commit-off, msaa-fbfetch-off). It stops recipes being recorded, which is what the prewarm lane
+// learns from; the recipes already there are still replayed. One stat per stage name a process first uses, not a
+// cached answer: a process's cache directory is settled before its first stage, but a second one asked later (a
+// library reloaded with another cache, the host's tests) must not keep the first answer.
+bool recipeRecordingOff() {
+    const char* dir = getenv("HAKIOS_METAL_CACHE");
+    if (dir == nullptr || dir[0] == 0) return false;   // no cache: gWarmDirectory stays empty and nothing is recorded
+    return access((std::string(dir) + "/pipeline-prewarm-off").c_str(), F_OK) == 0;
+}
+
+struct RecipeJob {
+    std::string path, file, data;
+};
+// the queue and its thread are never destroyed (allocated once, leaked): a writer of a process that is leaving must not
+// find its own mutex and deque destructed under it
+struct RecipeQueue {
+    std::mutex lock;
+    std::condition_variable ready;
+    std::deque<RecipeJob> jobs;
+    std::thread* thread = nullptr;   // made once, never joined or destroyed (the process leaves under it)
+    bool noThread = false;           // a process that cannot make the thread writes them itself, as before
+};
+RecipeQueue& recipeQueue() {
+    static RecipeQueue* const queue = new RecipeQueue;
+    return *queue;
+}
+
+void recipeWriterLoop() {
+    RecipeQueue& q = recipeQueue();
+    for (;;) {
+        RecipeJob job;
+        {
+            std::unique_lock<std::mutex> lock(q.lock);
+            q.ready.wait(lock, [&q] { return !q.jobs.empty(); });
+            job = std::move(q.jobs.front());
+            q.jobs.pop_front();
+        }
+        if (cacheFileSave(job.path, job.data)) {
+            recipeWriteStat(kRecipeWritten);
+            continue;
+        }
+        recipeWriteStat(kRecipeFailed);   // (not retried this process: the next boot's use records it again)
+    }
+}
+
+// true when the job was taken by the writer; false when there is none and the caller must write it itself (its own
+// data then untouched: the move into the queue happens only when the job is taken)
+bool queueRecipeWrite(RecipeJob&& job) {
+    RecipeQueue& q = recipeQueue();
+    std::lock_guard<std::mutex> lock(q.lock);
+    if (q.thread == nullptr) {
+        if (q.noThread) return false;
+        try {
+            // never joined or destroyed: a cache -- whatever has not been written when the process leaves is recorded
+            // again by the next boot's use -- and a thread a process is leaving under must not have its object destroyed
+            q.thread = new std::thread(recipeWriterLoop);
+        } catch (...) {
+            q.noThread = true;
+            return false;
+        }
+    }
+    q.jobs.push_back(std::move(job));
+    q.ready.notify_one();
+    return true;
+}
+
+void recordStage(const std::string& name, const void* bitcode, size_t size, const FunctionConstants& constants,
+                 uint32_t iboBase, const KnownBuffer* known, uint32_t samples, StageCacheMeasure& measure) {
+    (void)measure;
+    if (gReplaying) return;
+    std::string directory;
+    {
+        std::lock_guard<std::mutex> lock(gWarmLock);
+        if (gWarmDirectory.empty() || gWarmRecorded.size() >= kWarmStages || !gWarmRecorded.insert(name).second) return;
+        directory = gWarmDirectory;
+    }
+    if (recipeRecordingOff()) return;
+    CacheWriter w;
+    w.u32(kWarmMagic);
+    w.str(std::string(static_cast<const char*>(bitcode), size));
+    FunctionConstants ordered = constants;
+    std::stable_sort(ordered.begin(), ordered.end(), [](const auto& a, const auto& b) { return a.index < b.index; });
+    w.u32(uint32_t(ordered.size()));
+    for (const auto& c : ordered) { w.u32(c.index); w.raw(&c.bits, sizeof(c.bits)); }
+    w.u32(iboBase);
+    w.u32(samples);
+    w.u32(known != nullptr);
+    if (known) {
+        w.u32(known->colorOutputs);
+        w.u32(known->binding);
+        std::string bytes(known->bytes.begin(), known->bytes.end());
+        for (size_t i = 0; i < bytes.size(); i++) if (!known->mask.empty() && !known->mask[i]) bytes[i] = 0;
+        w.str(bytes);
+        w.str(std::string(known->mask.begin(), known->mask.end()));
+    }
+    char namebuf[40];
+    snprintf(namebuf, sizeof(namebuf), "%016llx.warm", (unsigned long long)warmHash(w.out));
+    const std::string file = namebuf, path = directory + "/" + file;
+    {
+        std::lock_guard<std::mutex> lock(gWarmLock);
+        if (!gWarmOnDisk.insert(file).second) {   // this process replayed it, or is writing it now
+            recipeWriteStat(kRecipeSkipped);
+            return;
+        }
+    }
+    // not replayed yet (the lane runs at process start, this may be sooner): one stat, not a write
+    if (access(path.c_str(), F_OK) == 0) {
+        recipeWriteStat(kRecipeSkipped);
+        return;
+    }
+    RecipeJob job{path, file, std::move(w.out)};
+    if (queueRecipeWrite(std::move(job))) return;
+    if (cacheFileSave(job.path, job.data)) recipeWriteStat(kRecipeWritten);
+    else recipeWriteStat(kRecipeFailed);
+}
+
+std::unique_ptr<CompiledStage> warmStage(const std::string& name) {
+    std::lock_guard<std::mutex> lock(gWarmLock);
+    const auto it = gWarmStages.find(name);
+    if (it == gWarmStages.end()) return nullptr;
+    auto s = std::make_unique<CompiledStage>(*it->second);
+    s->stage.k.words = s->words.data();
+    s->stage.k.immediates = s->immediates.empty() ? nullptr : s->immediates.data();
+    s->stage.k.name = s->name.c_str();
+    return s;
+}
 }  // namespace
 
 std::unique_ptr<CompiledStage> compileStage(const void* bitcode, size_t size, std::string* why, const FunctionConstants& constants, uint32_t iboBase,
-                                           const KnownBuffer* known) {
-    std::lock_guard<std::mutex> g(gCompilerLock);
-    if (theCompiler() == nullptr) {
-        refuse(why, "ir3 has no compiler for chip 0x06030500");
+                                           const KnownBuffer* known, bool cachedOnly, uint32_t framebufferSamples) {
+    StageCacheMeasure measure;
+    const auto lookupStart = CacheClock::now();
+    const std::string name = stageCacheName(bitcode, size, constants, iboBase, known, framebufferSamples);
+    if (stageFailure(name, why)) return nullptr;
+    auto used = [&](std::unique_ptr<CompiledStage> s) {
+        if (s && !cachedOnly) recordStage(name, bitcode, size, constants, iboBase, known, framebufferSamples, measure);
+        return s;
+    };
+    const std::string cached = stageCacheWritable(name);
+    auto lookup = [&]() -> std::unique_ptr<CompiledStage> {
+        if (auto s = warmStage(name)) { ++measure.stats.prewarm_hits; return s; }
+        if (!cached.empty()) {
+            if (auto s = stageCacheLoad(cached)) { ++measure.stats.hits; return s; }
+        }
+        if (!name.empty()) {
+            const char* seed = getenv("HAKIOS_METAL_CACHE_SEED");
+            for (const char* p = seed; p != nullptr && *p != 0;) {
+                const char* colon = strchr(p, ':');
+                const std::string dir(p, colon != nullptr ? size_t(colon - p) : strlen(p));
+                p = colon != nullptr ? colon + 1 : nullptr;
+                if (dir.empty()) continue;
+                if (auto s = stageCacheLoad(dir + name)) { ++measure.stats.seed_hits; return s; }
+            }
+        }
+        return nullptr;
+    };
+    // Cached stages own all their storage and do not touch Mesa. In particular,
+    // a foreground cache hit must not queue behind background specialization.
+    auto hit = lookup();
+    measure.stats.lookup_ns = cacheNanos(lookupStart);
+    if (hit) return used(std::move(hit));
+    if (cachedOnly) {
+        refuse(why, "not in the cache");
         return nullptr;
     }
-    const std::string name = stageCacheName(bitcode, size, constants, iboBase, known);
-    const std::string cached = stageCacheWritable(name);
-    if (!cached.empty()) {
-        if (std::unique_ptr<CompiledStage> s = stageCacheLoad(cached)) return s;
-    }
-    if (!name.empty()) {
-        const char* seed = getenv("HAKIOS_METAL_CACHE_SEED");
-        for (const char* p = seed; p != nullptr && *p != 0;) {
-            const char* colon = strchr(p, ':');
-            const std::string dir(p, colon != nullptr ? size_t(colon - p) : strlen(p));
-            p = colon != nullptr ? colon + 1 : nullptr;
-            if (dir.empty()) continue;
-            if (std::unique_ptr<CompiledStage> s = stageCacheLoad(dir + name)) return s;
+    auto chosen = [&]() -> std::unique_ptr<CompiledStage> {
+        const auto waitStart = CacheClock::now();
+        CompilerTurn g;
+        measure.stats.wait_ns = cacheNanos(waitStart);
+        // Another caller may have compiled this stage while we waited.
+        const auto retryStart = CacheClock::now();
+        hit = lookup();
+        measure.stats.lookup_ns += cacheNanos(retryStart);
+        if (hit) return std::move(hit);
+        if (stageFailure(name, why)) return nullptr;
+        ++measure.stats.misses;
+        if (theCompiler() == nullptr) {
+            ++measure.stats.failures;
+            refuse(why, "ir3 has no compiler for chip 0x06050002");
+            return nullptr;
         }
+        const auto compileStart = CacheClock::now();
+        std::unique_ptr<CompiledStage> with = compileStageOnce(bitcode, size, why, constants, iboBase, known, framebufferSamples);
+        std::unique_ptr<CompiledStage> chosen;
+        if (with == nullptr || with->stage.k.pvtmemSize == 0 || !theCompiler()->has_preamble) {
+            chosen = std::move(with);
+        } else {
+            theCompiler()->has_preamble = false;
+            std::string whyNot;
+            std::unique_ptr<CompiledStage> without = compileStageOnce(bitcode, size, &whyNot, constants, iboBase, known, framebufferSamples);
+            theCompiler()->has_preamble = true;
+            chosen = without != nullptr && preferWithoutPreamble(with->stage.k, without->stage.k) ? std::move(without) : std::move(with);
+        }
+        measure.stats.compile_ns = measure.stats.compile_max_ns = cacheNanos(compileStart);
+        if (chosen == nullptr) {
+            ++measure.stats.failures;
+            std::lock_guard<std::mutex> lock(gStageFailuresLock);
+            gStageFailures.emplace(name, why != nullptr ? *why : "stage compilation failed");
+        }
+        if (chosen != nullptr && !cached.empty()) {
+            if (stageCacheSave(cached, *chosen)) ++measure.stats.writes;
+            else ++measure.stats.write_failures;
+        }
+        return chosen;
+    }();
+    return used(std::move(chosen));
+}
+
+
+bool setProcessCache(const char* executable) {
+    const std::string root = stageCacheWritable("/prewarm-on");
+    if (root.empty() || access(root.c_str(), F_OK) != 0) return false;
+    char suffix[64];
+    snprintf(suffix, sizeof(suffix), "/warm-%u-%016llx", unsigned(getuid()), (unsigned long long)warmHash(executable));
+    const std::string directory = stageCacheWritable(suffix);
+    std::lock_guard<std::mutex> lock(gWarmLock);
+    if (!gWarmDirectory.empty()) return false; // one replay per process, even with several Metal devices
+    if (mkdir(directory.c_str(), 0700) != 0 && errno != EEXIST) return false;
+    gWarmDirectory = directory;
+    return true;
+}
+
+void prewarmStageCache() {
+    std::string directory;
+    {
+        std::lock_guard<std::mutex> lock(gWarmLock);
+        directory = gWarmDirectory;
     }
-    std::unique_ptr<CompiledStage> with = compileStageOnce(bitcode, size, why, constants, iboBase, known);
-    std::unique_ptr<CompiledStage> chosen;
-    if (with == nullptr || with->stage.k.pvtmemSize == 0 || !theCompiler()->has_preamble) {
-        chosen = std::move(with);
-    } else {
-        theCompiler()->has_preamble = false;
-        std::string whyNot;
-        std::unique_ptr<CompiledStage> without = compileStageOnce(bitcode, size, &whyNot, constants, iboBase, known);
-        theCompiler()->has_preamble = true;
-        chosen = without != nullptr && preferWithoutPreamble(with->stage.k, without->stage.k) ? std::move(without) : std::move(with);
+    DIR* dir = opendir(directory.c_str());
+    if (dir == nullptr) return;
+    const bool background = hakios_metal_compiler_set_background(true);
+    gReplaying = true;
+    StageCacheMeasure measure;
+    for (dirent* entry; (entry = readdir(dir)) != nullptr;) {
+        const std::string file = entry->d_name;
+        if (file.size() != 21 || file.substr(16) != ".warm") continue;
+        const std::string data = cacheFileRead(directory + "/" + file);
+        CacheReader r{reinterpret_cast<const uint8_t*>(data.data()), reinterpret_cast<const uint8_t*>(data.data()) + data.size()};
+        if (r.u32() != kWarmMagic) { ++measure.stats.prewarm_failures; continue; }
+        const std::string bitcode = r.str();
+        FunctionConstants constants;
+        const uint32_t n = r.u32();
+        for (uint32_t i = 0; i < n && r.ok; i++) {
+            FunctionConstant c{};
+            c.index = r.u32();
+            r.raw(&c.bits, sizeof(c.bits));
+            constants.push_back(c);
+        }
+        const uint32_t ibo = r.u32(), samples = r.u32(), hasKnown = r.u32();
+        KnownBuffer known;
+        if (hasKnown) {
+            known.colorOutputs = r.u32();
+            known.binding = r.u32();
+            const std::string bytes = r.str(), mask = r.str();
+            known.bytes.assign(bytes.begin(), bytes.end());
+            known.mask.assign(mask.begin(), mask.end());
+        }
+        if (!r.ok || r.p != r.end) { ++measure.stats.prewarm_failures; continue; }
+        {
+            // a parsed recipe holds exactly this content under this name: this process has nothing to write for it
+            std::lock_guard<std::mutex> lock(gWarmLock);
+            gWarmOnDisk.insert(file);
+        }
+        const std::string name = stageCacheName(bitcode.data(), bitcode.size(), constants, ibo, hasKnown ? &known : nullptr, samples);
+        std::string why;
+        auto stage = compileStage(bitcode.data(), bitcode.size(), &why, constants, ibo, hasKnown ? &known : nullptr, true, samples);
+        if (!stage) {
+            ++measure.stats.prewarm_compiles;
+            stage = compileStage(bitcode.data(), bitcode.size(), &why, constants, ibo, hasKnown ? &known : nullptr, false, samples);
+        }
+        if (stage) {
+            std::lock_guard<std::mutex> lock(gWarmLock);
+            gWarmStages.emplace(name, std::move(stage));
+            ++measure.stats.prewarm_loaded;
+            if (gWarmStages.size() >= kWarmStages) break;
+        } else ++measure.stats.prewarm_failures;
     }
-    if (chosen != nullptr && !cached.empty()) stageCacheSave(cached, *chosen);
-    return chosen;
+    gReplaying = false;
+    hakios_metal_compiler_set_background(background);
+    closedir(dir);
 }
 
 
 
 namespace {
 std::unique_ptr<CompiledStage> compileStageOnce(const void* bitcode, size_t size, std::string* why, const FunctionConstants& constants, uint32_t iboBase,
-                                                const KnownBuffer* known) {
+                                                const KnownBuffer* known, uint32_t framebufferSamples) {
     Translation t;
+    t.framebufferSamples = framebufferSamples;
+    if (framebufferSamples != 1 && framebufferSamples != 2 && framebufferSamples != 4) {
+        refuse(why, "framebuffer fetch sample count must be 1, 2 or 4");
+        return nullptr;
+    }
     if (!translate(bitcode, size, t, why, constants, known)) return nullptr;
     // the stage is the module's named metadata (air.vertex / air.fragment / air.kernel: air_to_nir.c module_stage)
     const std::string name = t.info.entry_point ? t.info.entry_point : "the function";
@@ -1337,6 +2075,7 @@ std::unique_ptr<CompiledStage> compileStageOnce(const void* bitcode, size_t size
         return nullptr;
     }
     auto out = std::make_unique<CompiledStage>();
+    out->constantReads = constantReadsOf(t.nir);
     // read off the NIR before any lowering touches it: the textures the instructions address and the outputs' classes
     uint32_t highestSampler = 0;
     if (!walkTextures(t.nir, out->stage.k, &highestSampler, why)) return nullptr;
@@ -1363,7 +2102,7 @@ std::unique_ptr<CompiledStage> compileStageOnce(const void* bitcode, size_t size
         KernelTexture& kt = out->stage.k.textures[i];
         kt = KernelTexture{};
         kt.kind = kTexSampled;
-        kt.dim = kTexDim2D;
+        kt.dim = framebufferSamples > 1 ? kTexDimMS : kTexDim2D;
         kt.element = kElemFloat;
         kt.read = 1;
         kt.fbTarget = t.fbTargets[i];
@@ -1439,7 +2178,7 @@ std::unique_ptr<CompiledProgram> linkProgram(std::shared_ptr<CompiledStage> vs, 
         refuse(why, stageName(*fs) + " writes a sample mask: no multisampling is served");
         return nullptr;
     }
-    if (F.perSamp) {
+    if (F.perSamp && !F.fbRead) {
         refuse(why, stageName(*fs) + " runs per sample: no multisampling is served");
         return nullptr;
     }
@@ -1555,7 +2294,7 @@ bool argumentBufferLayout(const void* bitcode, size_t size, uint32_t set, std::v
     // under the compilers' lock as well: the front end and theCompiler() are the same ones compileAir uses, and Resident
     // Evil 4 asks for encoders on one thread while it compiles on others -- unlocked, the same function's layout came
     // back with 23 members, then 12, its set numbers garbage, and the encoders built from it wrote nothing
-    std::lock_guard<std::mutex> g(gCompilerLock);
+    CompilerTurn g;
     // the interface alone: a body the front end cannot translate yet does not keep a set's layout from being known
     Translation t;
     t.mem = ralloc_context(nullptr);
@@ -1661,3 +2400,18 @@ bool preferWithoutPreamble(const Kernel& with, const Kernel& without) {
 }
 
 }  // namespace hakios::metal
+
+bool hakios_metal_stage_cache_set_process(const char* executable) {
+#ifdef HAKIOS_METAL_MESA
+    return hakios::metal::setProcessCache(executable);
+#else
+    (void)executable;
+    return false;
+#endif
+}
+
+void hakios_metal_stage_cache_prewarm(void) {
+#ifdef HAKIOS_METAL_MESA
+    hakios::metal::prewarmStageCache();
+#endif
+}

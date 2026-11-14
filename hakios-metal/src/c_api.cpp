@@ -201,12 +201,25 @@ void refusedThere(hakios_metal_cb* cb, int r) {
 }
 }  // namespace
 
-namespace hakios::metal { extern std::atomic<uint32_t> gBuffersMade, gBuffersReused; extern std::atomic<uint64_t> gBytesMade; }
+namespace hakios::metal {
+extern std::atomic<uint32_t> gBuffersMade, gBuffersReused, gAttachmentsMade, gLongestStream, gStreamsCut;
+extern std::atomic<uint64_t> gBytesMade, gAttachmentBytesMade;
+}
 extern "C" {
 void hakios_metal_buffer_counts(unsigned* made, unsigned* reused, unsigned long long* bytes) {
     *made = hakios::metal::gBuffersMade.exchange(0);
     *reused = hakios::metal::gBuffersReused.exchange(0);
     *bytes = hakios::metal::gBytesMade.exchange(0);
+}
+
+void hakios_metal_stream_counts(unsigned* longest, unsigned* cut) {
+    *longest = hakios::metal::gLongestStream.exchange(0);
+    *cut = hakios::metal::gStreamsCut.exchange(0);
+}
+
+void hakios_metal_attachment_counts(unsigned* made, unsigned long long* bytes) {
+    *made = hakios::metal::gAttachmentsMade.exchange(0);
+    *bytes = hakios::metal::gAttachmentBytesMade.exchange(0);
 }
 
 
@@ -215,7 +228,7 @@ const char* hakios_metal_error(void) { return lastError.c_str(); }
 // Tiles, GMEM offsets and the shader compiler are built for one chip (a6xx.hpp). A kernel that does not say (0) is taken at its
 // word that it is that one: only a chip it names as another is refused, so that the window server stays on OpenGL ES there.
 bool hakios_metal_chip_known(uint32_t chip) { return chip == 0 || chip == a6xx::kChipId; }
-static bool chipKnown(uint32_t chip) { return hakios_metal_chip_known(chip); }
+[[maybe_unused]] static bool chipKnown(uint32_t chip) { return hakios_metal_chip_known(chip); }
 
 static hakios_metal_device* deviceOn(std::unique_ptr<Transport> t) {
     auto* d = new hakios_metal_device;
@@ -286,6 +299,13 @@ static FunctionConstants constantsOf(const hakios_metal_constant* c, unsigned co
 
 hakios_metal_kernel* hakios_metal_kernel_compile_bitcode(const void* bitcode, size_t size) {
     return hakios_metal_kernel_compile_bitcode_constants(bitcode, size, nullptr, 0);
+}
+
+unsigned hakios_metal_bitcode_function_constants(const void* bitcode, size_t size, unsigned* indices, unsigned max) {
+    if (bitcode == nullptr || size == 0) return 0;
+    std::vector<uint32_t> declared = functionConstantIndices(bitcode, size);
+    for (size_t i = 0; i < declared.size() && i < max; i++) indices[i] = declared[i];
+    return unsigned(declared.size());
 }
 
 hakios_metal_kernel* hakios_metal_kernel_compile_bitcode_constants(const void* bitcode, size_t size, const hakios_metal_constant* constants, unsigned count) {
@@ -365,7 +385,14 @@ hakios_metal_buffer* hakios_metal_buffer_new(hakios_metal_device* d, uint64_t le
 }
 
 void hakios_metal_buffer_free(hakios_metal_buffer* b) { delete b; }
-void* hakios_metal_buffer_contents(hakios_metal_buffer* b) { return b->buffer->contents(); }
+int hakios_metal_buffer_sync(hakios_metal_buffer* b) {
+    int e = CommandQueue::synchronize(b->buffer->bo());
+    if (e) { failed(std::string("buffer synchronization: ") + strerror(e)); return -1; }
+    return 0;
+}
+void* hakios_metal_buffer_contents(hakios_metal_buffer* b) {
+    return hakios_metal_buffer_sync(b) == 0 ? b->buffer->contents() : nullptr;
+}
 uint64_t hakios_metal_buffer_length(hakios_metal_buffer* b) { return b->buffer->length(); }
 uint64_t hakios_metal_buffer_gpu_address(hakios_metal_buffer* b) { return b->buffer->gpuAddress(); }
 
@@ -500,8 +527,11 @@ hakios_metal_texture* hakios_metal_texture_new_multisample(hakios_metal_device* 
 unsigned hakios_metal_texture_samples(hakios_metal_texture* t) { return t->texture->samples(); }
 unsigned hakios_metal_texture_depth(hakios_metal_texture* t) { return t->texture->depth(); }
 
+static int syncTexture(hakios_metal_texture* t);
+
 int hakios_metal_texture_replace_3d(hakios_metal_texture* t, unsigned level, unsigned x, unsigned y, unsigned z, unsigned w, unsigned h, unsigned d, const void* bytes,
                                     uint64_t bytesPerRow, uint64_t bytesPerImage) {
+    if (syncTexture(t) != 0) return -1;
     std::string why;
     if (!t->texture->replaceSlices(level, x, y, z, w, h, d, bytes, bytesPerRow, bytesPerImage, &why)) {
         failed(why);
@@ -512,6 +542,7 @@ int hakios_metal_texture_replace_3d(hakios_metal_texture* t, unsigned level, uns
 
 int hakios_metal_texture_read_3d(hakios_metal_texture* t, unsigned level, unsigned x, unsigned y, unsigned z, unsigned w, unsigned h, unsigned d, void* bytes,
                                  uint64_t bytesPerRow, uint64_t bytesPerImage) {
+    if (syncTexture(t) != 0) return -1;
     std::string why;
     if (!t->texture->readSlices(level, x, y, z, w, h, d, bytes, bytesPerRow, bytesPerImage, &why)) {
         failed(why);
@@ -565,8 +596,8 @@ hakios_metal_texture* hakios_metal_texture_new_compressed(hakios_metal_device* d
 
 namespace {
 hakios_metal_texture* textureOverSurface(hakios_metal_device* d, unsigned surfaceId, unsigned plane, unsigned pixelFormat, unsigned width, unsigned height,
-                                         unsigned usage, const Texture::SurfacePlane* chroma) {
-    if (plane != 0) {
+                                         unsigned usage, const Texture::SurfacePlane* chroma, const Texture::SurfacePlane* layout = nullptr) {
+    if (plane != 0 && layout == nullptr) {
         failed("plane " + std::to_string(plane) + " of IOSurface " + std::to_string(surfaceId) + ": a single-plane surface (plane 0) is what is served");
         return nullptr;
     }
@@ -576,7 +607,7 @@ hakios_metal_texture* textureOverSurface(hakios_metal_device* d, unsigned surfac
     desc.height = height;
     desc.usage = usage;
     std::string why;
-    std::shared_ptr<Texture> t = Texture::wrapSurface(*d->gpu, surfaceId, desc, &why, chroma);
+    std::shared_ptr<Texture> t = Texture::wrapSurface(*d->gpu, surfaceId, desc, &why, chroma, plane, layout);
     if (t == nullptr) {
         failed(why);
         return nullptr;
@@ -596,6 +627,13 @@ hakios_metal_texture* hakios_metal_texture_new_iosurface2(hakios_metal_device* d
                                                           unsigned height, unsigned usage, uint64_t chromaOffset, unsigned chromaRowBytes) {
     const Texture::SurfacePlane chroma{chromaOffset, chromaRowBytes};
     return textureOverSurface(d, surfaceId, plane, pixelFormat, width, height, usage, &chroma);
+}
+
+hakios_metal_texture* hakios_metal_texture_new_iosurface_plane(hakios_metal_device* d, unsigned surfaceId, unsigned plane, unsigned pixelFormat,
+                                                               unsigned width, unsigned height, unsigned usage, uint64_t offset,
+                                                               unsigned rowBytes, unsigned planeWidth, unsigned planeHeight) {
+    const Texture::SurfacePlane layout{offset, rowBytes, planeWidth, planeHeight};
+    return textureOverSurface(d, surfaceId, plane, pixelFormat, width, height, usage, nullptr, &layout);
 }
 
 hakios_metal_texture* hakios_metal_texture_new_buffer(hakios_metal_buffer* b, unsigned type, unsigned pixelFormat, unsigned width, unsigned height, unsigned usage,
@@ -672,7 +710,14 @@ uint64_t hakios_metal_texture_resource_id(hakios_metal_texture* t) { return t->t
 uint64_t hakios_metal_sampler_resource_id(hakios_metal_sampler* s) { return s->sampler.id; }
 
 void hakios_metal_texture_free(hakios_metal_texture* t) { delete t; }
-void* hakios_metal_texture_contents(hakios_metal_texture* t) { return t->texture->contents(); }
+static int syncTexture(hakios_metal_texture* t) {
+    int e = CommandQueue::synchronize(t->texture->buffer()->bo());
+    if (e) { failed(std::string("texture synchronization: ") + strerror(e)); return -1; }
+    return 0;
+}
+void* hakios_metal_texture_contents(hakios_metal_texture* t) {
+    return syncTexture(t) == 0 ? t->texture->contents() : nullptr;
+}
 uint64_t hakios_metal_texture_bytes_per_row(hakios_metal_texture* t) { return t->texture->bytesPerRow(); }
 uint64_t hakios_metal_texture_gpu_address(hakios_metal_texture* t) { return t->texture->gpuAddress(); }
 unsigned hakios_metal_texture_width(hakios_metal_texture* t) { return t->texture->width(); }
@@ -699,6 +744,7 @@ int hakios_metal_texture_replace(hakios_metal_texture* t, unsigned x, unsigned y
 
 int hakios_metal_texture_replace_level(hakios_metal_texture* t, unsigned level, unsigned x, unsigned y, unsigned w, unsigned h, const void* bytes,
                                        uint64_t bytesPerRow) {
+    if (syncTexture(t) != 0) return -1;
     std::string why;
     if (!t->texture->replace(level, x, y, w, h, bytes, bytesPerRow, &why)) {
         failed(why);
@@ -707,12 +753,19 @@ int hakios_metal_texture_replace_level(hakios_metal_texture* t, unsigned level, 
     return 0;
 }
 
+int hakios_metal_texture_is_complete(hakios_metal_texture* t) {
+    return CommandQueue::isComplete(t->texture->buffer()->bo());
+}
+
+int hakios_metal_texture_sync(hakios_metal_texture* t) { return syncTexture(t); }
+
 int hakios_metal_texture_read(hakios_metal_texture* t, unsigned x, unsigned y, unsigned w, unsigned h, void* bytes, uint64_t bytesPerRow) {
     return hakios_metal_texture_read_level(t, 0, x, y, w, h, bytes, bytesPerRow);
 }
 
 int hakios_metal_texture_read_level(hakios_metal_texture* t, unsigned level, unsigned x, unsigned y, unsigned w, unsigned h, void* bytes,
                                     uint64_t bytesPerRow) {
+    if (syncTexture(t) != 0) return -1;
     std::string why;
     if (!t->texture->read(level, x, y, w, h, bytes, bytesPerRow, &why)) {
         failed(why);
@@ -866,6 +919,12 @@ void hakios_metal_cb_skip_refused(hakios_metal_cb* cb, int on) {
     cb->cb->setSkipRefused(on != 0);
 }
 
+void hakios_metal_cb_inherit_settings(hakios_metal_cb* cb, const hakios_metal_cb* parent) {
+    if (cb == nullptr || parent == nullptr) return;
+    if (deferring(cb)) return cb->deferrer->post(&cb->pending, [cb, parent] { cb->cb->inheritSettings(*parent->cb); });
+    cb->cb->inheritSettings(*parent->cb);
+}
+
 void hakios_metal_cb_set_profile(hakios_metal_cb* cb, int on) {
     if (deferring(cb)) return cb->deferrer->post(&cb->pending, [cb, on] { cb->cb->setProfile(on != 0); });
     cb->cb->setProfile(on != 0);
@@ -893,6 +952,20 @@ void hakios_metal_cb_counts(hakios_metal_cb* cb, unsigned* passes, unsigned* dra
     if (clears) *clears = c.clears;
 }
 
+void hakios_metal_cb_set_pass_wfi(hakios_metal_cb* cb, int on) {
+    if (deferring(cb)) return cb->deferrer->post(&cb->pending, [cb, on] { cb->cb->setPassWfi(on != 0); });
+    cb->cb->setPassWfi(on != 0);
+}
+
+void hakios_metal_cb_sync_counts(hakios_metal_cb* cb, unsigned* flushes, unsigned* barriers, unsigned* waits, unsigned* chained) {
+    syncOne(cb);
+    const CommandBuffer::Counts& c = cb->cb->counts();
+    if (flushes) *flushes = c.flushes;
+    if (barriers) *barriers = c.barriers;
+    if (waits) *waits = c.waits;
+    if (chained) *chained = c.chained;
+}
+
 void hakios_metal_cb_set_gmem(hakios_metal_cb* cb, int on) {
     if (deferring(cb)) return cb->deferrer->post(&cb->pending, [cb, on] { cb->cb->setGmem(on != 0); });
     cb->cb->setGmem(on != 0);
@@ -916,6 +989,11 @@ void hakios_metal_cb_set_gmem_min_draws(hakios_metal_cb* cb, unsigned draws) {
 void hakios_metal_cb_set_gmem_binning(hakios_metal_cb* cb, int on) {
     if (deferring(cb)) return cb->deferrer->post(&cb->pending, [cb, on] { cb->cb->setGmemBinning(on != 0); });
     cb->cb->setGmemBinning(on != 0);
+}
+
+void hakios_metal_cb_set_gmem_msaa_zs(hakios_metal_cb* cb, int on) {
+    if (deferring(cb)) return cb->deferrer->post(&cb->pending, [cb, on] { cb->cb->setGmemMsaaZs(on != 0); });
+    cb->cb->setGmemMsaaZs(on != 0);
 }
 
 void hakios_metal_cb_set_null_fs_textures(hakios_metal_cb* cb, int on) {
@@ -1002,6 +1080,35 @@ int hakios_metal_cb_generate_mipmaps(hakios_metal_cb* cb, hakios_metal_texture* 
 namespace {
 // the dispatches' shared half: the bindings from the C tables, the dispatch itself (DO), and what has to live until
 // the GPU is done with it
+// Argument sets and constants copied by the CPU must see pending GPU writers, including this queue's.
+// Aligned, full constant ranges stay GPU reads and can remain in the same batch.
+bool bindSynchronizedArguments(const std::vector<Resource>& resources, const Kernel& kernel, Bindings* bindings,
+                               std::vector<std::shared_ptr<const void>>* kept, std::string* why) {
+    auto syncRead = [&](const Buffer& buffer) {
+        int e = CommandQueue::synchronize(buffer.bo(), false);
+        if (e) *why = std::string("CPU binding synchronization: ") + strerror(e);
+        return e == 0;
+    };
+    for (const auto& resource : resources) {
+        if (resource.argbufSet < bindings->buffers.size()) {
+            const auto* buffer = bindings->buffers[resource.argbufSet].buffer;
+            if (buffer && !syncRead(*buffer)) return false;
+        }
+    }
+    if (!bindArgumentBuffers(resources, bindings, kept, why)) return false;
+    for (unsigned i = 0; i < kernel.numUboRanges; i++) {
+        const auto& range = kernel.uboRanges[i];
+        if (range.block >= bindings->buffers.size()) continue;
+        const auto& binding = bindings->buffers[range.block];
+        if (!binding.buffer || binding.offset > binding.buffer->length()) continue;
+        const uint64_t start = 4ull * range.startDword, bytes = 4ull * range.sizeDwords;
+        const uint64_t available = binding.buffer->length() - binding.offset;
+        const bool shortCopy = start < available && bytes > available - start;
+        if (((binding.buffer->gpuAddress() + binding.offset + start) % 16 || shortCopy) && !syncRead(*binding.buffer)) return false;
+    }
+    return true;
+}
+
 int dispatchWith(hakios_metal_cb* cb, hakios_metal_kernel* k, hakios_metal_buffer* const* buffers, const uint64_t* offsets, unsigned count,
                  hakios_metal_texture* const* textures, unsigned textureCount, hakios_metal_sampler* const* samplers, unsigned samplerCount,
                  const std::function<bool(const Bindings&)>& dispatch) {
@@ -1030,7 +1137,7 @@ int dispatchWith(hakios_metal_cb* cb, hakios_metal_kernel* k, hakios_metal_buffe
     // the members of its argument buffers, from what the sets hold, at the indices the front end gave them
     std::vector<std::shared_ptr<const void>> members;
     std::string whyMembers;
-    if (!bindArgumentBuffers(k->kernel->resources, &b, &members, &whyMembers)) {
+    if (!bindSynchronizedArguments(k->kernel->resources, k->kernel->kernel, &b, &members, &whyMembers)) {
         failed(whyMembers);
         cb->cb->refuse(whyMembers);
         return -1;
@@ -1128,6 +1235,12 @@ hakios_metal_program* hakios_metal_program_new_bitcode(const void* vsBitcode, si
 hakios_metal_program* hakios_metal_program_new_bitcode_constants(const void* vsBitcode, size_t vsSize, const hakios_metal_constant* vsConstants, unsigned vsCount,
                                                                  const void* fsBitcode, size_t fsSize, const hakios_metal_constant* fsConstants, unsigned fsCount,
                                                                  unsigned colorPixelFormat) {
+    return hakios_metal_program_new_bitcode_samples(vsBitcode, vsSize, vsConstants, vsCount, fsBitcode, fsSize, fsConstants, fsCount, colorPixelFormat, 1);
+}
+
+hakios_metal_program* hakios_metal_program_new_bitcode_samples(const void* vsBitcode, size_t vsSize, const hakios_metal_constant* vsConstants, unsigned vsCount,
+                                                               const void* fsBitcode, size_t fsSize, const hakios_metal_constant* fsConstants, unsigned fsCount,
+                                                               unsigned colorPixelFormat, unsigned samples) {
     std::string why;
     std::unique_ptr<CompiledStage> vs = compileStage(vsBitcode, vsSize, &why, constantsOf(vsConstants, vsCount));
     if (vs == nullptr) {
@@ -1143,26 +1256,52 @@ hakios_metal_program* hakios_metal_program_new_bitcode_constants(const void* vsB
         fsCount = 0;
     }
     // the FS's device buffers past the VS's in the one IBO table the two share
-    std::unique_ptr<CompiledStage> fs = compileStage(fsBitcode, fsSize, &why, constantsOf(fsConstants, fsCount), vs->stage.k.numSsbos);
+    std::unique_ptr<CompiledStage> fs = compileStage(fsBitcode, fsSize, &why, constantsOf(fsConstants, fsCount), vs->stage.k.numSsbos, nullptr, false, samples);
     if (fs == nullptr) {
         failed(why);
         return nullptr;
     }
-    return programOf(std::move(vs), std::move(fs), colorPixelFormat);
+    auto* p = programOf(std::move(vs), std::move(fs), colorPixelFormat);
+    if (p != nullptr) p->program->program.samples = samples;
+    return p;
 }
 
-hakios_metal_program* hakios_metal_program_specialize(hakios_metal_program* base, const void* fsBitcode, size_t fsSize, const hakios_metal_constant* fsConstants,
-                                                     unsigned fsCount, unsigned binding, const void* bytes, size_t length) {
-    if (base == nullptr || fsBitcode == nullptr || fsSize == 0 || bytes == nullptr) {
-        failed("a specialisation needs the program, its fragment function's bitcode and the buffer's bytes");
+bool hakios_metal_program_framebuffer_fetch(hakios_metal_program* p) {
+    return p != nullptr && p->program->program.fs.fbRead;
+}
+
+hakios_metal_program* hakios_metal_program_new_bitcode_config(const void* vsBitcode, size_t vsSize,
+    const void* fsBitcode, size_t fsSize, const void* config, size_t configSize, unsigned colorFormat) {
+    if (!config || !configSize) { failed("no fragment configuration"); return nullptr; }
+    std::string why;
+    auto vs = compileStage(vsBitcode, vsSize, &why);
+    if (!vs) { failed(why); return nullptr; }
+    KnownBuffer known;
+    if (configSize != 52 || static_cast<const uint8_t*>(config)[37] >= 3) {
+        failed("invalid iOS CA fragment configuration"); return nullptr;
+    }
+    known.colorOutputs = 1u << static_cast<const uint8_t*>(config)[37];
+    known.binding = 0;
+    known.bytes.assign(static_cast<const uint8_t*>(config), static_cast<const uint8_t*>(config) + configSize);
+    auto fs = compileStage(fsBitcode, fsSize, &why, {}, vs->stage.k.numSsbos, &known);
+    if (!fs) { failed(why); return nullptr; }
+    return programOf(std::move(vs), std::move(fs), colorFormat);
+}
+
+static hakios_metal_program* specialize(hakios_metal_program* base, const void* fsBitcode, size_t fsSize, const hakios_metal_constant* fsConstants,
+                                        unsigned fsCount, unsigned binding, const void* bytes, const uint8_t* mask, size_t length, bool cachedOnly) {
+    if (base == nullptr || fsBitcode == nullptr || fsSize == 0 || bytes == nullptr || mask == nullptr) {
+        failed("a specialisation needs the program, its fragment function's bitcode and the buffer's bytes and mask");
         return nullptr;
     }
     std::string why;
     KnownBuffer known;
     known.binding = binding;
     known.bytes.assign(static_cast<const uint8_t*>(bytes), static_cast<const uint8_t*>(bytes) + length);
+    known.mask.assign(mask, mask + length);
     const Program& was = base->program->program;
-    std::unique_ptr<CompiledStage> fs = compileStage(fsBitcode, fsSize, &why, constantsOf(fsConstants, fsCount), was.fsIboBase, &known);
+    const uint32_t fetchSamples = was.fs.fbRead && was.fs.perSamp ? was.samples : 1;
+    std::unique_ptr<CompiledStage> fs = compileStage(fsBitcode, fsSize, &why, constantsOf(fsConstants, fsCount), was.fsIboBase, &known, cachedOnly, fetchSamples);
     if (fs == nullptr) {
         failed(why);
         return nullptr;
@@ -1181,6 +1320,17 @@ hakios_metal_program* hakios_metal_program_specialize(hakios_metal_program* base
     r->program = std::move(p);
     r->color = base->color;
     return r;
+}
+
+hakios_metal_program* hakios_metal_program_specialize(hakios_metal_program* base, const void* fsBitcode, size_t fsSize, const hakios_metal_constant* fsConstants,
+                                                     unsigned fsCount, unsigned binding, const void* bytes, const uint8_t* mask, size_t length) {
+    return specialize(base, fsBitcode, fsSize, fsConstants, fsCount, binding, bytes, mask, length, false);
+}
+
+hakios_metal_program* hakios_metal_program_specialize_cached(hakios_metal_program* base, const void* fsBitcode, size_t fsSize,
+                                                            const hakios_metal_constant* fsConstants, unsigned fsCount, unsigned binding,
+                                                            const void* bytes, const uint8_t* mask, size_t length) {
+    return specialize(base, fsBitcode, fsSize, fsConstants, fsCount, binding, bytes, mask, length, true);
 }
 
 unsigned hakios_metal_program_stage_words(hakios_metal_program* p, unsigned stage) {
@@ -1224,6 +1374,15 @@ static const CompiledStage* stageOf(hakios_metal_program* p, unsigned stage) {
 unsigned hakios_metal_program_resource_count(hakios_metal_program* p, unsigned stage) {
     const CompiledStage* s = stageOf(p, stage);
     return s != nullptr ? unsigned(s->resources.size()) : 0;
+}
+
+void hakios_metal_program_constant_reads(hakios_metal_program* p, unsigned stage, unsigned binding, uint8_t* mask, size_t length) {
+    const CompiledStage* s = stageOf(p, stage);
+    if (s == nullptr) {
+        memset(mask, 0xff, length);
+        return;
+    }
+    constantReadMask(*s, binding, mask, length);
 }
 
 int hakios_metal_program_resource(hakios_metal_program* p, unsigned stage, unsigned i, unsigned* kind, unsigned* index, unsigned* sizeBytes) {
@@ -1318,6 +1477,7 @@ static void keepPassAlive(hakios_metal_cb* cb, const struct hakios_metal_render_
         if (m.texture != nullptr) cb->cb->keepAlive(m.texture->texture);
     }
     if (pass->depth != nullptr) cb->cb->keepAlive(pass->depth->texture);
+    if (pass->stencil != nullptr) cb->cb->keepAlive(pass->stencil->texture);
     if (pass->visibility != nullptr) cb->cb->keep(pass->visibility->buffer);   // the result words the draws write
 }
 
@@ -1378,8 +1538,8 @@ int drawCommon(hakios_metal_cb* cb, hakios_metal_program* p, const struct hakios
     // both stages' argument-buffer members, from what the sets hold, at the indices the front end gave them
     std::vector<std::shared_ptr<const void>> members;
     std::string whyMembers;
-    if (!bindArgumentBuffers(p->program->vs->resources, &vsb, &members, &whyMembers) ||
-        !bindArgumentBuffers(p->program->fs->resources, &fsb, &members, &whyMembers)) {
+    if (!bindSynchronizedArguments(p->program->vs->resources, p->program->vs->stage.k, &vsb, &members, &whyMembers) ||
+        !bindSynchronizedArguments(p->program->fs->resources, p->program->fs->stage.k, &fsb, &members, &whyMembers)) {
         failed(whyMembers);
         cb->cb->refuse(whyMembers);
         return -1;
@@ -1395,8 +1555,8 @@ int drawCommon(hakios_metal_cb* cb, hakios_metal_program* p, const struct hakios
         targetLevel = rp.more[i].level;
     }
     if (target == nullptr) {
-        target = rp.depth;
-        targetLevel = rp.depthLevel;
+        target = rp.depth != nullptr ? rp.depth : rp.stencil;
+        targetLevel = rp.depth != nullptr ? rp.depthLevel : 0;
     }
     Draw d;
     d.primitive = Primitive(primitive);
@@ -1426,6 +1586,7 @@ int drawCommon(hakios_metal_cb* cb, hakios_metal_program* p, const struct hakios
         if (pass->depth_state_set) d.depth = DepthState{pass->depth_compare, pass->depth_write != 0};
         d.cullMode = pass->cull_mode;
         d.winding = pass->winding;
+        d.glMode = pass->gl_mode;
         if (pass->stencil_state_set) {
             auto face = [](const hakios_metal_render_pass::hakios_metal_stencil_face& f) {
                 return StencilFace{f.compare, f.stencil_fail, f.depth_fail, f.pass, f.read_mask, f.write_mask};
@@ -1615,12 +1776,80 @@ void hakios_metal_cb_fail(hakios_metal_cb* cb, const char* why) {
     cb->cb->refuse(why != nullptr ? why : "refused");
 }
 
-void hakios_metal_cb_commit(hakios_metal_cb* cb, void (*callback)(hakios_metal_cb*, void*), void* context) {
-    if (deferring(cb)) return cb->deferrer->post(&cb->pending, [cb, callback, context] { hakios_metal_cb_commit(cb, callback, context); });
-    if (callback != nullptr) {
-        cb->cb->addCompletedHandler([cb, callback, context](CommandBuffer&) { callback(cb, context); });
+static void commitBatch(CommandQueue& queue, const std::vector<hakios_metal_commit>& commits) {
+    std::vector<std::shared_ptr<CommandBuffer>> buffers;
+    for (const auto& entry : commits) {
+        auto core = entry.cb->cb;
+        if (entry.callback != nullptr) {
+            core->addCompletedHandler([entry](CommandBuffer&) { entry.callback(entry.cb, entry.context); });
+        }
+        buffers.push_back(std::move(core));
     }
-    cb->cb->commit();
+    queue.commitBatch(buffers);
+}
+
+void hakios_metal_queue_commit_batch(hakios_metal_queue* q, const hakios_metal_commit* commits, unsigned count) {
+    if (count == 0) return;
+    std::vector<hakios_metal_commit> entries(commits, commits + count);
+    if (q->deferrer != nullptr) {
+        // A local barrier outlives callback-owned C handles. The worker never touches a CB after commit.
+        std::atomic<int> pending{0};
+        q->deferrer->post(&pending, [&] { commitBatch(*q->queue, entries); });
+        q->deferrer->drain(&pending);
+    } else {
+        commitBatch(*q->queue, entries);
+    }
+}
+
+void hakios_metal_cb_commit(hakios_metal_cb* cb, void (*callback)(hakios_metal_cb*, void*), void* context) {
+    auto core = cb->cb;
+    auto deferrer = cb->deferrer;
+    auto submit = [core, cb, callback, context] {
+        if (callback != nullptr) core->addCompletedHandler([cb, callback, context](CommandBuffer&) { callback(cb, context); });
+        core->commit();
+    };
+    if (deferring(cb)) {
+        std::atomic<int> pending{0};
+        deferrer->post(&pending, std::move(submit));
+        deferrer->drain(&pending); // real fence before return, even if the callback freed cb
+    } else {
+        submit();
+    }
+}
+
+void hakios_metal_queue_stage_batch(hakios_metal_queue* q, const hakios_metal_commit* commits, unsigned count,
+                                    void (*scheduled)(hakios_metal_cb*, void*), const unsigned* reasons) {
+    if (count == 0) return;
+    std::vector<hakios_metal_commit> entries(commits, commits + count);
+    std::vector<unsigned> causes(reasons, reasons + count);
+    auto stage = [&] {
+        std::vector<std::shared_ptr<CommandBuffer>> buffers;
+        for (const auto& entry : entries) {
+            auto core = entry.cb->cb;
+            if (entry.callback) core->addCompletedHandler([entry](CommandBuffer&) { entry.callback(entry.cb, entry.context); });
+            if (scheduled) core->setScheduledHandler([entry, scheduled] { scheduled(entry.cb, entry.context); });
+            buffers.push_back(std::move(core));
+        }
+        for (unsigned i = 0; i < count; i++)
+            q->queue->stageBatch({buffers[i]}, static_cast<CommandQueue::DrainReason>(causes[i]));
+    };
+    if (q->deferrer != nullptr) {
+        std::atomic<int> pending{0};
+        q->deferrer->post(&pending, stage);
+        q->deferrer->drain(&pending);
+    } else stage();
+}
+
+void hakios_metal_queue_drain(hakios_metal_queue* q, unsigned reason) {
+    q->queue->drain(static_cast<CommandQueue::DrainReason>(reason));
+}
+void hakios_metal_drain_all(unsigned reason) {
+    CommandQueue::drainAll(static_cast<CommandQueue::DrainReason>(reason));
+}
+int hakios_metal_surface_sync(unsigned surface) {
+    int e = synchronizeSurface(surface);
+    if (e) { failed(std::string("IOSurface synchronization: ") + strerror(e)); return -1; }
+    return 0;
 }
 
 void hakios_metal_cb_wait(hakios_metal_cb* cb) {

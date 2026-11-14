@@ -1,6 +1,7 @@
 #include "hakios-metal/texture.hpp"
 
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <vector>
 #include <mutex>
@@ -84,6 +85,8 @@ constexpr FormatInfo kFormats[] = {
     // Z32_FLOAT is FMT6_32_FLOAT to the TP and the 2D engine (fd6_format_table.c:330 VT(Z32_FLOAT, 32_FLOAT, WZYX)) and
     // DEPTH6_32 to the RB (fd6_pipe2depth)
     {PixelFormat::kDepth32Float, FMT6_32_FLOAT, 4, WZYX, false, false, kElemFloat, "Depth32Float", true},
+    {PixelFormat::kDepth16Unorm, FMT6_16_UNORM, 2, WZYX, false, false, kElemFloat, "Depth16Unorm", true},
+    {PixelFormat::kStencil8, FMT6_8_UINT, 1, WZYX, false, false, kElemUint, "Stencil8", false, true},
     // the S8 plane read as its own image (fdl6_view_init over a stencil layout): FMT6_8_UINT, tiled as the plane is laid
     // out (TILE6_3, its rows to 32, its pitch to 128) -- "depth" here for the tiling, which a stencil view shares
     {PixelFormat::kX32Stencil8, FMT6_8_UINT, 1, WZYX, false, false, kElemUint, "X32_Stencil8", true},
@@ -200,6 +203,7 @@ uint64_t texturePitch(const FormatInfo& format, uint32_t width) {
     // 1 << (pitchalign + 6)) = align(width * cpp, 64 * cpp); so a row is a multiple of 64 pixels
     // (a block format counts blocks across, as fdl_set_pitchalign does: nblocksx * cpp, cpp the block's bytes)
     uint64_t unit = 64ull * format.bytesPerPixel;
+    if (format.depth || format.stencil) unit = format.bytesPerPixel == 1 ? 128 : std::max<uint64_t>(256, unit);
     return (uint64_t(blocksAcross(format, width)) * format.bytesPerPixel + unit - 1) / unit * unit;
 }
 
@@ -220,9 +224,18 @@ TextureLevel textureLevel(const FormatInfo& format, uint32_t width, uint32_t hei
 }
 
 namespace {
+// fdl6_tile_alignment: cpp includes samples; cpp 1 uses 128-byte/32-row tiles,
+// cpp 2 uses 256-byte/16-row tiles, larger cpp uses 64*cpp/16-row tiles.
+uint64_t zsPitch(uint32_t cpp, uint32_t width) {
+    const uint64_t alignment = cpp == 1 ? 128 : 64ull * std::max(4u, cpp);
+    return (uint64_t(width) * cpp + alignment - 1) / alignment * alignment;
+}
+uint64_t zsBytes(uint32_t cpp, uint32_t width, uint32_t height) {
+    const uint32_t rows = cpp == 1 ? 32 : 16;
+    return ((uint64_t(height) + rows - 1) / rows * rows * zsPitch(cpp, width) + 4095) / 4096 * 4096;
+}
 uint64_t depthBytes(const FormatInfo& format, uint32_t width, uint32_t height) {
-    uint64_t rows = (uint64_t(height) + 15) / 16 * 16;
-    return (rows * texturePitch(format, width) + 4095) / 4096 * 4096;
+    return zsBytes(format.bytesPerPixel, width, height);
 }
 uint64_t s8Pitch(uint32_t width) { return (uint64_t(width) + 127) / 128 * 128; }
 }  // namespace
@@ -244,6 +257,7 @@ uint64_t s8Bytes(uint32_t width, uint32_t height) { return ((uint64_t(height) + 
 }  // namespace
 
 uint64_t textureBytes(const FormatInfo& format, uint32_t width, uint32_t height, uint32_t levels) {
+    if (format.format == PixelFormat::kStencil8) return zsBytes(1, width, height);
     if (format.depth && levels > 1) {
         const TextureLevel last = depthLevel(format, width, height, levels - 1);
         return last.offset + depthBytes(format, last.width, last.height);
@@ -260,8 +274,7 @@ uint64_t textureBytes(const FormatInfo& format, uint32_t width, uint32_t height,
         // rows counted to the tiled height alignment of 16 for cpp 4 (fdl6_tile_alignment, :81-95; the pitch is
         // texturePitch's, the same 64 * cpp), the layer 4096-aligned, and so is the base (base_align, :102-104: the
         // buffer is whole pages)
-        uint64_t rows = (uint64_t(height) + 15) / 16 * 16;
-        return (rows * texturePitch(format, width) + 4095) / 4096 * 4096;
+        return depthBytes(format, width, height);
     }
     return layerBytes2d(blocksDown(format, height), texturePitch(format, width));
 }
@@ -348,12 +361,12 @@ bool Texture::plan(const TextureDesc& desc, const FormatInfo** infoOut, uint64_t
         refuse(why, std::string("a ") + info->name + " texture with usage " + n(desc.usage) + ": a compressed format is sampled alone (1), not stored or drawn into");
         return false;
     }
-    if (info->depth && desc.mipLevels != 1 && (info->stencil || desc.samples != 1)) {
+    if ((info->depth || info->stencil) && desc.mipLevels != 1 && (info->stencil || desc.samples != 1)) {
         refuse(why, std::string("a ") + info->name + " texture of " + n(desc.mipLevels) + " mip levels: mip levels of a depth texture with a stencil plane or "
                         "samples are not served");
         return false;
     }
-    if (info->depth && (desc.usage & ~kTextureUsageRead) != kTextureUsageRenderTarget) {
+    if ((info->depth || info->stencil) && (desc.usage & ~kTextureUsageRead) != kTextureUsageRenderTarget) {
         // a depth texture is an attachment the RB writes, and may be sampled (a shadow map): the TP reads the tiled layout
         // as fdl6_view_init describes it (sampledDescriptor); a store into it would need the tiled IBO, which is not here
         refuse(why, std::string("a ") + info->name + " texture with usage " + n(desc.usage) +
@@ -362,10 +375,9 @@ bool Texture::plan(const TextureDesc& desc, const FormatInfo** infoOut, uint64_t
     }
     // (shader read is taken beside render target -- sokol asks for both on every attachment; a shader sampling one as a
     // 2D texture is refused at its draw by the type, a texture2d_ms read is served as such)
-    if (multisample && (info->stencil || info->blockW > 1 || desc.mipLevels != 1 || (desc.usage & ~kTextureUsageRead) != kTextureUsageRenderTarget)) {
+    if (multisample && (info->blockW > 1 || desc.mipLevels != 1 || (desc.usage & ~kTextureUsageRead) != kTextureUsageRenderTarget)) {
         refuse(why, std::string("a multisample ") + info->name + " texture of " + n(desc.mipLevels) + " levels with usage " + n(desc.usage) +
-                        ": one level of an uncompressed colour format or Depth32Float, a render target (4) alone, is served (a stencil plane is "
-                        "laid out apart and not for samples here)");
+                        ": one level of an uncompressed colour or depth/stencil render target (4) is served");
         return false;
     }
     // (a slice texture is sampled or stored by a kernel, and may be drawn into a slice at a time: the slices are 2D layouts
@@ -378,7 +390,7 @@ bool Texture::plan(const TextureDesc& desc, const FormatInfo** infoOut, uint64_t
     // (a depth 2D array -- a shadow map's cascades -- is each layer a tiled depth plane, drawn into and sampled: one level,
     // no stencil plane; what the depth check above already asked of its usage)
     const bool depthArray = info->depth && !info->stencil && desc.type == TextureType::k2DArray && desc.mipLevels == 1 && desc.samples == 1;
-    if (slices && !depthArray && (info->depth || info->twoPlane || info->blockW > 1 || (desc.usage & (kTextureUsageRead | kTextureUsageWrite)) == 0 ||
+    if (slices && !depthArray && (info->depth || info->stencil || info->twoPlane || info->blockW > 1 || (desc.usage & (kTextureUsageRead | kTextureUsageWrite)) == 0 ||
                    (desc.usage & ~sliceUsage) != 0)) {
         refuse(why, std::string("a ") + (desc.type == TextureType::k3D ? "3D " : desc.type == TextureType::kCube ? "cube " : "2D array ") + info->name + " texture with usage " + n(desc.usage) +
                         ": one of an uncompressed colour format, sampled (1)" + (desc.type == TextureType::kCube ? "" : " or stored by a kernel (2)") +
@@ -391,12 +403,11 @@ bool Texture::plan(const TextureDesc& desc, const FormatInfo** infoOut, uint64_t
                            : desc.mipLevels > 1 ? textureBytes(*info, desc.width, desc.height, desc.mipLevels)
                                                 : (uint64_t(blocksDown(*info, desc.height)) * pitch + 4095) / 4096 * 4096;
     uint64_t bytes = slices ? layer * desc.depth : textureBytes(*info, memoryWidth, desc.height, desc.mipLevels);
-    if (info->depth && desc.samples > 1) {
-        // a multisample depth layout is fdl6's tiled one at cpp 4 * samples: the pitch aligned to 64 such texels
-        // (fdl6_tile_alignment's pitchalign = log2(cpp)), its rows counted to 16, the layer 4096-aligned
-        const uint64_t cpp = uint64_t(info->bytesPerPixel) * desc.samples;
-        pitch = (uint64_t(desc.width) * cpp + 64 * cpp - 1) / (64 * cpp) * (64 * cpp);
-        bytes = ((uint64_t(desc.height) + 15) / 16 * 16 * pitch + 4095) / 4096 * 4096;
+    if ((info->depth || info->stencil) && desc.samples > 1) {
+        const uint32_t cpp = info->bytesPerPixel * desc.samples;
+        pitch = zsPitch(cpp, desc.width);
+        bytes = zsBytes(cpp, desc.width, desc.height);
+        if (info->depth && info->stencil) bytes += zsBytes(desc.samples, desc.width, desc.height);
     }
     *infoOut = info;
     *pitchOut = pitch;
@@ -437,6 +448,10 @@ const Sampler* samplerById(uint64_t id) {
     auto it = gSamplers.find(id);
     return it != gSamplers.end() ? &it->second : nullptr;   // (an unordered_map's elements stay where they are)
 }
+
+// of the buffers newBuffer counts, those made for attachments (hakios_metal_attachment_counts)
+std::atomic<uint32_t> gAttachmentsMade{0};
+std::atomic<uint64_t> gAttachmentBytesMade{0};
 
 std::shared_ptr<Texture> Texture::make(Gpu& gpu, const TextureDesc& desc, std::string* why) {
     const FormatInfo* info = nullptr;
@@ -492,9 +507,16 @@ std::shared_ptr<Texture> Texture::make(Gpu& gpu, const TextureDesc& desc, std::s
         return nullptr;
 #endif
     }
-    std::shared_ptr<Buffer> buffer = newBuffer(gpu, bytes, why);
+    // (a multisample or depth/stencil texture is an attachment, its contents undefined until a pass clears or draws
+    // them: Maps makes a 56 MB one every frame, and clearing it again cost more than the frame)
+    const bool attachment = desc.samples > 1 || info->depth || info->stencil;
+    std::shared_ptr<Buffer> buffer = newBuffer(gpu, bytes, why, attachment ? kBoWriteCombined | kBoUncleared : kBoWriteCombined);
     if (buffer == nullptr) {
         return nullptr;
+    }
+    if (attachment) {
+        gAttachmentsMade++;
+        gAttachmentBytesMade += bytes;
     }
     return adopt(new Texture(std::move(buffer), desc, info, pitch));
 }
@@ -524,10 +546,10 @@ bool regionFits(const Texture& t, uint32_t level, uint32_t x, uint32_t y, uint32
 }
 }  // namespace
 
-uint64_t Texture::depthPlaneBytes() const { return info_->depth ? depthBytes(*info_, desc_.width, desc_.height) : buffer_->length(); }
-uint64_t Texture::stencilOffset() const { return info_->stencil ? depthPlaneBytes() : 0; }
-uint64_t Texture::stencilPitch() const { return info_->stencil ? s8Pitch(desc_.width) : 0; }
-uint64_t Texture::stencilPlaneBytes() const { return info_->stencil ? s8Bytes(desc_.width, desc_.height) : 0; }
+uint64_t Texture::depthPlaneBytes() const { return info_->depth ? zsBytes(info_->bytesPerPixel * desc_.samples, desc_.width, desc_.height) : 0; }
+uint64_t Texture::stencilOffset() const { return info_->stencil && info_->depth ? depthPlaneBytes() : 0; }
+uint64_t Texture::stencilPitch() const { return info_->stencil ? zsPitch(desc_.samples, desc_.width) : 0; }
+uint64_t Texture::stencilPlaneBytes() const { return info_->stencil ? zsBytes(desc_.samples, desc_.width, desc_.height) : 0; }
 
 TextureLevel Texture::level(uint32_t l) const {
     if (surface_ != 0 || desc_.mipLevels <= 1) return TextureLevel{0, pitch_, desc_.width, desc_.height};
@@ -665,7 +687,7 @@ bool Texture::replace(uint32_t level, uint32_t x, uint32_t y, uint32_t w, uint32
     if (desc_.samples != 1) {
         return refuse(why, "a multisample texture's samples are the GPU's alone: resolve it into a texture of one sample first (Metal refuses this too)");
     }
-    if (info_->depth) {
+    if (info_->depth || info_->stencil) {
         return refuse(why, std::string("a ") + info_->name + " texture is tiled (TILE6_3): its bytes are not rows the CPU can address");
     }
     if (info_->twoPlane) {
@@ -686,6 +708,7 @@ bool Texture::replace(uint32_t level, uint32_t x, uint32_t y, uint32_t w, uint32
     for (uint32_t r = 0; r < blocksDown(*info_, h); r++) {
         memcpy(dst + uint64_t(r) * L.pitch, src + uint64_t(r) * bytesPerRow, row);
     }
+    markWritten();   // (v29i D1: an upload is a write; a draw may sample it from here)
     return true;
 }
 
@@ -695,7 +718,7 @@ bool Texture::read(uint32_t level, uint32_t x, uint32_t y, uint32_t w, uint32_t 
     if (desc_.samples != 1) {
         return refuse(why, "a multisample texture's samples are the GPU's alone: resolve it into a texture of one sample first (Metal refuses this too)");
     }
-    if (info_->depth) {
+    if (info_->depth || info_->stencil) {
         return refuse(why, std::string("a ") + info_->name + " texture is tiled (TILE6_3): its bytes are not rows the CPU can address");
     }
     if (info_->twoPlane) {
@@ -758,6 +781,7 @@ bool Texture::replaceSlices(uint32_t level, uint32_t x, uint32_t y, uint32_t z, 
         auto* src = static_cast<const uint8_t*>(bytes) + uint64_t(s) * bytesPerImage;
         for (uint32_t r = 0; r < h; r++) memcpy(dst + uint64_t(r) * L.pitch, src + uint64_t(r) * bytesPerRow, row);
     }
+    markWritten();   // (v29i D1)
     return true;
 }
 
@@ -823,13 +847,16 @@ a6xx::TexConst Texture::sampledDescriptor() const {
         d.dword[10] |= A6XX_TEX_CONST_10_FLAG_BUFFER_PITCH(ubwcPitch_) | A6XX_TEX_CONST_10_FLAG_BUFFER_LOGW(ubwcLogW_) |
                        A6XX_TEX_CONST_10_FLAG_BUFFER_LOGH(ubwcLogH_);
     }
-    if (info_->depth) {
+    if (info_->depth || info_->stencil) {
         // the depth plane as the TP reads it (fdl6_view_init over a depth layout): TILE6_3, and TILE_ALL since every level
         // of a depth layout is tiled (fd6_layout.c:157-164 "Linear D/S is not supported by HW"); FMT6_32_FLOAT, the depth
         // in the first component, as fd6_format_texture gives Z32_FLOAT. Its pitch is the layout's (PITCHALIGN log2(cpp)
         // for cpp 4, fdl6_tile_alignment)
         d.dword[0] = (d.dword[0] & ~(A6XX_TEX_CONST_0_TILE_MODE__MASK | A6XX_TEX_CONST_0_MIPLVLS__MASK)) | A6XX_TEX_CONST_0_TILE_MODE(TILE6_3);   // level 0 alone (depthLevel)
         d.dword[3] |= A6XX_TEX_CONST_3_TILE_ALL;
+        const uint32_t cpp = info_->bytesPerPixel * desc_.samples;
+        const uint32_t align = cpp == 1 ? 1 : std::max(2u, log2u(cpp));
+        d.dword[2] = (d.dword[2] & ~A6XX_TEX_CONST_2_PITCHALIGN__MASK) | A6XX_TEX_CONST_2_PITCHALIGN(align);
     }
     if (info_->twoPlane) {
         // the second plane as fdl6_view_init gives it (fd6_view.c:255-289): its pitch over MIN_LOD_CLAMP's dword and its
@@ -844,6 +871,10 @@ a6xx::TexConst Texture::sampledDescriptor() const {
 }
 
 a6xx::TexConst Texture::levelDescriptor(uint32_t level) const {
+    // The same shape sampledDescriptor gives, for one level of it: LEVEL's address, its size and its pitch, one sample
+    // and one mip level (texture.hpp). What it cannot express -- a multisample attachment's interleaved samples, a
+    // compressed attachment's tiles and flag buffer -- is refused by the framebuffer fetch that asks for it
+    // (render.cpp: stageTextures), never served as a linear view of memory that is not.
     const TextureLevel L = this->level(level);
     a6xx::TexConst d = texture2d(levelAddress(level), L.width, L.height, uint32_t(L.pitch), pitchAlign_ != ~0u ? pitchAlign_ : log2u(info_->bytesPerPixel),
                                  info_->fmt6, info_->swap, info_->hasAlpha, info_->srgb);
@@ -876,7 +907,7 @@ std::shared_ptr<Texture> Texture::swizzled(const std::shared_ptr<Texture>& textu
             return nullptr;
         }
     }
-    std::shared_ptr<Texture> t = adopt(new Texture(p.buffer_, p.desc_, p.info_, p.pitch_, p.offset_, p.pitchAlign_, p.surface_));
+    std::shared_ptr<Texture> t = adopt(new Texture(p.buffer_, p.desc_, p.info_, p.pitch_, p.offset_, p.pitchAlign_, p.surface_, p.everWritten()));
     t->chroma_ = p.chroma_;
     t->layerPitch_ = p.layerPitch_;
     // over the parent's: a component naming red reads what the parent's red reads
@@ -918,14 +949,15 @@ bool Texture::isShaped(const KernelTexture& t) const {
     return false;
 }
 
-std::shared_ptr<Texture> Texture::wrapSurface(Gpu& gpu, uint32_t surfaceId, const TextureDesc& desc, std::string* why, const SurfacePlane* chroma) {
+std::shared_ptr<Texture> Texture::wrapSurface(Gpu& gpu, uint32_t surfaceId, const TextureDesc& desc, std::string* why, const SurfacePlane* chroma,
+                                              unsigned plane, const SurfacePlane* layout) {
     const FormatInfo* info = formatInfo(desc.format);
     if (info == nullptr || desc.type != TextureType::k2D) {
         refuse(why, "a texture over IOSurface " + n(surfaceId) + " of type " + n(uint32_t(desc.type)) + " and pixel format " + n(uint32_t(desc.format)) +
                         ": a 2D texture of one of the served colour formats is what a surface takes");
         return nullptr;
     }
-    if (info->depth) {
+    if (info->depth || info->stencil) {
         refuse(why, std::string("a ") + info->name + " texture over an IOSurface: a depth texture is tiled, a surface's rows are linear");
         return nullptr;
     }
@@ -943,12 +975,32 @@ std::shared_ptr<Texture> Texture::wrapSurface(Gpu& gpu, uint32_t surfaceId, cons
         return nullptr;
     }
     const std::string name = "IOSurface " + n(surfaceId);
+    if ((plane != 0 && layout == nullptr) || (info->twoPlane && (plane != 0 || layout != nullptr))) {
+        refuse(why, name + ": a separate plane needs its IOSurface layout; a combined YCbCr texture starts at plane 0");
+        return nullptr;
+    }
     if (info->twoPlane) {
         std::shared_ptr<Texture> t = wrapTwoPlanes(std::move(buffer), s, name, desc, info, chroma, why);
         if (t != nullptr) t->surface_ = surfaceId;
         return t;
     }
-    if (s.planes > 1) {
+    if (layout != nullptr) {
+        // IOSurface's plane getters supply geometry absent from the kernel's plane-0-only ABI.
+        // Normalize that plane to the existing linear import, including packed wider texels.
+        if (s.planes != 2 || plane >= s.planes || (s.pixelFormat != 0x34323066u && s.pixelFormat != 0x34323076u) ||
+            layout->width == 0 || layout->height == 0 || layout->offset > UINT32_MAX || layout->offset > s.size ||
+            uint64_t(layout->rowBytes) * layout->height > s.size - layout->offset ||
+            uint64_t(layout->width) * (plane == 0 ? 1u : 2u) > layout->rowBytes) {
+            refuse(why, name + ": invalid 420f/420v plane " + n(plane) + " layout or rows outside the allocation");
+            return nullptr;
+        }
+        s.offset = uint32_t(layout->offset);
+        s.rowBytes = layout->rowBytes;
+        s.width = layout->width;
+        s.height = layout->height;
+        s.size = layout->offset + uint64_t(layout->rowBytes) * layout->height;
+        s.pixelFormat = plane == 0 ? 0x4c303038u : 0x4c413038u; // one Y byte or two CbCr bytes
+    } else if (s.planes > 1) {
         refuse(why, name + " has " + n(s.planes) + " planes: a single-plane surface is what is served");
         return nullptr;
     }
@@ -999,7 +1051,8 @@ std::shared_ptr<Texture> Texture::wrapSurface(Gpu& gpu, uint32_t surfaceId, cons
     // TEX_CONST_2.PITCHALIGN: the largest k up to log2(cpp) with the pitch a multiple of 64 << k
     uint32_t pitchAlign = 0;
     while (pitchAlign < log2u(info->bytesPerPixel) && s.rowBytes % (64u << (pitchAlign + 1)) == 0) pitchAlign++;
-    return adopt(new Texture(std::move(buffer), desc, info, s.rowBytes, s.offset, pitchAlign, surfaceId));
+    // (v29i D1: a surface holds someone else's pixels already: its texture is never "never written")
+    return adopt(new Texture(std::move(buffer), desc, info, s.rowBytes, s.offset, pitchAlign, surfaceId, true));
 }
 
 // A '420f' or '420v' surface as one YCbCr8_420_2P texture: plane 0 the luma rows the kernel describes, plane 1 the
@@ -1030,14 +1083,14 @@ std::shared_ptr<Texture> Texture::wrapTwoPlanes(std::shared_ptr<Buffer> buffer, 
                         "hold its width, and its rows inside the surface");
         return nullptr;
     }
-    std::shared_ptr<Texture> t = adopt(new Texture(std::move(buffer), desc, info, s.rowBytes, s.offset, 0));
+    std::shared_ptr<Texture> t = adopt(new Texture(std::move(buffer), desc, info, s.rowBytes, s.offset, 0, 0, true));   // (a surface: written)
     t->chroma_ = *chroma;
     return t;
 }
 
 std::shared_ptr<Texture> Texture::overBuffer(std::shared_ptr<Buffer> buffer, uint64_t offset, uint64_t bytesPerRow, const TextureDesc& desc, std::string* why) {
     const FormatInfo* info = formatInfo(desc.format);
-    if (info == nullptr || info->depth || info->twoPlane || info->blockW > 1) {
+    if (info == nullptr || info->depth || info->stencil || info->twoPlane || info->blockW > 1) {
         refuse(why, "a texture over a buffer of pixel format " + n(uint32_t(desc.format)) + ": one of the colour formats served (texture.hpp: PixelFormat) is what a buffer takes");
         return nullptr;
     }
@@ -1059,7 +1112,7 @@ std::shared_ptr<Texture> Texture::overBuffer(std::shared_ptr<Buffer> buffer, uin
     }
     uint32_t pitchAlign = 0;
     while (pitchAlign < log2u(info->bytesPerPixel) && bytesPerRow % (64u << (pitchAlign + 1)) == 0) pitchAlign++;
-    Texture* t = new Texture(std::move(buffer), desc, info, bytesPerRow, offset, pitchAlign);
+    Texture* t = new Texture(std::move(buffer), desc, info, bytesPerRow, offset, pitchAlign, 0, true);   // (a buffer: written)
     t->overBuffer_ = true;
     return adopt(t);
 }
@@ -1082,7 +1135,7 @@ std::shared_ptr<Texture> Texture::view(const std::shared_ptr<Texture>& parent, P
     // the stencil plane of a Depth32Float_Stencil8 texture as X32_Stencil8 (Resident Evil 4 samples it so): the S8 plane's
     // own image, past the depth plane, at its pitch -- 128-byte aligned, PITCHALIGN 1 (fdl6's tiled alignment for cpp 1)
     if (format == PixelFormat::kX32Stencil8) {
-        if (p.format() != PixelFormat::kDepth32FloatStencil8 || levels != 1 || slices != 1 ||
+        if (p.format() != PixelFormat::kDepth32FloatStencil8 || p.samples() != 1 || levels != 1 || slices != 1 ||
             (type != TextureType::k2D && type != TextureType::k2DArray)) {
             refuse(why, asked + ": X32_Stencil8 is a Depth32Float_Stencil8 texture's stencil plane, one level, as 2D or a one-slice 2D array");
             return nullptr;
@@ -1092,20 +1145,20 @@ std::shared_ptr<Texture> Texture::view(const std::shared_ptr<Texture>& parent, P
         d.type = type;
         d.depth = 1;
         d.mipLevels = 1;
-        std::shared_ptr<Texture> t = adopt(new Texture(p.buffer_, d, info, p.stencilPitch(), p.offset_ + p.stencilOffset(), 1));
+        std::shared_ptr<Texture> t = adopt(new Texture(p.buffer_, d, info, p.stencilPitch(), p.offset_ + p.stencilOffset(), 1, 0, p.everWritten()));
         t->layerPitch_ = p.stencilPlaneBytes();
         return t;
     }
     // another format reads the same bytes otherwise: the same size a pixel and a plain colour layout on both sides, as
     // Metal's own rule for views has it (a depth or two-plane layout is not rows of pixels a second format could name)
-    if (info == nullptr || (format != p.format() && (info->depth || info->twoPlane || info->blockW > 1 || p.info().depth || p.info().twoPlane ||
+    if (info == nullptr || (format != p.format() && (info->depth || info->stencil || info->twoPlane || info->blockW > 1 || p.info().depth || p.info().stencil || p.info().twoPlane ||
                                                       p.info().blockW > 1 || info->bytesPerPixel != p.info().bytesPerPixel))) {
         refuse(why, asked + ": a view reads the texture's own format, or another uncompressed colour format of as many bytes a pixel");
         return nullptr;
     }
     if (p.surface() != 0 || p.info().twoPlane || p.samples() != 1) {
         if (format == p.format() && type == p.type() && levels == p.levels() && slices == parentSlices) {
-            std::shared_ptr<Texture> t = adopt(new Texture(p.buffer_, p.desc_, p.info_, p.pitch_, p.offset_, p.pitchAlign_, p.surface_));
+            std::shared_ptr<Texture> t = adopt(new Texture(p.buffer_, p.desc_, p.info_, p.pitch_, p.offset_, p.pitchAlign_, p.surface_, p.everWritten()));
             t->chroma_ = p.chroma_;
             return t;
         }
@@ -1115,7 +1168,7 @@ std::shared_ptr<Texture> Texture::view(const std::shared_ptr<Texture>& parent, P
             info->bytesPerPixel == p.info().bytesPerPixel && !info->depth && !info->twoPlane && info->blockW == 1) {
             TextureDesc d = p.desc_;
             d.format = format;
-            return adopt(new Texture(p.buffer_, d, info, p.pitch_, p.offset_, p.pitchAlign_, p.surface_));
+            return adopt(new Texture(p.buffer_, d, info, p.pitch_, p.offset_, p.pitchAlign_, p.surface_, p.everWritten()));
         }
         refuse(why, asked + ": a view of an IOSurface's, a two-plane or a multisample texture is served only as the whole of it");
         return nullptr;
@@ -1126,13 +1179,13 @@ std::shared_ptr<Texture> Texture::view(const std::shared_ptr<Texture>& parent, P
     // every level from 0, the slices all there, the type the parent's: the same layout, its first LEVELS levels
     if (type == p.type() && baseLevel == 0 && baseSlice == 0 && slices == parentSlices) {
         d.mipLevels = levels;
-        std::shared_ptr<Texture> t = adopt(new Texture(p.buffer_, d, info, p.pitch_, p.offset_, p.pitchAlign_));
+        std::shared_ptr<Texture> t = adopt(new Texture(p.buffer_, d, info, p.pitch_, p.offset_, p.pitchAlign_, 0, p.everWritten()));
         t->layerPitch_ = p.layerPitch_ != 0 ? p.layerPitch_ : (layered ? p.sliceBytes() : 0);
         return t;
     }
     // one level as a 2D texture: level L's rows, at its pitch, are a one-level 2D layout of their own (the TP reads a
     // single level by PITCH alone); of a layered parent that has the one level, slice BASE_SLICE's rows
-    if (type == TextureType::k2D && levels == 1 && slices == 1 && !p.info().depth && (p.type() == TextureType::k2D || layered)) {
+    if (type == TextureType::k2D && levels == 1 && slices == 1 && !p.info().depth && !p.info().stencil && (p.type() == TextureType::k2D || layered)) {
         const TextureLevel L = p.level(baseLevel);
         d.width = L.width;
         d.height = L.height;
@@ -1140,7 +1193,7 @@ std::shared_ptr<Texture> Texture::view(const std::shared_ptr<Texture>& parent, P
         d.depth = 1;
         uint32_t pitchAlign = 0;
         while (pitchAlign < log2u(info->bytesPerPixel) && L.pitch % (64u << (pitchAlign + 1)) == 0) pitchAlign++;
-        return adopt(new Texture(p.buffer_, d, info, L.pitch, p.offset_ + L.offset + uint64_t(baseSlice) * p.sliceBytes(), pitchAlign));
+        return adopt(new Texture(p.buffer_, d, info, L.pitch, p.offset_ + L.offset + uint64_t(baseSlice) * p.sliceBytes(), pitchAlign, 0, p.everWritten()));
     }
     // one layer of a one-level depth array as 2D (Resident Evil 4's shadow cascades: 32 layers of Depth32Float, each
     // drawn and then sampled on its own): a depth texture is tiled, so the linear rows the branch above gives a colour
@@ -1150,7 +1203,7 @@ std::shared_ptr<Texture> Texture::view(const std::shared_ptr<Texture>& parent, P
         (p.type() == TextureType::k2DArray || p.type() == TextureType::kCube || p.type() == TextureType::kCubeArray)) {
         d.mipLevels = 1;
         d.depth = 1;
-        return adopt(new Texture(p.buffer_, d, info, p.pitch_, p.offset_ + uint64_t(baseSlice) * p.sliceBytes(), p.pitchAlign_));
+        return adopt(new Texture(p.buffer_, d, info, p.pitch_, p.offset_ + uint64_t(baseSlice) * p.sliceBytes(), p.pitchAlign_, 0, p.everWritten()));
     }
     // a 2D texture as a 2D array of that one slice, or a 1D one as a 1D array (Resident Evil 4 makes such views of its
     // targets, depth buffers and 1D tables, to bind them where a shader takes an array): its levels from 0 are the one
@@ -1159,7 +1212,7 @@ std::shared_ptr<Texture> Texture::view(const std::shared_ptr<Texture>& parent, P
         baseLevel == 0 && slices == 1) {
         d.depth = 1;
         d.mipLevels = levels;
-        std::shared_ptr<Texture> t = adopt(new Texture(p.buffer_, d, info, p.pitch_, p.offset_, p.pitchAlign_));
+        std::shared_ptr<Texture> t = adopt(new Texture(p.buffer_, d, info, p.pitch_, p.offset_, p.pitchAlign_, 0, p.everWritten()));
         t->layerPitch_ = textureBytes(p.info(), p.width(), p.height(), p.levels());
         return t;
     }
@@ -1172,7 +1225,7 @@ std::shared_ptr<Texture> Texture::view(const std::shared_ptr<Texture>& parent, P
         d.depth = 1;
         uint32_t pitchAlign = 0;
         while (pitchAlign < log2u(info->bytesPerPixel) && L.pitch % (64u << (pitchAlign + 1)) == 0) pitchAlign++;
-        return adopt(new Texture(p.buffer_, d, info, L.pitch, p.offset_ + L.offset, pitchAlign));
+        return adopt(new Texture(p.buffer_, d, info, L.pitch, p.offset_ + L.offset, pitchAlign, 0, p.everWritten()));
     }
     // a run of a one-level layered texture's slices as a 2D array, six as a cube, or sixes as a cube array: the slices
     // sit sliceBytes apart whichever of them names them, so the run starts BASE_SLICE slices in
@@ -1194,7 +1247,7 @@ std::shared_ptr<Texture> Texture::view(const std::shared_ptr<Texture>& parent, P
             pitchAlign = 0;
             while (pitchAlign < log2u(info->bytesPerPixel) && L.pitch % (64u << (pitchAlign + 1)) == 0) pitchAlign++;
         }
-        std::shared_ptr<Texture> t = adopt(new Texture(p.buffer_, d, info, pitch, p.offset_ + L.offset + uint64_t(baseSlice) * p.sliceBytes(), pitchAlign));
+        std::shared_ptr<Texture> t = adopt(new Texture(p.buffer_, d, info, pitch, p.offset_ + L.offset + uint64_t(baseSlice) * p.sliceBytes(), pitchAlign, 0, p.everWritten()));
         t->layerPitch_ = p.sliceBytes();
         return t;
     }

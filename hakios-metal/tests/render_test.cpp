@@ -12,6 +12,8 @@
 #include <cstdio>
 #include <cstring>
 #include <map>
+#include <thread>
+#include <unistd.h>
 #include <vector>
 
 #include "hakios-metal/a6xx.hpp"
@@ -533,12 +535,14 @@ TEST(render_refuses_what_the_first_draw_does_not_serve_by_name) {
         p = handProgram();
         p.fs.numSamplerPrefetch = 1;
         refused(r, p, pass, d, "hand_fs prefetches a texture and loads none: ir3's tables disagree");
-        // a varying the vertex stage does not write: render::link's sentence
+        // A missing varying is a deterministic zero, not a fatal pipeline refusal.
         p = handProgram();
         p.fs.inputs[1] = StageInput{kSlotVar0, uint8_t(regid(0, 2)), 0xf, 0, 0, 1, 0, 0};
         p.fs.numInputs = 2;
         p.fs.totalIn = 4;
-        refused(r, p, pass, d, "the fragment stage reads varying slot 32 (VAR0), which the vertex stage does not write");
+        Linkage zero;
+        CHECK(render::link(p.vs, p.fs, &zero, nullptr));
+        CHECK_EQ(zero.interpMode[0] & 0xff, 0xaau);
     }
     // the target
     {
@@ -575,7 +579,7 @@ TEST(render_refuses_what_the_first_draw_does_not_serve_by_name) {
         Program p = handProgram();
         Draw x = d;
         x.primitive = Primitive(7);
-        refused(r, p, pass, x, "primitive 7: MTLPrimitiveType is Point (0), Line (1), LineStrip (2), Triangle (3) or TriangleStrip (4)");
+        refused(r, p, pass, x, "primitive 7: MTLPrimitiveType is Point (0), Line (1), LineStrip (2), Triangle (3) or TriangleStrip (4), and Apple's private LineLoop (5) and TriangleFan (6)");
         x = d;
         x.vertexCount = 0;
         refused(r, p, pass, x, "a draw of 0 vertices");
@@ -587,7 +591,7 @@ TEST(render_refuses_what_the_first_draw_does_not_serve_by_name) {
         refused(r, p, pass, x, "a viewport with a non-finite value");
         x = d;
         x.viewport.width = 0;
-        refused(r, p, pass, x, "a viewport of 0 x 64 pixels: both sides must be positive");
+        refused(r, p, pass, x, "a viewport of 0 x 64 pixels: the width must be positive and the height not 0");
         x = d;
         x.viewport.x = 64;   // past the window altogether (one that only reaches past it is drawn, clipped: below)
         refused(r, p, pass, x, "viewport (64.000000, 0.000000, 64.000000, 64.000000) covers no pixel of the 64 x 64 target");
@@ -616,6 +620,124 @@ TEST(render_refuses_what_the_first_draw_does_not_serve_by_name) {
 }
 
 // --- the words, against the literals worked out by hand (a6xx-draw.md; tests/a6xx_test.cpp) ---------------------------------
+
+// OpenGL ES through Metal (hakios_metal_render_pass.gl_mode): each bit moves exactly its words. GL depth clears
+// ZERO_GB_SCALE_Z (0xc0 -> 0x80) and nothing else (the depth words stay Metal's: the renderer hands GL's offset and scale as
+// znear and zfar - znear); no viewport transform adds CLIP_DISABLE | VP_XFORM_DISABLE | PERSP_DIVISION_DISABLE (turnip's r3d
+// word, 0x381 with GL depth); the last vertex provoking sets PC_PRIMITIVE_CNTL_0.PROVOKING_VTX_LAST (2); bit 2 (once a y
+// flip, now the renderer's own negative viewport) and anything past 8 are refused by name. Metal's draw is the twin.
+TEST(render_gl_mode_moves_the_clipper_and_the_provoking_vertex_alone) {
+    using namespace a6xx;
+    struct Case { uint32_t mode, clCntl, primitiveCntl; };
+    const Case cases[] = {{0, 0xc0u, 0u}, {1, 0x80u, 0u}, {4, 0x3c1u, 0u}, {5, 0x381u, 0u}, {8, 0xc0u, 2u}, {13, 0x381u, 2u}};
+    for (const Case& c : cases) {
+        Rig r;
+        auto t = target(r);
+        RenderPass pass;
+        pass.color0 = t.get();
+        Draw d = wholeDraw();
+        d.glMode = c.mode;
+        Encoded e(r, flatProgram(), pass, d);
+        CHECK(e.ok);
+        if (!e.ok) {
+            std::printf("       gl_mode %u: %s\n", c.mode, e.error.c_str());
+            continue;
+        }
+        CHECK_EQ(e.reg(REG_A6XX_GRAS_CL_CNTL), c.clCntl);
+        CHECK_EQ(e.reg(REG_A6XX_PC_PRIMITIVE_CNTL_0), c.primitiveCntl);
+        CHECK_EQ(e.reg(REG_A6XX_GRAS_SU_CNTL), 0x2014u);
+        const auto& w = e.stream.words();
+        size_t vp = e.findReg(REG_A6XX_GRAS_CL_VPORT_XOFFSET);
+        CHECK(vp != size_t(-1));
+        if (vp == size_t(-1)) continue;
+        CHECK_EQ(w[vp + 3], 0xc2000000u);   // Metal's y scale whatever the mode
+        CHECK_EQ(w[vp + 4], 0u);
+        CHECK_EQ(w[vp + 5], 0x3f800000u);
+    }
+    for (uint32_t bad : {2u, 16u}) {
+        Rig r;
+        auto t = target(r);
+        RenderPass pass;
+        pass.color0 = t.get();
+        Draw d = wholeDraw();
+        d.glMode = bad;
+        Encoded e(r, flatProgram(), pass, d);
+        CHECK(!e.ok);
+        CHECK(e.error.find("GL mode " + std::to_string(bad)) != std::string::npos);
+    }
+}
+
+// An upside-down viewport (height -64 from y 64), the one AppleMetalGLRenderer draws every GL framebuffer through: drawn,
+// with YSCALE +32 and YOFFSET 32, the viewport scissor the whole target the right way up (0,0)-(63,63), the guardband as
+// the upright one's; a viewport of height 0 is still refused. The twin is the upright viewport's YSCALE -32.
+TEST(render_takes_an_upside_down_viewport) {
+    using namespace a6xx;
+    Rig r;
+    auto t = target(r);
+    RenderPass pass;
+    pass.color0 = t.get();
+    Draw d = wholeDraw();
+    d.viewport = Viewport{0, 64, 64, -64, 0, 1};
+    Encoded e(r, flatProgram(), pass, d);
+    CHECK(e.ok);
+    if (!e.ok) std::printf("       %s\n", e.error.c_str());
+    if (e.ok) {
+        const auto& w = e.stream.words();
+        size_t vp = e.findReg(REG_A6XX_GRAS_CL_VPORT_XOFFSET);
+        CHECK(vp != size_t(-1));
+        if (vp != size_t(-1)) {
+            CHECK_EQ(w[vp + 2], 0x42000000u);
+            CHECK_EQ(w[vp + 3], 0x42000000u);
+        }
+        CHECK_EQ(e.reg(REG_A6XX_GRAS_SC_VIEWPORT_SCISSOR_TL), scissorXY(0, 0));
+        CHECK_EQ(e.reg(REG_A6XX_GRAS_SC_VIEWPORT_SCISSOR_BR), scissorXY(63, 63));
+        CHECK_EQ(e.reg(REG_A6XX_GRAS_CL_GUARDBAND_CLIP_ADJ), guardbandClipAdj(32, 32, 32, -32));
+    }
+    Rig r2;
+    auto t2 = target(r2);
+    RenderPass pass2;
+    pass2.color0 = t2.get();
+    Draw flat = wholeDraw();
+    flat.viewport = Viewport{0, 64, 64, 0, 0, 1};
+    Encoded zero(r2, flatProgram(), pass2, flat);
+    CHECK(!zero.ok);
+    CHECK(zero.error.find("the height not 0") != std::string::npos);
+}
+
+// The private primitives AppleMetalGLRenderer draws GL_TRIANGLE_FAN and GL_LINE_LOOP with: CP_DRAW_INDX_OFFSET's PRIM_TYPE
+// DI_PT_TRIFAN (5) and DI_PT_LINELOOP (7), each completing on the fake; 7 (past them) refused by name
+TEST(render_draws_fans_and_loops) {
+    using namespace a6xx;
+    for (uint32_t prim : {5u, 6u}) {
+        Rig r;
+        auto t = target(r);
+        RenderPass pass;
+        pass.color0 = t.get();
+        Draw d = wholeDraw(4);
+        d.primitive = Primitive(prim);
+        Encoded e(r, flatProgram(), pass, d);
+        CHECK(e.ok);
+        if (!e.ok) {
+            std::printf("       primitive %u: %s\n", prim, e.error.c_str());
+            continue;
+        }
+        size_t at = e.find(CP_DRAW_INDX_OFFSET);
+        CHECK(at != size_t(-1));
+        if (at != size_t(-1)) {
+            CHECK_EQ((e.stream.words()[at + 1] & CP_DRAW_INDX_OFFSET_0_PRIM_TYPE__MASK) >> CP_DRAW_INDX_OFFSET_0_PRIM_TYPE__SHIFT,
+                     prim == 6u ? uint32_t(DI_PT_TRIFAN) : uint32_t(DI_PT_LINELOOP));
+        }
+    }
+    Rig r;
+    auto t = target(r);
+    RenderPass pass;
+    pass.color0 = t.get();
+    Draw d = wholeDraw(4);
+    d.primitive = Primitive(7);
+    Encoded e(r, flatProgram(), pass, d);
+    CHECK(!e.ok);
+    CHECK(e.error.find("primitive 7") != std::string::npos);
+}
 
 TEST(render_encodes_the_first_triangles_registers) {
     Rig r;
@@ -660,7 +782,7 @@ TEST(render_encodes_the_first_triangles_registers) {
     {
         size_t ccu = e.findReg(REG_A6XX_RB_CCU_CNTL);
         CHECK(ccu != size_t(-1));
-        CHECK_EQ(w[ccu], 0x10000000u);
+        CHECK_EQ(w[ccu], 0x18000000u);
         pm4::Header before = pm4::decode(w[ccu - 2]);
         CHECK(before.kind == pm4::Header::kCommand && before.opcode == pm4::kWaitForIdle && before.count == 0);
     }
@@ -964,7 +1086,7 @@ TEST(render_options_switch_each_group_and_each_alternative) {
         CHECK_EQ(e.find(CP_SET_DRAW_STATE), size_t(-1));
         CHECK_EQ(e.reg(REG_A6XX_SP_TP_BORDER_COLOR_BASE_ADDR), Encoded::kNone);
         CHECK_EQ(e.writes(REG_A6XX_RB_ALPHA_CONTROL), 1u);   // blendZsa's alone
-        CHECK_EQ(e.reg(REG_A6XX_RB_CCU_CNTL), 0x10000000u);   // ccuCntl is its own group
+        CHECK_EQ(e.reg(REG_A6XX_RB_CCU_CNTL), 0x18000000u);   // ccuCntl is its own group
         CHECK(e.stream.size() < whole.stream.size());
     }
     {
@@ -974,7 +1096,7 @@ TEST(render_options_switch_each_group_and_each_alternative) {
     }
     {
         Encoded e = with([](render::Options& o) { o.ccuConcurrentResolve = true; });
-        CHECK_EQ(e.reg(REG_A6XX_RB_CCU_CNTL), 0x10000004u);
+        CHECK_EQ(e.reg(REG_A6XX_RB_CCU_CNTL), 0x18000004u);
     }
     {
         Encoded e = with([](render::Options& o) { o.passBegin = false; });
@@ -1213,7 +1335,7 @@ TEST(a_draw_of_tri_flat_holds_together_and_the_fake_does_not_rasterize_it) {
     pass.color0 = t.get();
     auto cb = drawOnce(r, flatProgram(), pass, wholeDraw());
     CHECK(cb->error().empty());
-    if (!cb->error().empty()) std::printf("       %s\n", cb->error().c_str());
+    if (!cb->error().empty()) std::printf("       %s; %s\n", cb->error().c_str(), r.fake->stats().lastFault.c_str());
     CHECK(cb->status() == CommandBuffer::kCompleted);
     FakeGpu::Stats s = r.fake->stats();
     CHECK_EQ(s.faults, 0u);
@@ -1254,7 +1376,7 @@ TEST(a_draw_of_tri_flat_holds_together_and_the_fake_does_not_rasterize_it) {
         CHECK_EQ(d.windowScissor[i], 0u);
         CHECK_EQ(d.screenScissor[i], 0u);
         CHECK_EQ(d.viewportScissor[i], 0u);
-        CHECK_EQ(d.windowScissor[2 + i], 63u);
+        CHECK(d.windowScissor[2 + i] == 63u || d.windowScissor[2 + i] == a6xx::kTileAlignW - 1u);
         CHECK_EQ(d.screenScissor[2 + i], 63u);
         CHECK_EQ(d.viewportScissor[2 + i], 63u);
     }
@@ -1434,8 +1556,8 @@ TEST(the_fake_refuses_a_draw_packet_that_is_not_the_three_word_triangle_form) {
     }
     {
         Twin w;
-        w.words[w.e.find(CP_DRAW_INDX_OFFSET) + 1] = drawIndxOffset0(DI_PT_POINTLIST, DI_SRC_SEL_AUTO_INDEX, IGNORE_VISIBILITY);
-        CHECK(has(w.fault(), "a draw of primitive type 9: triangle lists (4) and strips (6) and line lists (2) and strips (3) are what this GPU model runs"));
+        w.words[w.e.find(CP_DRAW_INDX_OFFSET) + 1] = drawIndxOffset0(DI_PT_RECTLIST, DI_SRC_SEL_AUTO_INDEX, IGNORE_VISIBILITY);
+        CHECK(has(w.fault(), "a draw of primitive type 8: triangle lists, strips and fans (4, 6, 5), lines, strips and loops (2, 3, 7) and points (9) run here"));
     }
     {
         Twin w;
@@ -1851,7 +1973,7 @@ TEST(the_fake_refuses_a_draw_with_msaa_without_the_ccu_cntl_or_without_its_flush
         Twin w;
         size_t ccu = w.e.findReg(REG_A6XX_RB_CCU_CNTL);
         w.words[ccu - 2] = pm4::type7(pm4::kNop, 0);   // the WFI before it, gone
-        CHECK(has(w.fault(), "RB_CCU_CNTL (0x10000000) was not written in this submission right after a CP_WAIT_FOR_IDLE"));
+        CHECK(has(w.fault(), "RB_CCU_CNTL (0x18000000) was not written in this submission right after a CP_WAIT_FOR_IDLE"));
     }
     {
         Twin w;
@@ -1966,7 +2088,7 @@ TEST(a_draw_pushes_a_fragment_constant_range_out_of_the_bound_buffer) {
     CHECK_EQ(p.fs.k.numUboRanges, 1u);
     CHECK_EQ(p.fs.k.uboRanges[0].sizeDwords, 16u);
     std::string why;
-    auto colour = newBuffer(*r.gpu, 16, &why);
+    auto colour = newBuffer(*r.gpu, 64, &why);
     CHECK(colour != nullptr);
     Bindings fsb;
     fsb.buffers = {Binding{colour.get(), 0}};
@@ -1988,7 +2110,7 @@ TEST(a_draw_pushes_a_fragment_constant_range_out_of_the_bound_buffer) {
     // the whole draw on the fake: the load is inside the bound buffer and within the decoded CONSTLEN
     auto cb = drawOnce(r, p, pass, wholeDraw(), render::Options{}, Bindings{}, fsb);
     CHECK(cb->error().empty());
-    if (!cb->error().empty()) std::printf("       %s\n", cb->error().c_str());
+    if (!cb->error().empty()) std::printf("       %s; %s\n", cb->error().c_str(), r.fake->stats().lastFault.c_str());
     CHECK(cb->status() == CommandBuffer::kCompleted);
     FakeGpu::Stats s = r.fake->stats();
     CHECK_EQ(s.faults, 0u);
@@ -1998,6 +2120,42 @@ TEST(a_draw_pushes_a_fragment_constant_range_out_of_the_bound_buffer) {
     if (!s.lastDraw.fsConsts.empty()) {
         CHECK_EQ(s.lastDraw.fsConsts[0].units, 4u);
         CHECK(!s.lastDraw.fsConsts[0].direct);
+    }
+}
+
+TEST(short_draw_constants_are_zero_padded_without_reading_past_the_binding) {
+    Rig r;
+    auto t = target(r);
+    RenderPass pass;
+    pass.color0 = t.get();
+    std::string why;
+    for (bool atPageEnd : {false, true}) {
+        for (uint64_t bytes : {0u, 13u, 16u, 48u}) {
+            for (uint32_t startDword : {0u, 4u, 16u}) {
+                Program p{kernels::tri_flat_vs_air, kernels::tri_cflat_fs_air, Linkage{}, "short_constants"};
+                p.fs.k.uboRanges[0].startDword = startDword;
+                // Poison all mapped bytes, including those after the logical binding.
+                auto b = newBuffer(*r.gpu, atPageEnd ? 0x4000 - ((4 - bytes % 4) % 4) : bytes + 4, &why);
+                CHECK(b != nullptr);
+                memset(b->contents(), 0xa5, b->bo().size());
+                const uint64_t offset = atPageEnd ? b->length() - bytes : 4;
+                Bindings fsb;
+                fsb.buffers = {Binding{b.get(), offset}};
+                auto cb = drawOnce(r, p, pass, wholeDraw(), render::Options{}, Bindings{}, fsb);
+                CHECK(cb->status() == CommandBuffer::kCompleted);
+                CHECK_EQ(r.fake->stats().faults, 0u);
+                const auto s = r.fake->stats();
+                CHECK_EQ(s.lastDraw.fsConsts.size(), size_t(1));
+                if (s.lastDraw.fsConsts.size() != 1) continue;
+                const auto& c = s.lastDraw.fsConsts[0];
+                CHECK(c.direct);
+                CHECK_EQ(c.words.size(), size_t(16));
+                const uint8_t* data = reinterpret_cast<const uint8_t*>(c.words.data());
+                for (size_t i = 0; i < c.words.size() * 4; i++) {
+                    CHECK_EQ(data[i], uint8_t(4ull * startDword + i < bytes ? 0xa5 : 0));
+                }
+            }
+        }
     }
 }
 
@@ -2066,11 +2224,6 @@ TEST(a_draw_refuses_a_constant_range_it_cannot_serve_by_name) {
     Bindings odd;
     odd.buffers = {Binding{colour.get(), 2}};
     refusedWith(p, odd, "tri_cflat_fs_air: buffer 0: offset 2 is not a multiple of 4 inside it");
-    // the padded 64-byte range running off the object's pages: a buffer as long as its pages, bound 16 bytes before the end
-    auto page = newBuffer(*r.gpu, colour->bo().size(), &why);
-    Bindings tail;
-    tail.buffers = {Binding{page.get(), page->bo().size() - 16}};
-    refusedWith(p, tail, "tri_cflat_fs_air reads 64 bytes at 0 of constant buffer 0; 16 are bound and 16 mapped behind the offset");
     // a range past the stage's constlen (the twin of the constlen the fixture carries)
     Program short_ = p;
     short_.fs.k.constlen = 0;
@@ -2148,7 +2301,7 @@ TEST(a_stage_that_wants_private_memory_gets_the_queues) {
     CHECK(scratch != nullptr);
     CHECK_EQ(pm.perFiber, 512u);
     CHECK_EQ(pm.perSp, 512u * 4096u);
-    CHECK_EQ(scratch->length(), 2ull * 512u * 4096u);
+    CHECK_EQ(scratch->length(), 3ull * 512u * 4096u);   // one per SP core: the A650 has 3
     Bindings fsb;
     fsb.privateMemory = pm;
     Encoded e(r, p, pass, wholeDraw(3), render::Options{}, Bindings{}, fsb);
@@ -2259,7 +2412,7 @@ TEST(a_draw_fetches_two_attributes_through_the_vertex_descriptor) {
     // the whole draw on the fake
     auto cb = drawOnce(r, p, pass, wholeDraw(6), render::Options{}, vsb, Bindings{});
     CHECK(cb->error().empty());
-    if (!cb->error().empty()) std::printf("       %s\n", cb->error().c_str());
+    if (!cb->error().empty()) std::printf("       %s; %s\n", cb->error().c_str(), r.fake->stats().lastFault.c_str());
     CHECK(cb->status() == CommandBuffer::kCompleted);
     CHECK_EQ(r.fake->stats().faults, 0u);
     CHECK_EQ(r.fake->stats().lastDraw.vfdDecodeCount, 2u);
@@ -2522,6 +2675,10 @@ TEST(a_clear_packs_the_colour_as_each_format_holds_it) {
         {PixelFormat::kRGBA8UnormSrgb, {0.5, 0.5, 0.5, 0.5}, 4, {188, 188, 188, 128}},
         {PixelFormat::kBGRA8UnormSrgb, {1.0, 0.0, 0.002, 1.0}, 4, {7, 0, 255, 255}},   // 0.002 * 12.92 * 255 = 6.6 -> 7, then swapped
         {PixelFormat::kR8Unorm, {1.0, 0.5, 0.5, 0.5}, 1, {255}},
+        // A8: its one channel is alpha, the fill's fourth word (r2d_clear_value fills only the channels the format's
+        // swizzle names, and A8's is (0, 0, 0, X)); the other three stay 0 whatever the colour asks
+        {PixelFormat::kA8Unorm, {0.25, 0.5, 0.75, 0.5}, 1, {128}},
+        {PixelFormat::kA8Unorm, {1.0, 1.0, 1.0, 1.0}, 1, {255}},
         {PixelFormat::kRG8Unorm, {0.0, 1.0, 0.5, 0.5}, 2, {0, 255}},
         {PixelFormat::kRGBA16Float, {0.25, -2.0, 65504.0, 1e-7}, 8, {0x00, 0x34, 0x00, 0xc0, 0xff, 0x7b, 0x02, 0x00}},
         {PixelFormat::kR32Float, {1.5, 9.0, 9.0, 9.0}, 4, {0x00, 0x00, 0xc0, 0x3f}},
@@ -2805,6 +2962,27 @@ TEST(a_command_buffer_counts_its_passes_and_draws) {
 
 // Profiling: a stamp at each pass's start and after its tail. The buffer still completes on the fake, and the passes
 // are described as they were recorded -- a draw pass of 64 x 64 with two draws, then a 16 x 16 copy
+TEST(pass_profiling_keeps_all_intervals_across_stamp_blocks) {
+    Rig r;
+    auto a = target(r), b = target(r);
+    auto cb = r.queue->commandBuffer();
+    cb->setProfile(true);
+    for (unsigned i = 0; i < 130; i++) {
+        CHECK(cb->blit(*(i % 2 ? b : a), 0, render::BlitRect{0, 0, 16, 16},
+                       *(i % 2 ? a : b), 0, render::BlitRect{0, 0, 16, 16}, false));
+    }
+    cb->commit(); cb->waitUntilCompleted();
+    CHECK(cb->status() == CommandBuffer::kCompleted);
+    const auto timings = cb->passTimes();
+    CHECK_EQ(timings.size(), size_t(130));
+    for (const auto& pass : timings) {
+        CHECK(pass.kind == CommandBuffer::kPassCopy);
+        CHECK_EQ(pass.width, 16u);
+        CHECK(pass.us > 0);
+    }
+    CHECK_EQ(r.fake->stats().faults, 0u);
+}
+
 TEST(a_profiled_command_buffer_lists_its_passes) {
     Rig r;
     auto t = target(r), u = target(r);
@@ -3138,6 +3316,22 @@ TEST(a_draw_samples_a_texture_in_the_vertex_stage) {
     CHECK_EQ(r2.fake->stats().lastDraw.fsTextureCount, 0u);
 }
 
+TEST(a_draw_samples_a_render_target_without_shader_read_usage) {
+    Rig r;
+    auto t = target(r);
+    auto tex = target(r, 4, 4, kTextureUsageRenderTarget);
+    Sampler smp = nearestClamp();
+    RenderPass pass;
+    pass.color0 = t.get();
+    Bindings fsb;
+    fsb.textures = {tex.get()};
+    fsb.samplers = {&smp};
+    auto cb = drawOnce(r, texProgram(), pass, wholeDraw(6), render::Options{}, Bindings{}, fsb);
+    CHECK(cb->status() == CommandBuffer::kCompleted);
+    CHECK_EQ(r.fake->stats().faults, 0u);
+    CHECK_EQ(r.fake->stats().draws, 1u);
+}
+
 TEST(a_draw_refuses_a_texture_the_fs_cannot_sample) {
     Rig r;
     auto t = target(r);
@@ -3179,7 +3373,8 @@ TEST(a_draw_refuses_a_texture_the_fs_cannot_sample) {
     Bindings unreadable;
     unreadable.textures = {writeOnly.get()};
     unreadable.samplers = {&smp};
-    refusedWith(texProgram(), unreadable, "texture 0 was made without shader-read usage; tri_tex_fs_air samples it");
+    Encoded sampled(r, texProgram(), pass, wholeDraw(6), render::Options{}, Bindings{}, unreadable);
+    CHECK(sampled.ok);
     // the prefetch's own slots: a texture index the FS does not declare, a bindless or unknown command
     Bindings ok;
     ok.textures = {tex.get()};
@@ -4296,6 +4491,108 @@ TEST(a_draw_writes_two_colour_targets_each_into_its_own_attachment) {
 // default, before the draw the colour CCU is flushed on the draw table's own word and the texture caches invalidated,
 // so that it reads what the draws before it wrote. Two such draws in one pass: each its own flush, on its
 // own table.
+TEST(multisample_framebuffer_fetch_binds_ms_texture_and_sample_execution_state) {
+    using namespace a6xx;
+    for (uint32_t samples : {2u, 4u}) {
+        Rig r;
+        TextureDesc d;
+        d.width = d.height = 64; d.samples = samples; d.type = TextureType::k2DMultisample;
+        d.format = PixelFormat::kRGBA8Unorm; d.usage = kTextureUsageRenderTarget;
+        std::string why;
+        auto t = Texture::make(*r.gpu, d, &why);
+        CHECK(t != nullptr);
+        if (!t) return;
+        Program fb{kernels::tri_flat_vs_air, kernels::tri_fb_fs_air, Linkage{}, "ms_fb"};
+        fb.samples = samples; fb.fs.perSamp = true; fb.fs.sampleIdRegid = 4;
+        fb.fs.k.textures[0].dim = kTexDimMS;
+        RenderPass pass; pass.color0 = t.get();
+        Encoded e(r, fb, pass, wholeDraw(3));
+        CHECK(e.ok);
+        if (!e.ok) { std::printf("       %s\n", e.error.c_str()); continue; }
+        const TexConst want = t->sampledDescriptor();
+        CHECK(memcmp(e.tableWords() + render::kTableFsAt / 4, want.dword, 64) == 0);
+        CHECK_EQ(e.reg(REG_A6XX_RB_SAMPLE_CNTL), A6XX_RB_SAMPLE_CNTL_PER_SAMP_MODE);
+        CHECK_EQ(e.reg(REG_A6XX_GRAS_SAMPLE_CNTL), A6XX_GRAS_SAMPLE_CNTL_PER_SAMP_MODE);
+        CHECK_EQ(e.reg(REG_A6XX_GRAS_LRZ_PS_INPUT_CNTL), A6XX_GRAS_LRZ_PS_INPUT_CNTL_SAMPLEID |
+            A6XX_GRAS_LRZ_PS_INPUT_CNTL_FRAGCOORDSAMPLEMODE(FRAGCOORD_SAMPLE));
+        CHECK_EQ(e.reg(REG_A6XX_RB_RENDER_CONTROL1) & A6XX_RB_RENDER_CONTROL1_FRAGCOORDSAMPLEMODE__MASK,
+            A6XX_RB_RENDER_CONTROL1_FRAGCOORDSAMPLEMODE(FRAGCOORD_SAMPLE));
+        CHECK(e.findEvent(PC_CCU_FLUSH_COLOR_TS) < e.find(CP_DRAW_INDX_OFFSET));
+        CHECK(!render::gmemDrawOk(fb, pass, wholeDraw(3), {}, {}, &why));
+        CHECK(why.find("framebuffer fetch of a multisample target") != std::string::npos);
+    }
+}
+
+// The 4-sample attachment's fetch descriptor is its memory as the TP reads an MSAA texel: the pixel width, the row
+// pitch of the samples interleaved in the row (four a pixel: texture.cpp's plan), and SAMPLES the log2 of the count --
+// so txf_ms of (x, y, n) addresses sample n of pixel x. (The layout has no per-sample planes: reading it as a 2D view
+// of the level was the wrong-memory read v29h refused.)
+TEST(multisample_framebuffer_fetch_descriptor_names_the_interleaved_layout) {
+    using namespace a6xx;
+    Rig r;
+    TextureDesc d;
+    d.width = d.height = 64; d.samples = 4; d.type = TextureType::k2DMultisample;
+    d.format = PixelFormat::kRGBA8Unorm; d.usage = kTextureUsageRenderTarget;
+    std::string why;
+    auto t = Texture::make(*r.gpu, d, &why);
+    CHECK(t != nullptr);
+    if (!t) return;
+    CHECK_EQ(t->bytesPerRow(), uint64_t(64u * 4u * 4u));   // 64 pixels, 4 samples a pixel, BGRA8
+    Program fb{kernels::tri_flat_vs_air, kernels::tri_fb_fs_air, Linkage{}, "ms_fb_layout"};
+    fb.samples = 4; fb.fs.perSamp = true; fb.fs.sampleIdRegid = 4;
+    fb.fs.k.textures[0].dim = kTexDimMS;
+    RenderPass pass; pass.color0 = t.get();
+    Encoded e(r, fb, pass, wholeDraw(3));
+    CHECK(e.ok);
+    if (!e.ok) { std::printf("       %s\n", e.error.c_str()); return; }
+    const TexConst want = t->sampledDescriptor();
+    CHECK_EQ(want.dword[0] & A6XX_TEX_CONST_0_SAMPLES__MASK, A6XX_TEX_CONST_0_SAMPLES(MSAA_FOUR));
+    CHECK_EQ(want.dword[1] & A6XX_TEX_CONST_1_WIDTH__MASK, A6XX_TEX_CONST_1_WIDTH(64));   // the pixels, not the samples
+    CHECK_EQ(want.dword[2] & A6XX_TEX_CONST_2_PITCH__MASK, A6XX_TEX_CONST_2_PITCH(uint32_t(t->bytesPerRow())));
+    CHECK_EQ(want.dword[2] & A6XX_TEX_CONST_2_TYPE__MASK, A6XX_TEX_CONST_2_TYPE(A6XX_TEX_2D));
+    CHECK(memcmp(e.tableWords() + render::kTableFsAt / 4, want.dword, 64) == 0);
+}
+
+// A pipeline built at 4 samples drawn into a one-sample target: Metal's txf_ms there is that texture's sample 0, so the
+// fetch is served from its own one-sample sampledDescriptor -- not refused, which is what made the draw vanish.
+TEST(multisample_framebuffer_fetch_serves_a_single_sample_attachment) {
+    using namespace a6xx;
+    Rig r;
+    auto t = target(r);   // 64 x 64, one sample
+    CHECK_EQ(t->samples(), 1u);
+    Program fb{kernels::tri_flat_vs_air, kernels::tri_fb_fs_air, Linkage{}, "ms_fb_single"};
+    fb.samples = 4; fb.fs.perSamp = true; fb.fs.sampleIdRegid = 4;
+    fb.fs.k.textures[0].dim = kTexDimMS;
+    RenderPass pass; pass.color0 = t.get();
+    Encoded e(r, fb, pass, wholeDraw(3));
+    CHECK(e.ok);
+    if (!e.ok) { std::printf("       %s\n", e.error.c_str()); return; }
+    const TexConst want = t->sampledDescriptor();
+    CHECK_EQ(want.dword[0] & A6XX_TEX_CONST_0_SAMPLES__MASK, A6XX_TEX_CONST_0_SAMPLES(MSAA_ONE));
+    CHECK(memcmp(e.tableWords() + render::kTableFsAt / 4, want.dword, 64) == 0);
+}
+
+TEST(maps_vertex_formats_encode_normalized_and_float_attributes) {
+    using namespace a6xx;
+    Rig r;
+    auto t = target(r);
+    RenderPass pass; pass.color0 = t.get();
+    std::string why;
+    auto vb = newBuffer(*r.gpu, 6 * 32, &why);
+    Bindings vsb; vsb.buffers = {Binding{vb.get(), 0}};
+    struct Case { uint32_t metal; a6xx_format adreno; };
+    for (const Case& c : {Case{19, FMT6_16_16_UNORM}, Case{21, FMT6_16_16_16_16_UNORM},
+                          Case{22, FMT6_16_16_SNORM}, Case{31, FMT6_32_32_32_32_FLOAT}}) {
+        Program p = attrProgram();
+        p.vertexDescriptor.layouts[0].stride = 32;
+        p.vertexDescriptor.attributes[1].format = VertexFormat(c.metal);
+        Encoded e(r, p, pass, wholeDraw(6), {}, vsb, {});
+        CHECK(e.ok);
+        if (!e.ok) { std::printf("       format %u: %s\n", c.metal, e.error.c_str()); continue; }
+        CHECK_EQ(e.reg(regVfdDecodeInstr(1)), vfdDecodeInstr(0, 8, false, c.adreno, WZYX, true));
+    }
+}
+
 TEST(a_draw_that_reads_its_target_gets_the_target_as_a_texture_and_a_barrier_before_it) {
     using namespace a6xx;
     Rig r;
@@ -4411,7 +4708,7 @@ TEST(a_draw_that_reads_its_target_gets_the_target_as_a_texture_and_a_barrier_bef
     if (gd.size() == 64) memcpy(gw, gd.data(), 64);
     CHECK_EQ((gw[0] & A6XX_TEX_CONST_0_TILE_MODE__MASK) >> A6XX_TEX_CONST_0_TILE_MODE__SHIFT, uint32_t(TILE6_2));
     CHECK_EQ(gw[0] & A6XX_TEX_CONST_0_SWAP__MASK, 0u);
-    CHECK_EQ((gw[2] & A6XX_TEX_CONST_2_PITCH__MASK) >> A6XX_TEX_CONST_2_PITCH__SHIFT, 64u * 4);
+    CHECK_EQ((gw[2] & A6XX_TEX_CONST_2_PITCH__MASK) >> A6XX_TEX_CONST_2_PITCH__SHIFT, 384u);
     CHECK(gw[4] == 0 && (gw[5] & A6XX_TEX_CONST_5_BASE_HI__MASK) == 0);
     pm4::Stream gb;
     std::string gwhy;
@@ -4423,6 +4720,39 @@ TEST(a_draw_that_reads_its_target_gets_the_target_as_a_texture_and_a_barrier_bef
     bool gmemFlush = false;
     for (size_t i = 0; gt != nullptr && i + 2 < gb.words().size(); i++) gmemFlush |= gb.words()[i + 2] == uint32_t(gt->gpuAddress() + render::kTableFbReadFlushAt);
     CHECK(!gmemFlush);
+    CHECK_EQ(r.fake->stats().faults, 0u);
+}
+
+// v29i: a sysmem fetch barrier is PC_CCU_FLUSH_COLOR_TS -- the whole colour CCU's flush -- so one covers every fetch
+// after it until a draw writes the fetched target again. A fetch at a pass's start (nothing written since the full
+// batch start, which invalidated the caches and left the CCU empty) pays nothing; every fetch after a draw that writes
+// the target pays one, and only one, until the next write. (/var/db/hakios-metal-cache/fbread-dedupe-off turns the
+// dedupe off on the phone; on a host the file is absent, and a host that has it skips this test.)
+TEST(a_sysmem_fetch_barrier_is_paid_once_between_writes_to_the_target) {
+    if (access("/var/db/hakios-metal-cache/fbread-dedupe-off", F_OK) == 0) {
+        std::printf("       (the dedupe is off on this host: /var/db/hakios-metal-cache/fbread-dedupe-off)\n");
+        return;
+    }
+    Rig r;
+    auto t = target(r);
+    const Program fb{kernels::tri_flat_vs_air, kernels::tri_fb_fs_air, Linkage{}, "tri_fb"};   // reads its target, and blends into it
+    RenderPass pass;
+    pass.color0 = t.get();
+    render::Options sysmem;
+    sysmem.gmem = false;
+    sysmem.fbReadOrdered = false;   // (sysmem never orders: the barrier is what a fetch pays there)
+    auto cb = r.queue->commandBuffer();
+    CHECK(cb->draw(fb, pass, wholeDraw(6), Bindings{}, Bindings{}, sysmem));
+    CHECK_EQ(cb->counts().fetchBarriers, 0u);   // not chained: the full batch start invalidated the caches, the CCU is
+                                                // clean, and this pass has written nothing
+    CHECK(cb->draw(fb, pass, wholeDraw(6), Bindings{}, Bindings{}, sysmem));
+    CHECK_EQ(cb->counts().fetchBarriers, 1u);   // the fetch above blended into its target: it is in the CCU again
+    CHECK(cb->draw(fb, pass, wholeDraw(6), Bindings{}, Bindings{}, sysmem));
+    CHECK_EQ(cb->counts().fetchBarriers, 2u);   // ...and so is this one's, for the fetch after it
+    cb->commit();
+    cb->waitUntilCompleted();
+    CHECK(cb->status() == CommandBuffer::kCompleted);
+    if (cb->status() != CommandBuffer::kCompleted) std::printf("       %s | %s\n", cb->error().c_str(), r.fake->stats().lastFault.c_str());
     CHECK_EQ(r.fake->stats().faults, 0u);
 }
 
@@ -4618,8 +4948,12 @@ TEST(a_stencil_attachment_is_the_s8_plane_and_its_test_the_draws_state) {
     RenderPass other = pass;
     other.depth = plain.get();
     Encoded e3(r, flatProgram(), other, d);
-    CHECK(!e3.ok);
-    expectRefusal(e3.error, "a stencil attachment that is not the depth attachment's own Depth32Float_Stencil8 texture: the S8 plane of that one texture is what is served");
+    CHECK(e3.ok);   // independent depth and stencil attachments use their own bases
+    CHECK_EQ(uint64_t(e3.reg(REG_A6XX_RB_STENCIL_INFO + 3)) | uint64_t(e3.reg(REG_A6XX_RB_STENCIL_INFO + 4)) << 32, plane);
+    other.stencil = plain.get();
+    Encoded invalid(r, flatProgram(), other, d);
+    CHECK(!invalid.ok);
+    expectRefusal(invalid.error, "a stencil attachment must be Stencil8 or Depth32Float_Stencil8");
     CHECK_EQ(r.fake->stats().faults, 0u);
 }
 
@@ -5086,6 +5420,193 @@ TEST(append_runs_another_command_buffers_work_after_this_ones) {
     CHECK(parent->error().find("a draw of 0 vertices") != std::string::npos);
 }
 
+// What a sub-command buffer timed comes over with its work: append() takes its pass and draw stamps (the buffers moved,
+// each entry still naming its own), so a parallel render encoder's parent reports the passes its sub-encoders recorded --
+// which is where Maps' passes live, and why its summary named none of them.
+TEST(append_takes_the_other_command_buffers_profiling) {
+    Rig r;
+    auto t = target(r);
+    RenderPass pass;
+    pass.color0 = t.get();
+    auto parent = r.queue->commandBuffer();
+    auto sub = r.queue->commandBuffer();
+    parent->setProfile(true);
+    sub->setProfile(true);
+    parent->setProfileDraws(true);
+    sub->setProfileDraws(true);
+    parent->setGmem(false);   // (each draw of a sysmem pass is timed, one by one: the profiled draws)
+    sub->setGmem(false);
+    CHECK(parent->draw(flatProgram(), pass, wholeDraw(), Bindings{}, Bindings{}));   // the parent's own pass
+    CHECK(sub->draw(flatProgram(), pass, wholeDraw(), Bindings{}, Bindings{}));
+    CHECK(sub->draw(flatProgram(), pass, wholeDraw(), Bindings{}, Bindings{}));
+    CHECK(parent->append(*sub));
+    CHECK_EQ(sub->counts().passes, 0u);
+    parent->commit();
+    parent->waitUntilCompleted();
+    CHECK(parent->status() == CommandBuffer::kCompleted);
+    const auto times = parent->passTimes();
+    CHECK_EQ(times.size(), size_t(2));   // the parent's, then the sub's
+    if (times.size() == 2) {
+        CHECK_EQ(times[0].draws, 1u);
+        CHECK_EQ(times[1].draws, 2u);   // the two draws of one pass share it
+        CHECK(times[0].us > 0 && times[1].us > 0);
+    }
+    const auto draws = parent->drawTimes();
+    CHECK_EQ(draws.size(), size_t(3));
+    for (const auto& d : draws) CHECK(d.stampBuffer != nullptr);
+    CHECK_EQ(r.fake->stats().faults, 0u);
+}
+
+// A profiled command buffer's own draw stamps go back to the pool: drawStamps_ holds the same buffer as the list that
+// owns it, and giveBuffer only pools one that is the last reference. Without the reset every profiled, draw-timed
+// buffer made a new 8 KiB allocation and freed it -- the pool pressure the pass stamps' own pooling was added for.
+TEST(a_profiled_draw_stamp_buffer_returns_to_the_pool) {
+    Rig r;
+    auto t = target(r);
+    RenderPass pass;
+    pass.color0 = t.get();
+    auto cb = r.queue->commandBuffer();
+    cb->setProfileDraws(true);
+    cb->setGmem(false);
+    CHECK(cb->draw(flatProgram(), pass, wholeDraw(), Bindings{}, Bindings{}));
+    cb->commit();
+    cb->waitUntilCompleted();
+    CHECK(cb->status() == CommandBuffer::kCompleted);
+    const auto draws = cb->drawTimes();
+    CHECK_EQ(draws.size(), size_t(1));
+    uint64_t stampsAt = 0;
+    if (draws.size() == 1 && draws[0].stampBuffer != nullptr) stampsAt = draws[0].stampBuffer->gpuAddress();
+    CHECK(stampsAt != 0);
+    // (the queue lets go of a completed buffer just after it notifies; wait for this buffer's destructor to have run)
+    std::weak_ptr<CommandBuffer> gone = cb;
+    cb.reset();
+    for (int i = 0; i < 100000 && !gone.expired(); i++) std::this_thread::yield();
+    CHECK(gone.expired());
+    std::string why;
+    auto again = r.queue->takeBuffer(16 * CommandBuffer::kMaxProfiledDraws, &why);
+    CHECK(again != nullptr);
+    if (again != nullptr) {
+        CHECK_EQ(again->gpuAddress(), stampsAt);   // the same buffer, not a new one
+        r.queue->giveBuffer(std::move(again));
+    }
+}
+
+// A pass recorded after append() is numbered from this buffer's own passes, not from the merged count: the sub's 63
+// passes fill its own stamp set, and a parent pass written after the merge must not land on the sub's slot 0 (its entry
+// still names that slot, so its time would be the parent's, and the parent's own would alias it).
+TEST(append_keeps_pass_stamps_of_the_buffer_that_took_them) {
+    Rig r;
+    auto a = target(r), b = target(r);
+    RenderPass pa, pb;
+    pa.color0 = a.get();
+    pb.color0 = b.get();
+    auto parent = r.queue->commandBuffer();
+    auto sub = r.queue->commandBuffer();
+    parent->setProfile(true);
+    sub->setProfile(true);
+    parent->setGmem(false);
+    sub->setGmem(false);
+    CHECK(parent->draw(flatProgram(), pa, wholeDraw(), Bindings{}, Bindings{}));   // the parent's pass 0
+    for (uint32_t i = 0; i < 63; i++) {
+        // alternating targets: each draw opens a pass of its own
+        CHECK(sub->draw(flatProgram(), i % 2 == 0 ? pa : pb, wholeDraw(), Bindings{}, Bindings{}));
+    }
+    CHECK(parent->append(*sub));
+    CHECK(parent->draw(flatProgram(), pa, wholeDraw(), Bindings{}, Bindings{}));   // the parent's pass 1, after the merge
+    parent->commit();
+    parent->waitUntilCompleted();
+    CHECK(parent->status() == CommandBuffer::kCompleted);
+    const auto times = parent->passTimes();
+    CHECK_EQ(times.size(), size_t(65));   // the parent's, the sub's 63, then the parent's again
+    if (times.size() == 65) {
+        CHECK(times[0].stampBuffer != nullptr && times[1].stampBuffer != nullptr);
+        CHECK(times[1].stampBuffer != times[0].stampBuffer);   // each buffer's own set
+        // the sub's 63 passes keep their own buffer and their own slots, in order
+        for (uint32_t i = 1; i < 64; i++) {
+            CHECK(times[i].stampBuffer == times[1].stampBuffer);
+            CHECK_EQ(times[i].stampSlot, 2 * (i - 1));
+        }
+        // and the parent's pass recorded after the merge is back in the parent's own set, at its own slot
+        CHECK(times[64].stampBuffer == times[0].stampBuffer);
+        CHECK_EQ(times[64].stampSlot, 2u);
+        for (const auto& t : times) CHECK(t.us > 0);   // the fake's counter moves at every stamp
+    }
+    CHECK_EQ(r.fake->stats().faults, 0u);
+}
+
+// A sub-buffer's draws name a pass of the merged passTimes(), not of the sub's own list: append() moves each local index
+// by the parent's pass count at the merge, so a heavy pass's draws are printed under it (metal_fps=draws).
+TEST(append_maps_child_draws_to_the_merged_pass_index) {
+    Rig r;
+    auto a = target(r), b = target(r);
+    RenderPass pa, pb;
+    pa.color0 = a.get();
+    pb.color0 = b.get();
+    auto parent = r.queue->commandBuffer();
+    auto sub = r.queue->commandBuffer();
+    parent->setProfile(true);
+    sub->setProfile(true);
+    parent->setProfileDraws(true);
+    sub->setProfileDraws(true);
+    parent->setGmem(false);
+    sub->setGmem(false);
+    CHECK(parent->draw(flatProgram(), pa, wholeDraw(), Bindings{}, Bindings{}));   // merged pass 0
+    CHECK(sub->draw(flatProgram(), pa, wholeDraw(), Bindings{}, Bindings{}));      // merged pass 1
+    CHECK(sub->draw(flatProgram(), pb, wholeDraw(), Bindings{}, Bindings{}));      // merged pass 2
+    CHECK(parent->append(*sub));
+    CHECK(parent->draw(flatProgram(), pb, wholeDraw(), Bindings{}, Bindings{}));   // merged pass 3
+    parent->commit();
+    parent->waitUntilCompleted();
+    CHECK(parent->status() == CommandBuffer::kCompleted);
+    const auto times = parent->passTimes();
+    CHECK_EQ(times.size(), size_t(4));
+    const auto draws = parent->drawTimes();
+    CHECK_EQ(draws.size(), size_t(4));
+    if (draws.size() == 4 && times.size() == 4) {
+        CHECK_EQ(draws[0].pass, 0u);   // the parent's
+        CHECK_EQ(draws[1].pass, 1u);   // the sub's first, moved past the parent's one pass
+        CHECK_EQ(draws[2].pass, 2u);   // the sub's second
+        CHECK_EQ(draws[3].pass, 3u);   // the parent's, after the merge
+        for (const auto& d : draws) CHECK_EQ(times[d.pass].draws, 1u);   // and each names the pass it was drawn in
+    }
+    CHECK_EQ(r.fake->stats().faults, 0u);
+}
+
+// A parallel render encoder's sub-command buffers are made fresh (GMEM-eligible by default), so the frame's switches
+// have to be handed over: metal_gmem=0's sysmem (GMEM hung this GPU once), pass-wfi and the timing. A sub that inherits
+// must run in the parent's mode -- the passes Maps records go into these buffers.
+TEST(a_sub_command_buffer_inherits_the_parents_switches) {
+    Rig r;
+    auto a = target(r), b = target(r);
+    RenderPass pa, pb;
+    pa.color0 = a.get();
+    pb.color0 = b.get();
+    auto parent = r.queue->commandBuffer();
+    parent->setGmem(false);
+    parent->setPassWfi(true);
+    parent->setProfile(true);
+    auto sub = r.queue->commandBuffer();
+    sub->inheritSettings(*parent);
+    CHECK(sub->draw(flatProgram(), pa, wholeDraw(), Bindings{}, Bindings{}));
+    CHECK(sub->draw(flatProgram(), pb, wholeDraw(), Bindings{}, Bindings{}));
+    sub->commit();
+    sub->waitUntilCompleted();
+    CHECK(sub->status() == CommandBuffer::kCompleted);
+    CHECK_EQ(r.fake->stats().faults, 0u);
+    CHECK_EQ(sub->counts().gmemPasses, 0u);   // GMEM off in the parent reached the sub
+    CHECK_EQ(sub->counts().chained, 0u);      // pass-wfi too: neither pass is chained
+    CHECK(std::string(sub->passSysmemWhy(0)).find("GMEM off") != std::string::npos);
+    const auto times = sub->passTimes();      // and the timing
+    CHECK_EQ(times.size(), size_t(2));
+    for (const auto& t : times) CHECK(t.us > 0);
+    // the twin: a new command buffer that inherits nothing is GMEM-eligible, which is what the sub must not be here
+    auto fresh = r.queue->commandBuffer();
+    CHECK(fresh->draw(flatProgram(), pa, wholeDraw(), Bindings{}, Bindings{}));
+    fresh->commit();
+    fresh->waitUntilCompleted();
+    CHECK_EQ(fresh->counts().gmemPasses, 1u);
+}
+
 // generateMipmaps of a cube: every face's levels from its own level 0 (a blit addresses slice 0 alone, so each
 // (level, slice) goes through its one-level 2D view). Face 3 holds a checkerboard of 0x60 and 0x20, which averages to
 // 0x40 at level 1; face 0 holds zeros and keeps them -- the twin that says the faces were not mixed.
@@ -5345,7 +5866,7 @@ TEST(the_gmem_plan_fits_the_bins_in_gmem_and_covers_the_target) {
         a.color0 = t.get();
         render::GmemPlan p;
         CHECK(render::gmemPlan(a, &p, nullptr));
-        CHECK(p.cols == 2 && p.rows == 12 && p.binW == 576 && p.binH == 208);
+        CHECK(p.cols == 2 && p.rows == 6 && p.binW == 576 && p.binH == 416);
     }
     // what stays in sysmem: a second colour attachment of another size, an integer target
     {
@@ -5360,6 +5881,24 @@ TEST(the_gmem_plan_fits_the_bins_in_gmem_and_covers_the_target) {
         RenderPass b;
         b.color0 = i.get();
         CHECK(!render::gmemPlan(b, &p, &why));
+    }
+}
+
+TEST(gmem_non_power_of_two_tile_alignment) {
+    Rig r;
+    for (uint32_t width : {960u, 961u, 1024u, 1921u, 2048u}) {
+        auto t = target(r, width, 64, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
+        RenderPass a; a.color0 = t.get();
+        render::GmemPlan p;
+        CHECK(render::gmemPlan(a, &p, nullptr));
+        CHECK(p.binW <= a6xx::kTileMaxW);
+        CHECK_EQ(p.binW % a6xx::kTileAlignW, 0u);
+        for (uint32_t x : {95u, 96u, 191u, 192u, 300u}) {
+            uint32_t area[] = {x, 17, x + 31, 40};
+            CHECK(render::gmemTiles(&p, area));
+            CHECK_EQ(p.x0 % a6xx::kTileAlignW, 0u);
+            CHECK(p.x0 <= x && x - p.x0 < a6xx::kTileAlignW);
+        }
     }
 }
 
@@ -5462,7 +6001,9 @@ TEST(a_pass_of_two_attachments_in_gmem_loads_and_stores_those_drawn) {
         a.more[0].load = LoadAction::kLoad;
         render::GmemPlan p;
         CHECK(render::gmemPlan(a, &p, nullptr));
-        CHECK(p.binW == 576 && p.binH == 96 && p.base[0] == 0 && p.base[1] == 0x3c000 && p.room[0] == 0x3c000 && p.room[1] == 0x3c000);
+        // (the second bin on a multiple of 12 KiB, A650's 3 CCUs' 4 KiB: freedreno's gmem_page_align, turnip's gmem_align)
+        CHECK(p.binW == 576 && p.binH == 224 && p.base[0] == 0 && p.base[1] == 0x8a000 && p.room[0] == 0x8a000 && p.room[1] == 0x8a000);
+        CHECK_EQ(p.base[1] % a6xx::kGmemBaseAlign, 0u);
         auto cb = r.queue->commandBuffer();
         CHECK(cb->draw(both ? mrt : flatProgram(), a, wholeDraw(3, 1125, 2436), Bindings{}, Bindings{}));
         CHECK(cb->draw(both ? mrt : flatProgram(), a, wholeDraw(3, 1125, 2436), Bindings{}, Bindings{}));
@@ -5696,7 +6237,7 @@ TEST(a_clear_in_gmem_comes_out_as_the_fill_does) {
 // (CP_SET_BIN_DATA5) and draws USE_VISIBILITY; the target comes back as it was through the tiles' loads and stores
 TEST(a_binned_gmem_pass_bins_its_draws_then_tells_each_tile_its_streams) {
     Rig r;
-    auto t = target(r, 1125, 300, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
+    auto t = target(r, 1125, 600, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
     fillCoords(*t);
     RenderPass a;
     a.color0 = t.get();
@@ -5705,7 +6246,7 @@ TEST(a_binned_gmem_pass_bins_its_draws_then_tells_each_tile_its_streams) {
     render::Options o;
     o.gmemBinning = true;
     auto cb = r.queue->commandBuffer();
-    for (int i = 0; i < 3; i++) CHECK(cb->draw(flatProgram(), a, wholeDraw(3, 1125, 300), Bindings{}, Bindings{}, o));
+    for (int i = 0; i < 3; i++) CHECK(cb->draw(flatProgram(), a, wholeDraw(3, 1125, 600), Bindings{}, Bindings{}, o));
     cb->commit();
     cb->waitUntilCompleted();
     CHECK(cb->status() == CommandBuffer::kCompleted);
@@ -5722,7 +6263,7 @@ TEST(a_binned_gmem_pass_bins_its_draws_then_tells_each_tile_its_streams) {
         render::Options twin = o;
         twin.gmemBinningStage = 9;
         auto c2 = r.queue->commandBuffer();
-        for (int i = 0; i < 3; i++) CHECK(c2->draw(flatProgram(), a, wholeDraw(3, 1125, 300), Bindings{}, Bindings{}, twin));
+        for (int i = 0; i < 3; i++) CHECK(c2->draw(flatProgram(), a, wholeDraw(3, 1125, 600), Bindings{}, Bindings{}, twin));
         c2->commit();
         c2->waitUntilCompleted();
         CHECK(r.fake->stats().faults > s.faults);
@@ -5801,4 +6342,1140 @@ TEST(each_profiled_pass_says_why_it_was_drawn_in_sysmem) {
         CHECK(std::string(cb->passSysmemWhy(0)).find("GMEM off") != std::string::npos);
     }
     CHECK_EQ(r.fake->stats().faults, 0u);
+}
+
+// --- chained passes (render.hpp): the barriers a pass's hazards ask for, and no more ---------------------------------------
+
+namespace {
+// RECORD into a command buffer of R's queue (chained unless PASS_WFI; sysmem), committed and waited for: its counts, and whether
+// it completed on the fake without a fault (the fake refuses a texture sampled while what wrote it is still in the CCU)
+CommandBuffer::Counts chainRun(Rig& r, bool passWfi, const std::function<void(CommandBuffer&)>& record, size_t* words = nullptr) {
+    const uint32_t faults = r.fake->stats().faults;
+    auto cb = r.queue->commandBuffer();
+    cb->setPassWfi(passWfi);
+    cb->setGmem(false);   // (as the plug-in has it on umi: a GMEM pass is never chained, it ends with the full tail)
+    record(*cb);
+    if (words != nullptr) *words = cb->streamWords();
+    cb->commit();
+    cb->waitUntilCompleted();
+    CHECK(cb->status() == CommandBuffer::kCompleted);
+    CHECK_EQ(r.fake->stats().faults, faults);
+    if (cb->status() != CommandBuffer::kCompleted || r.fake->stats().faults != faults) {
+        std::printf("       %s | %s\n", cb->error().c_str(), r.fake->stats().lastFault.c_str());
+    }
+    return cb->counts();
+}
+}  // namespace
+
+TEST(chained_passes_flush_once_and_barrier_only_where_a_pass_samples_what_another_wrote) {
+    Rig r;
+    auto a = target(r), b = target(r), c = target(r);
+    Sampler smp = nearestClamp();
+    RenderPass pa, pb, pc;
+    pa.color0 = a.get();
+    pb.color0 = b.get();
+    pc.color0 = c.get();
+    Bindings sampleA;
+    sampleA.textures = {a.get()};
+    sampleA.samplers = {&smp};
+    // three passes into three targets, nothing read: the batch start once, the full tail once (at the submission)
+    auto three = [&](CommandBuffer& cb) {
+        CHECK(cb.draw(flatProgram(), pa, wholeDraw(), Bindings{}, Bindings{}));
+        CHECK(cb.draw(flatProgram(), pb, wholeDraw(), Bindings{}, Bindings{}));
+        CHECK(cb.draw(flatProgram(), pc, wholeDraw(), Bindings{}, Bindings{}));
+    };
+    size_t chainedWords = 0, wfiWords = 0;
+    CommandBuffer::Counts k = chainRun(r, false, three, &chainedWords);
+    CHECK_EQ(k.passes, 3u);
+    CHECK_EQ(k.chained, 2u);
+    CHECK_EQ(k.flushes, 1u);
+    CHECK_EQ(k.barriers + k.waits, 0u);
+    // ...and as before 9 November (metal_pass_wfi=1): a full tail and a batch start a pass
+    k = chainRun(r, true, three, &wfiWords);
+    CHECK_EQ(k.passes, 3u);
+    CHECK_EQ(k.chained, 0u);
+    CHECK_EQ(k.flushes, 3u);
+    CHECK(chainedWords < wfiWords);
+    // a pass whose first draw samples what the pass before it wrote stays chained, with the barrier before that draw
+    k = chainRun(r, false, [&](CommandBuffer& cb) {
+        CHECK(cb.draw(flatProgram(), pa, wholeDraw(), Bindings{}, Bindings{}));
+        CHECK(cb.draw(texProgram(), pb, wholeDraw(6), Bindings{}, sampleA));
+    });
+    CHECK_EQ(k.chained, 1u);
+    CHECK_EQ(k.flushes, 1u);
+    CHECK_EQ(k.barriers, 1u);
+    // ...and a blur's steps, each sampling the one before (a into b into c): one barrier a step, one full tail
+    Bindings sampleB;
+    sampleB.textures = {b.get()};
+    sampleB.samplers = {&smp};
+    k = chainRun(r, false, [&](CommandBuffer& cb) {
+        CHECK(cb.draw(flatProgram(), pa, wholeDraw(), Bindings{}, Bindings{}));
+        CHECK(cb.draw(texProgram(), pb, wholeDraw(6), Bindings{}, sampleA));
+        CHECK(cb.draw(texProgram(), pc, wholeDraw(6), Bindings{}, sampleB));
+    });
+    CHECK_EQ(k.chained, 2u);
+    CHECK_EQ(k.flushes, 1u);
+    CHECK_EQ(k.barriers, 2u);
+    // ...one whose later draw does gets the barrier in the pass, the pass staying chained
+    k = chainRun(r, false, [&](CommandBuffer& cb) {
+        CHECK(cb.draw(flatProgram(), pa, wholeDraw(), Bindings{}, Bindings{}));
+        CHECK(cb.draw(flatProgram(), pb, wholeDraw(), Bindings{}, Bindings{}));
+        CHECK(cb.draw(texProgram(), pb, wholeDraw(6), Bindings{}, sampleA));
+        CHECK(cb.draw(texProgram(), pb, wholeDraw(6), Bindings{}, sampleA));   // (once: the barrier put it out)
+    });
+    CHECK_EQ(k.passes, 2u);
+    CHECK_EQ(k.chained, 1u);
+    CHECK_EQ(k.barriers, 1u);
+    CHECK_EQ(k.flushes, 1u);
+    // write after read: a pass into what the pass before it sampled waits for idle first, and no more
+    k = chainRun(r, false, [&](CommandBuffer& cb) {
+        CHECK(cb.draw(texProgram(), pb, wholeDraw(6), Bindings{}, sampleA));
+        CHECK(cb.draw(flatProgram(), pa, wholeDraw(), Bindings{}, Bindings{}));
+        CHECK(cb.draw(flatProgram(), pc, wholeDraw(), Bindings{}, Bindings{}));
+    });
+    CHECK_EQ(k.chained, 2u);
+    CHECK_EQ(k.waits, 1u);
+    CHECK_EQ(k.barriers, 0u);
+    CHECK_EQ(k.flushes, 1u);
+    // anything but a draw pass ends the chain with the full tail first (the fill reads nothing, but a copy or a blit may
+    // read what the chain wrote, and the next pass begins with the batch start again)
+    std::string why;
+    auto buf = newBuffer(*r.gpu, 64, &why);
+    k = chainRun(r, false, [&](CommandBuffer& cb) {
+        CHECK(cb.draw(flatProgram(), pa, wholeDraw(), Bindings{}, Bindings{}));
+        CHECK(cb.draw(flatProgram(), pb, wholeDraw(), Bindings{}, Bindings{}));
+        CHECK(cb.fill(*buf, 0, 64, 7));
+        CHECK(cb.draw(texProgram(), pc, wholeDraw(6), Bindings{}, sampleA));
+    });
+    CHECK_EQ(k.chained, 1u);
+    CHECK_EQ(k.flushes, 2u);
+    CHECK_EQ(k.barriers, 0u);
+    // a depth attachment in the chain: the full tail flushes the depth CCU too, which the fake holds a submission to
+    auto depth = target(r, 64, 64, kTextureUsageRenderTarget, PixelFormat::kDepth32Float);
+    RenderPass pd = pa;
+    pd.depth = depth.get();
+    k = chainRun(r, false, [&](CommandBuffer& cb) {
+        CHECK(cb.draw(flatProgram(), pd, wholeDraw(), Bindings{}, Bindings{}));
+        CHECK(cb.draw(flatProgram(), pb, wholeDraw(), Bindings{}, Bindings{}));
+    });
+    CHECK_EQ(k.chained, 1u);
+    CHECK_EQ(k.flushes, 1u);
+    CHECK_EQ(r.fake->stats().faults, 0u);
+}
+
+// The fake holds a chained stream to its barriers: a pass that samples what the pass before it wrote, with neither the
+// full tail nor encodeBarrier between them, is refused by its sentence; with encodeBarrier before the draw it runs
+TEST(the_fake_refuses_a_draw_sampling_what_an_unflushed_pass_wrote) {
+    Rig r;
+    auto a = target(r), b = target(r);
+    Sampler smp = nearestClamp();
+    const Program flat = flatProgram(), tex = texProgram();
+    std::string why;
+    auto upload = [&](const Kernel& k) {
+        auto buf = newBuffer(*r.gpu, 4ull * k.numWords, &why);
+        CHECK(buf != nullptr);
+        memcpy(buf->contents(), k.words, 4ull * k.numWords);
+        return buf;
+    };
+    auto vsF = upload(flat.vs.k), fsF = upload(flat.fs.k), vsT = upload(tex.vs.k), fsT = upload(tex.fs.k);
+    for (bool barrier : {false, true}) {
+        std::shared_ptr<Buffer> t[5];
+        for (auto& x : t) {
+            x = newBuffer(*r.gpu, render::kTableBytes, &why);
+            CHECK(x != nullptr);
+            memset(x->contents(), 0, render::kTableBytes);
+        }
+        auto cpu = [](const std::shared_ptr<Buffer>& x) { return static_cast<uint8_t*>(x->contents()); };
+        RenderPass pa, pb;
+        pa.color0 = a.get();
+        pb.color0 = b.get();
+        Bindings fsb;
+        fsb.textures = {a.get()};
+        fsb.samplers = {&smp};
+        pm4::Stream s;
+        CHECK(render::encodeBegin(s, pa, t[0]->gpuAddress(), cpu(t[0]), &why));
+        CHECK(render::encodeInPass(s, flat, pa, wholeDraw(), Bindings{}, Bindings{}, vsF->gpuAddress(), fsF->gpuAddress(), t[1]->gpuAddress(), cpu(t[1]), &why));
+        render::encodeLightTail(s);
+        CHECK(render::encodeBegin(s, pb, t[2]->gpuAddress(), cpu(t[2]), &why, render::lightHeadOptions(render::Options{})));
+        if (barrier) render::encodeBarrier(s, t[4]->gpuAddress(), false);
+        CHECK(render::encodeInPass(s, tex, pb, wholeDraw(6), Bindings{}, fsb, vsT->gpuAddress(), fsT->gpuAddress(), t[3]->gpuAddress(), cpu(t[3]), &why));
+        render::encodeEnd(s, pb, t[2]->gpuAddress());
+        const uint32_t faults = r.fake->stats().faults;
+        Raw raw(r);
+        raw.submit(s.words());
+        if (barrier) {
+            CHECK_EQ(r.fake->stats().faults, faults);
+            if (r.fake->stats().faults != faults) std::printf("       %s\n", r.fake->stats().lastFault.c_str());
+        } else {
+            CHECK_EQ(r.fake->stats().faults, faults + 1);
+            CHECK(r.fake->stats().lastFault.find("still in the CCU") != std::string::npos);
+        }
+    }
+}
+
+TEST(sysmem_depth_stencil_formats_clear_test_store_and_msaa_resolve) {
+    using namespace a6xx;
+    Rig r;
+    std::string why;
+    for (uint32_t samples : {1u, 2u, 4u}) {
+        for (PixelFormat format : {PixelFormat::kDepth16Unorm, PixelFormat::kDepth32Float, PixelFormat::kDepth32FloatStencil8, PixelFormat::kStencil8}) {
+            TextureDesc d;
+            d.width = 65; d.height = 17; d.samples = samples;
+            d.type = samples == 1 ? TextureType::k2D : TextureType::k2DMultisample;
+            d.usage = kTextureUsageRenderTarget;
+            d.format = format;
+            auto zs = Texture::make(*r.gpu, d, &why);
+            d.format = PixelFormat::kRGBA8Unorm;
+            auto colour = Texture::make(*r.gpu, d, &why);
+            CHECK(zs && colour);
+            if (!zs || !colour) continue;
+            RenderPass pass;
+            pass.color0 = colour.get();
+            pass.depth = zs->info().depth ? zs.get() : nullptr;
+            pass.stencil = zs->info().stencil ? zs.get() : nullptr;
+            pass.depthLoad = pass.stencilLoad = LoadAction::kClear;
+            pass.depthStore = pass.stencilStore = StoreAction::kStore;
+            pass.clearDepth = 0.5; pass.clearStencil = 0xa7;
+            Program p = flatProgram(); p.samples = samples;
+            Draw draw = wholeDraw();
+            draw.depth = {pass.depth ? 3u : 7u, pass.depth != nullptr};
+            draw.stencil.enabled = pass.stencil != nullptr;
+            draw.stencil.front = {3, 1, 2, 6, 0x3f, 0xf0};
+            draw.stencil.back = {6, 5, 4, 7, 0xf3, 0x0f};
+            Encoded e(r, p, pass, draw);
+            CHECK(e.ok);
+            if (!e.ok) { std::printf("       %s\n", e.error.c_str()); continue; }
+            CHECK_EQ(e.reg(REG_A6XX_RB_DEPTH_BUFFER_INFO), pass.depth ? (format == PixelFormat::kDepth16Unorm ? 1u : 4u) : 0u);
+            if (pass.stencil) {
+                CHECK_EQ(e.reg(REG_A6XX_RB_STENCIL_INFO + 1) << 6, zs->stencilPitch());
+                CHECK_EQ(uint64_t(e.reg(REG_A6XX_RB_STENCIL_INFO + 3)) | uint64_t(e.reg(REG_A6XX_RB_STENCIL_INFO + 4)) << 32,
+                         zs->gpuAddress() + zs->stencilOffset());
+            }
+            auto cb = r.queue->commandBuffer();
+            CHECK(cb->draw(p, pass, draw, {}, {}));
+            pass.depthLoad = pass.stencilLoad = LoadAction::kLoad;
+            CHECK(cb->draw(p, pass, draw, {}, {}));
+            // Resolving closes the pass and must flush both colour and depth/stencil first.
+            d.type = TextureType::k2D; d.samples = 1;
+            auto resolved = Texture::make(*r.gpu, d, &why);
+            CHECK(resolved != nullptr);
+            if (samples > 1 && resolved) CHECK(cb->blit(*colour, 0, {0, 0, 65, 17}, *resolved, 0, {0, 0, 65, 17}, false));
+            cb->commit(); cb->waitUntilCompleted();
+            CHECK(cb->status() == CommandBuffer::kCompleted);
+            if (cb->status() != CommandBuffer::kCompleted) std::printf("       %s | %s\n", cb->error().c_str(), r.fake->stats().lastFault.c_str());
+            if (samples > 1 && pass.depth && format != PixelFormat::kDepth16Unorm) {
+                const auto* z = static_cast<const uint32_t*>(zs->contents());
+                // The fake does not rasterize depth: the clear must fill every sample, including row padding.
+                for (uint64_t i = 0; i < zs->bytesPerRow() * 32 / 4; i++) CHECK_EQ(z[i], 0x3f000000u);
+            }
+            if (samples > 1 && pass.stencil) {
+                const auto* s = static_cast<const uint8_t*>(zs->contents()) + zs->stencilOffset();
+                for (uint64_t i = 0; i < zs->stencilPitch() * 32; i++) CHECK_EQ(s[i], 0xa7u);
+            }
+        }
+    }
+}
+
+TEST(stencil_only_pass_flushes_and_keeps_the_attachment) {
+    Rig r;
+    auto stencil = target(r, 64, 64, kTextureUsageRenderTarget, PixelFormat::kStencil8);
+    RenderPass pass;
+    pass.stencil = stencil.get();
+    pass.stencilLoad = LoadAction::kClear;
+    pass.stencilStore = StoreAction::kStore;
+    Draw d = wholeDraw();
+    d.stencil.enabled = true;
+    d.stencil.front.pass = d.stencil.back.pass = 2;
+    auto cb = r.queue->commandBuffer();
+    CHECK(cb->draw(flatProgram(), pass, d, {}, {}));
+    cb->commit();
+    stencil.reset();
+    cb->waitUntilCompleted();
+    CHECK(cb->status() == CommandBuffer::kCompleted);
+    if (cb->status() != CommandBuffer::kCompleted) std::printf("       %s | %s\n", cb->error().c_str(), r.fake->stats().lastFault.c_str());
+    CHECK_EQ(r.fake->stats().faults, 0u);
+}
+
+// Impeller's onscreen pass (and CoreAnimation's memoryless ones): a 4x colour attachment and a 4x Depth32Float_Stencil8,
+// all cleared and none stored, the colour resolved into a one-sample texture right after. With setGmemMsaaZs the pass is
+// tiled -- the three Clears in each tile, the resolve from each tile, no sysmem fill and no 2D-engine resolve -- binned or
+// not; without it, as before, in sysmem with the 2D engine's resolve after it. Either way the one-sample texture is the
+// clear colour (the fake does not rasterize, so that is all the draws leave).
+TEST(a_memoryless_msaa_depth_stencil_pass_is_tiled_and_resolved_from_the_tiles) {
+    std::string why;
+    for (int mode = 0; mode < 4; mode++) {   // 0 sysmem, 1 GMEM, 2 GMEM binned, 3 GMEM asked for but the pass too light (dual -> sysmem)
+        Rig r;
+        TextureDesc d;
+        d.width = 300; d.height = 500; d.samples = 4;
+        d.type = TextureType::k2DMultisample;
+        d.usage = kTextureUsageRenderTarget;
+        d.format = PixelFormat::kRGBA8Unorm;
+        auto colour = Texture::make(*r.gpu, d, &why);
+        d.format = PixelFormat::kDepth32FloatStencil8;
+        auto zs = Texture::make(*r.gpu, d, &why);
+        auto out = target(r, 300, 500);
+        CHECK(colour && zs && out);
+        if (!colour || !zs || !out) return;
+        RenderPass pass;
+        pass.color0 = colour.get();
+        pass.load = LoadAction::kClear;
+        pass.store = StoreAction::kDontCare;
+        const double c[4] = {0.25, 0.5, 0.75, 1.0};
+        for (int i = 0; i < 4; i++) pass.clearColor[i] = c[i];
+        pass.depth = pass.stencil = zs.get();
+        pass.depthLoad = pass.stencilLoad = LoadAction::kClear;
+        pass.depthStore = pass.stencilStore = StoreAction::kDontCare;
+        pass.clearDepth = 0.5;
+        pass.clearStencil = 0xa7;
+        Program p = flatProgram();
+        p.samples = 4;
+        Draw draw = wholeDraw(3, 300, 500);
+        draw.depth = {3u, true};
+        draw.stencil.enabled = true;
+        draw.stencil.front = draw.stencil.back = {7, 0, 0, 2, 0xff, 0xff};
+        render::GmemPlan plan;
+        CHECK(render::gmemPlan(pass, &plan, &why));
+        CHECK(plan.samples == 4 && plan.depthBpp == 16 && plan.stencilBpp == 4 && plan.bpp[0] == 16);
+        CHECK(uint64_t(plan.binW) * plan.binH * 36 <= a6xx::kGmemCcuColorOffset && plan.stencilBase + plan.stencilRoom <= a6xx::kGmemCcuColorOffset);
+        auto cb = r.queue->commandBuffer();
+        cb->setGmemMsaaZs(mode != 0);
+        cb->setGmemBinning(mode == 2);
+        if (mode == 3) cb->setGmemMinDraws(8);
+        CHECK(cb->draw(p, pass, draw, {}, {}));
+        pass.load = pass.depthLoad = pass.stencilLoad = LoadAction::kDontCare;
+        CHECK(cb->draw(p, pass, draw, {}, {}));
+        CHECK(cb->blit(*colour, 0, {0, 0, 300, 500}, *out, 0, {0, 0, 300, 500}, false));
+        cb->commit();
+        cb->waitUntilCompleted();
+        CHECK(cb->status() == CommandBuffer::kCompleted);
+        if (cb->status() != CommandBuffer::kCompleted) std::printf("       mode %d: %s | %s\n", mode, cb->error().c_str(), r.fake->stats().lastFault.c_str());
+        const auto s = r.fake->stats();
+        const bool tiled = mode == 1 || mode == 2;
+        CHECK_EQ(cb->counts().gmemPasses, tiled ? 1u : 0u);
+        CHECK_EQ(cb->counts().copies, tiled ? 0u : 1u);   // (the 2D engine's resolve only in sysmem)
+        if (tiled) {
+            CHECK(s.tiles > 1 && s.tiles == cb->counts().tiles);
+            CHECK_EQ(s.tileLoads, 0u);                     // nothing of the pass is in memory to load
+            CHECK_EQ(s.tileClears, 3 * s.tiles);           // colour, depth, stencil in every tile
+            CHECK_EQ(s.tileStores, s.tiles);               // the resolve alone: the samples, depth and stencil stay in GMEM
+            CHECK_EQ(s.binningPasses, mode == 2 ? 1u : 0u);
+        }
+        auto* px = static_cast<const uint8_t*>(out->buffer()->contents());
+        uint32_t cleared = 0;
+        for (uint32_t j = 0; j < 500; j++)
+            for (uint32_t i = 0; i < 300; i++) cleared += memcmp(px + j * out->bytesPerRow() + i * 4, "\x40\x80\xbf\xff", 4) == 0;
+        CHECK_EQ(cleared, 300u * 500u);
+        if (cleared != 300u * 500u) std::printf("       mode %d: %u of the resolved pixels are the clear colour\n", mode, cleared);
+    }
+}
+
+// A later framebuffer fetch cannot run in GMEM. The earlier Clear and draws must survive
+// the change to sysmem, including stencil used by polygon fills. Model the v28 bar of 1.
+TEST(a_memoryless_pass_keeps_its_clear_when_a_later_draw_needs_sysmem) {
+    for (uint32_t samples : {1u, 2u, 4u}) for (uint32_t bar : {1u, 8u, CommandBuffer::kGmemAdaptive}) {
+        Rig r;
+        std::string why;
+        TextureDesc d;
+        d.width = 65; d.height = 17; d.samples = samples;
+        d.type = samples == 1 ? TextureType::k2D : TextureType::k2DMultisample;
+        d.format = PixelFormat::kRGBA8Unorm;
+        d.usage = kTextureUsageRenderTarget;
+        auto colour = Texture::make(*r.gpu, d, &why);
+        d.format = PixelFormat::kDepth32FloatStencil8;
+        auto zs = Texture::make(*r.gpu, d, &why);
+        auto out = target(r, 65, 17);
+        CHECK(colour && zs && out);
+        if (!colour || !zs || !out) return;
+        // Old contents differ from the Clear, as a reused memoryless allocation does.
+        memset(colour->contents(), 0x33, colour->buffer()->length());
+        memset(zs->contents(), 0x55, zs->buffer()->length());
+        RenderPass pass;
+        pass.color0 = colour.get(); pass.load = LoadAction::kClear; pass.store = StoreAction::kDontCare;
+        pass.clearColor[0] = 1; pass.clearColor[3] = 1;
+        pass.depth = pass.stencil = zs.get();
+        pass.depthLoad = pass.stencilLoad = LoadAction::kClear;
+        pass.depthStore = pass.stencilStore = StoreAction::kDontCare;
+        pass.clearDepth = 0.5; pass.clearStencil = 0xa7;
+        auto cb = r.queue->commandBuffer();
+        cb->setGmemMsaaZs(true); cb->setGmemMinDraws(bar);
+        Program p = flatProgram(); p.samples = samples;
+        Draw draw = wholeDraw(3, 65, 17);
+        CHECK(cb->draw(p, pass, draw, {}, {}));
+        pass.load = pass.depthLoad = pass.stencilLoad = LoadAction::kLoad;
+        // An explicit attachment alias forces sysmem also at one sample; MSAA framebuffer
+        // fetch is another trigger. Neither draw may discard the previous tile contents.
+        Bindings reads;
+        reads.textures.push_back(colour.get());
+        CHECK(cb->draw(p, pass, draw, {}, reads));
+        if (samples > 1) CHECK(cb->blit(*colour, 0, {0, 0, 65, 17}, *out, 0, {0, 0, 65, 17}, false));
+        cb->commit(); cb->waitUntilCompleted();
+        CHECK(cb->status() == CommandBuffer::kCompleted);
+        if (cb->status() != CommandBuffer::kCompleted) std::printf("       %s | %s\n", cb->error().c_str(), r.fake->stats().lastFault.c_str());
+        CHECK_EQ(cb->counts().gmemPasses, 0u); // replay the WHOLE pass in sysmem
+        CHECK_EQ(r.fake->stats().draws, 2u); // the earlier geometry is replayed too
+        const auto* image = samples > 1 ? out.get() : colour.get();
+        const auto* px = static_cast<const uint8_t*>(image->contents());
+        uint32_t cleared = 0;
+        for (uint32_t y = 0; y < 17; y++) for (uint32_t x = 0; x < 65; x++)
+            cleared += memcmp(px + y * image->bytesPerRow() + x * 4, "\xff\x00\x00\xff", 4) == 0;
+        CHECK_EQ(cleared, 65u * 17u);
+        // The fake does not rasterize: inspect clear state, not simulated polygon pixels.
+        const auto* z = static_cast<const uint32_t*>(zs->contents());
+        const auto* st = static_cast<const uint8_t*>(zs->contents()) + zs->stencilOffset();
+        if (samples > 1) { CHECK_EQ(z[0], 0x3f000000u); CHECK_EQ(st[0], 0xa7u); }
+        else CHECK_EQ(r.fake->stats().tiledFills, 2u); // single-sample TILE6_3 bytes are not modelled
+    }
+}
+
+// Stored/loaded MSAA and depth cannot live only in tiles.
+TEST(gmem_keeps_stored_or_loaded_msaa_and_depth_in_sysmem) {
+    Rig r;
+    std::string why;
+    TextureDesc d;
+    d.width = 64; d.height = 64; d.samples = 4;
+    d.type = TextureType::k2DMultisample;
+    d.usage = kTextureUsageRenderTarget;
+    d.format = PixelFormat::kRGBA8Unorm;
+    auto colour = Texture::make(*r.gpu, d, &why);
+    d.format = PixelFormat::kRGBA16Float;
+    auto wide = Texture::make(*r.gpu, d, &why);
+    d.format = PixelFormat::kDepth32Float;
+    auto depth = Texture::make(*r.gpu, d, &why);
+    CHECK(colour && wide && depth);
+    if (!colour || !wide || !depth) return;
+    render::GmemPlan p;
+    RenderPass a;
+    a.color0 = colour.get();
+    a.load = LoadAction::kClear;
+    a.store = StoreAction::kDontCare;
+    CHECK(render::gmemPlan(a, &p, &why));
+    CHECK(!render::gmemPlan(a, &p, &why, false));   // (setGmemMsaaZs off)
+    a.store = StoreAction::kStore;
+    CHECK(!render::gmemPlan(a, &p, &why));
+    a.store = StoreAction::kDontCare;
+    a.load = LoadAction::kLoad;
+    CHECK(!render::gmemPlan(a, &p, &why));
+    a.load = LoadAction::kDontCare;
+    a.depth = depth.get();
+    a.depthStore = StoreAction::kStore;
+    CHECK(!render::gmemPlan(a, &p, &why));
+    a.depthStore = StoreAction::kDontCare;
+    a.depthLoad = LoadAction::kLoad;
+    CHECK(!render::gmemPlan(a, &p, &why));
+    a.depthLoad = LoadAction::kClear;
+    CHECK(render::gmemPlan(a, &p, &why));
+    RenderPass b;
+    b.color0 = wide.get();
+    b.store = StoreAction::kDontCare;
+    CHECK(!render::gmemPlan(b, &p, &why));
+}
+
+TEST(adaptive_gmem_uses_current_pass_size_and_coverage) {
+    for (uint32_t size : {64u, 512u}) for (uint32_t draws : {1u, 22u, 64u}) for (bool corner : {false, true}) {
+        Rig r;
+        auto t = target(r, size, size);
+        RenderPass pass; pass.color0 = t.get();
+        auto cb = r.queue->commandBuffer();
+        cb->setGmemMinDraws(CommandBuffer::kGmemAdaptive);
+        cb->setProfile(true);
+        Draw d = wholeDraw(3, size, size);
+        if (corner) d.scissor = {0, 0, 16, 16};
+        for (uint32_t i = 0; i < draws; i++) CHECK(cb->draw(flatProgram(), pass, d, {}, {}));
+        cb->commit(); cb->waitUntilCompleted();
+        CHECK(cb->status() == CommandBuffer::kCompleted);
+        const bool tiled = size == 512 && draws == 64 && !corner;
+        CHECK_EQ(cb->counts().gmemPasses, tiled ? 1u : 0u);
+        CHECK_EQ(cb->counts().sysmemPasses, tiled ? 0u : 1u);
+        CHECK(cb->counts().wfis > 0 && cb->counts().encodeNs > 0);
+    }
+}
+
+TEST(gmem_and_sysmem_passes_chain_with_their_mode_and_hazard_waits) {
+    for (bool full : {false, true}) for (int read : {0, 1, 2}) {
+        Rig r;
+        auto a = target(r, 512, 512), b = target(r, 512, 512), c = target(r, 512, 512);
+        Sampler sampler = nearestClamp();
+        RenderPass pass; pass.color0 = a.get();
+        auto cb = r.queue->commandBuffer();
+        cb->setPassWfi(full); cb->setProfile(true); cb->setGmemBinning(true);
+        CHECK(cb->draw(flatProgram(), pass, wholeDraw(3, 512, 512), {}, {}));
+        pass.color0 = b.get();
+        CHECK(cb->draw(flatProgram(), pass, wholeDraw(3, 512, 512), {}, {}));
+        if (read) {
+            Bindings fs; fs.textures = {a.get()}; fs.samplers = {&sampler};
+            render::Options o; o.gmem = read == 2;
+            CHECK(cb->draw(texProgram(), pass, wholeDraw(6, 512, 512), {}, fs, o));
+        }
+        pass.color0 = c.get();
+        CHECK(cb->draw(flatProgram(), pass, wholeDraw(3, 512, 512), {}, {}));
+        cb->commit(); cb->waitUntilCompleted();
+        if (cb->status() != CommandBuffer::kCompleted) std::printf("       %s | %s\n", cb->error().c_str(), r.fake->stats().lastFault.c_str());
+        CHECK(cb->status() == CommandBuffer::kCompleted);
+        CHECK_EQ(r.fake->stats().faults, 0u);
+        CHECK(cb->counts().wfis >= cb->counts().tiles); // tile store waits remain
+        if (!full && read == 0) { CHECK_EQ(cb->counts().chained, 2u); CHECK_EQ(cb->counts().flushes, 1u); }
+        if (full) CHECK_EQ(cb->counts().chained, 0u);
+        if (!full && read == 2) CHECK(cb->counts().barriers > 0); // later GMEM draw samples the preceding chain
+    }
+}
+
+TEST(dirty_draw_state_keeps_mutable_samplers_and_changed_vertex_buffers) {
+    Rig r;
+    auto t = target(r), a = target(r, 4, 4, kTextureUsageRead), b = target(r, 4, 4, kTextureUsageRead);
+    Sampler smp = nearestClamp();
+    Bindings fs; fs.textures = {a.get()}; fs.samplers = {&smp};
+    RenderPass pass; pass.color0 = t.get();
+    render::Options o; o.gmem = false;
+    auto cb = r.queue->commandBuffer();
+    CHECK(cb->draw(texProgram(), pass, wholeDraw(6), {}, fs, o));
+    const size_t before = cb->streamWords();
+    CHECK(cb->draw(texProgram(), pass, wholeDraw(6), {}, fs, o));
+    CHECK(cb->streamWords() - before < 32u);
+    fs.textures = {b.get()};
+    smp.words[0] |= a6xx::A6XX_TEX_SAMP_0_XY_MAG(a6xx::A6XX_TEX_LINEAR);
+    CHECK(cb->draw(texProgram(), pass, wholeDraw(6), {}, fs, o));
+    cb->commit(); cb->waitUntilCompleted();
+    CHECK(cb->status() == CommandBuffer::kCompleted);
+    const auto last = r.fake->stats().lastDraw;
+    const auto descriptor = r.fake->memory(last.fsTexConst, 64);
+    const auto expected = b->sampledDescriptor();
+    CHECK(descriptor.size() == 64 && memcmp(descriptor.data(), &expected, 64) == 0);
+    const auto sampler = r.fake->memory(last.fsTexConst + kMaxTextureSlots * 64, 16);
+    CHECK(sampler.size() == 16 && memcmp(sampler.data(), smp.words, 16) == 0);
+
+    std::string why;
+    auto vb = newBuffer(*r.gpu, 144, &why), vb2 = newBuffer(*r.gpu, 144, &why);
+    auto vertices = r.queue->commandBuffer();
+    Bindings vs; vs.buffers = {{vb.get(), 0}};
+    Draw d = wholeDraw(6);
+    CHECK(vertices->draw(attrProgram(), pass, d, vs, {}, o));
+    CHECK(vertices->draw(attrProgram(), pass, d, vs, {}, o));
+    vs.buffers = {{vb2.get(), 12}};
+    d.scissor = {3, 4, 20, 21}; d.viewport.width = 48;
+    CHECK(vertices->draw(attrProgram(), pass, d, vs, {}, o));
+    vertices->commit(); vertices->waitUntilCompleted();
+    CHECK(vertices->status() == CommandBuffer::kCompleted);
+    CHECK_EQ(r.fake->stats().faults, 0u);
+}
+
+TEST(cached_shader_state_still_reloads_changed_constants_at_the_same_binding) {
+    Rig r;
+    auto t = target(r);
+    RenderPass pass; pass.color0 = t.get();
+    Program p{kernels::tri_flat_vs_air, kernels::tri_cflat_fs_air, Linkage{}, "same_binding"};
+    std::string why;
+    auto b = newBuffer(*r.gpu, 20, &why);
+    Bindings fs; fs.buffers = {{b.get(), 4}}; // short range: snapshotted into direct constants
+    auto cb = r.queue->commandBuffer();
+    render::Options o; o.gmem = false;
+    memset(b->contents(), 0x11, b->length());
+    CHECK(cb->draw(p, pass, wholeDraw(), {}, fs, o));
+    memset(b->contents(), 0x22, b->length());
+    CHECK(cb->draw(p, pass, wholeDraw(), {}, fs, o));
+    cb->commit(); cb->waitUntilCompleted();
+    CHECK(cb->status() == CommandBuffer::kCompleted);
+    const auto constants = r.fake->stats().lastDraw.fsConsts;
+    CHECK(!constants.empty());
+    if (!constants.empty()) CHECK_EQ(constants.back().words[0], 0x22222222u);
+}
+
+TEST(gmem_fetch_reuses_its_body_barrier_only_when_visibility_cannot_skip_it) {
+    using namespace a6xx;
+    Rig r;
+    auto t = target(r, 1125, 2436);
+    RenderPass pass; pass.color0 = t.get();
+    render::GmemPlan plan;
+    CHECK(render::gmemPlan(pass, &plan, nullptr));
+    CHECK(plan.tiles() > 1);
+    auto packets = [](const pm4::Stream& stream, bool omitFetchBarriers) {
+        std::vector<uint32_t> words;
+        for (size_t i = 0; i < stream.words().size();) {
+            const auto h = pm4::decode(stream.words()[i]);
+            const bool invalidate = h.kind == pm4::Header::kCommand && h.opcode == CP_EVENT_WRITE &&
+                (stream.words()[i + 1] & CP_EVENT_WRITE_0_EVENT__MASK) == CACHE_INVALIDATE;
+            const bool wfi = h.kind == pm4::Header::kCommand && h.opcode == CP_WAIT_FOR_IDLE;
+            if (!omitFetchBarriers || (!invalidate && !wfi))
+                words.insert(words.end(), stream.words().begin() + i, stream.words().begin() + i + h.count + 1);
+            i += h.count + 1;
+        }
+        return words;
+    };
+    auto wfis = [](const pm4::Stream& stream) {
+        uint32_t n = 0;
+        for (size_t i = 0; i < stream.words().size();) {
+            const auto h = pm4::decode(stream.words()[i]);
+            n += h.kind == pm4::Header::kCommand && h.opcode == CP_WAIT_FOR_IDLE;
+            i += h.count + 1;
+        }
+        return n;
+    };
+    for (bool binned : {false, true}) for (bool fetch : {false, true}) {
+        render::Options o; o.gmemBinning = binned;
+        render::GmemTileWork legacy, current;
+        current.fetchBarrierInBody = true;
+        pm4::Stream before, after;
+        const uint64_t vsc = binned ? 0x10000000 : 0;
+        render::encodeGmem(before, pass, plan, 0x20000000, 4, 0x30000000, o, 1, 1, fetch, 0, nullptr, vsc, &legacy);
+        render::encodeGmem(after, pass, plan, 0x20000000, 4, 0x30000000, o, 1, 1, fetch, 0, nullptr, vsc, &current);
+        CHECK_EQ(wfis(before) - wfis(after), !binned && fetch ? plan.tiles() : 0u);
+        // Loads, stores, resolves, draws, markers and all register state remain identical.
+        CHECK(packets(before, true) == packets(after, true));
+        if (binned || !fetch) CHECK(before.words() == after.words());
+    }
+    const Program fb{kernels::tri_flat_vs_air, kernels::tri_fb_fs_air, Linkage{}, "fetch-after-background"};
+    const Program background{kernels::tri_flat_vs_air, kernels::tri_cflat_fs_air, Linkage{}, "background"};
+    std::string why;
+    auto colour = newBuffer(*r.gpu, 16, &why);
+    Bindings constants; constants.buffers = {{colour.get(), 0}};
+    auto cb = r.queue->commandBuffer();
+    cb->setProfile(true); cb->setGmemMinDraws(1); cb->setGmemBinning(false);
+    CHECK(cb->draw(background, pass, wholeDraw(6, 1125, 2436), {}, constants));
+    CHECK(cb->draw(fb, pass, wholeDraw(6, 1125, 2436), {}, {}));
+    CHECK(cb->draw(fb, pass, wholeDraw(6, 1125, 2436), {}, {}));
+    cb->commit(); cb->waitUntilCompleted();
+    if (cb->status() != CommandBuffer::kCompleted) std::printf("       %s; %s\n", cb->error().c_str(), r.fake->stats().lastFault.c_str());
+    CHECK(cb->status() == CommandBuffer::kCompleted);
+    const auto times = cb->passTimes();
+    CHECK_EQ(times.size(), size_t(1));
+    CHECK_EQ(times[0].shaders.size(), size_t(2));
+    CHECK(times[0].shaders[1] == "fetch-after-background");
+    CHECK_EQ(times[0].loads, 1u); CHECK_EQ(times[0].stores, 1u);
+    CHECK_EQ(times[0].samples, 1u); CHECK_EQ(times[0].resolves, 0u);
+    CHECK_EQ(times[0].wfis + 1, cb->counts().wfis);
+    CHECK(times[0].wfis >= 3 * times[0].tiles); // first fetch barrier and tile-store WFI stay
+    CHECK_EQ(r.fake->stats().faults, 0u);
+}
+
+// --- A8 and one-channel targets, the destination-alpha blend, and a pass that samples its own attachment --------------
+//
+// What the report of the black shadows (work/v29g/INVESTIGATION-black-shadow.md) could not see from the phone's log:
+// whether CoreAnimation's shadow pass draws into an A8Unorm attachment (it does not there: v29g's format table shows
+// BGRA8 throughout), whether its second attachment is R8 (the driver never records a second attachment's format), and
+// whether a pass samples what its earlier draws wrote (the driver had no barrier for it). These hold the encoding of
+// each of those pieces; what the phone's RB and TP do with an A8 target or a same-pass read is the phone's to say.
+
+namespace {
+uint32_t fieldOf(uint32_t word, uint32_t mask, uint32_t shift) { return (word & mask) >> shift; }
+}  // namespace
+
+// An A8 colour attachment names A8 in the RB and in SP_FS_MRT_REG, the write mask through RB_MRT_CONTROL, and the
+// Clear packs the colour into the fill's fourth word alone. The fake does not model the RB's A8 packing of a DRAW's
+// output (it rasterizes nothing), so "0.5 written into an A8 target reads back 0.5" is still only the phone's to prove.
+TEST(a_draw_into_an_a8_target_names_alpha_in_the_rb) {
+    using namespace a6xx;
+    Rig r;
+    auto t = target(r, 64, 64, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kA8Unorm);
+    RenderPass pass;
+    pass.color0 = t.get();
+    Program p = flatProgram();
+    p.blend.writeMask = 0xf;
+    Encoded e(r, p, pass, wholeDraw());
+    CHECK(e.ok);
+    if (!e.ok) std::printf("       %s\n", e.error.c_str());
+    const uint32_t bufInfo = e.reg(regRbMrt(REG_A6XX_RB_MRT_BUF_INFO, 0));
+    CHECK_EQ(fieldOf(bufInfo, A6XX_RB_MRT_BUF_INFO_COLOR_FORMAT__MASK, A6XX_RB_MRT_BUF_INFO_COLOR_FORMAT__SHIFT), uint32_t(FMT6_A8_UNORM));
+    CHECK_EQ(fieldOf(bufInfo, A6XX_RB_MRT_BUF_INFO_COLOR_SWAP__MASK, A6XX_RB_MRT_BUF_INFO_COLOR_SWAP__SHIFT), uint32_t(WZYX));
+    const uint32_t sp = e.reg(regSpFsMrtReg(0));
+    CHECK_EQ(fieldOf(sp, A6XX_SP_FS_MRT_REG_COLOR_FORMAT__MASK, A6XX_SP_FS_MRT_REG_COLOR_FORMAT__SHIFT), uint32_t(FMT6_A8_UNORM));
+    CHECK_EQ(sp & (A6XX_SP_FS_MRT_REG_COLOR_SINT | A6XX_SP_FS_MRT_REG_COLOR_UINT), 0u);   // a unorm format, as R8Uint would not be
+    CHECK_EQ(fieldOf(e.reg(regRbMrt(REG_A6XX_RB_MRT_CONTROL, 0)), A6XX_RB_MRT_CONTROL_COMPONENT_ENABLE__MASK,
+                     A6XX_RB_MRT_CONTROL_COMPONENT_ENABLE__SHIFT), 0xfu);
+    // a write mask with alpha off: the component enable follows it (A8's channel is the fourth; MTLColorWriteMask's
+    // bits are Red 8, Green 4, Blue 2, Alpha 1, and the component enable's Red 1 .. Alpha 8, so 0xe is Red, Green, Blue)
+    p.blend.writeMask = 0xe;
+    Encoded masked(r, p, pass, wholeDraw());
+    CHECK(masked.ok);
+    CHECK_EQ(fieldOf(masked.reg(regRbMrt(REG_A6XX_RB_MRT_CONTROL, 0)), A6XX_RB_MRT_CONTROL_COMPONENT_ENABLE__MASK,
+                     A6XX_RB_MRT_CONTROL_COMPONENT_ENABLE__SHIFT), 0x7u);
+    // the Clear: A8's one channel is the fill's fourth word (clearWords), the first three 0 whatever the colour asks
+    std::string why;
+    auto table = newBuffer(*r.gpu, render::kTableBytes, &why);
+    pm4::Stream clear;
+    CHECK(render::encodeClear(clear, clearPass(t.get(), 0.25, 0.5, 0.75, 0.5), table->gpuAddress(), static_cast<uint8_t*>(table->contents()), &why));
+    auto lastReg = [](const pm4::Stream& st, uint32_t reg) {
+        uint32_t v = 0xdeadbeef;
+        for (size_t i = 0; i < st.words().size();) {
+            const pm4::Header h = pm4::decode(st.words()[i]);
+            if (h.kind == pm4::Header::kRegisters && reg >= h.reg && reg < h.reg + h.count) v = st.words()[i + 1 + (reg - h.reg)];
+            i += 1 + h.count;
+        }
+        return v;
+    };
+    CHECK_EQ(lastReg(clear, REG_A6XX_RB_2D_SRC_SOLID_C0), 0u);
+    CHECK_EQ(lastReg(clear, REG_A6XX_RB_2D_SRC_SOLID_C0 + 1), 0u);
+    CHECK_EQ(lastReg(clear, REG_A6XX_RB_2D_SRC_SOLID_C0 + 2), 0u);
+    CHECK_EQ(lastReg(clear, REG_A6XX_RB_2D_SRC_SOLID_C0 + 3), 128u);   // 0.5 * 255 = 127.5 -> 128
+    CHECK_EQ(lastReg(clear, REG_A6XX_RB_2D_DST_INFO) & A6XX_RB_2D_DST_INFO_COLOR_FORMAT__MASK, uint32_t(FMT6_A8_UNORM));
+    // through the command buffer: the fake judges the target's registers (RB_MRT, SP_FS_MRT_REG, RENDER_COMPONENTS)
+    auto cb = drawOnce(r, p, pass, wholeDraw());
+    CHECK(cb->status() == CommandBuffer::kCompleted);
+    if (cb->status() != CommandBuffer::kCompleted) std::printf("       %s | %s\n", cb->error().c_str(), r.fake->stats().lastFault.c_str());
+    CHECK_EQ(r.fake->stats().lastDraw.mrtFormat, uint32_t(FMT6_A8_UNORM));
+    CHECK_EQ(fieldOf(r.fake->stats().lastDraw.spFsMrtReg, A6XX_SP_FS_MRT_REG_COLOR_FORMAT__MASK, A6XX_SP_FS_MRT_REG_COLOR_FORMAT__SHIFT),
+             uint32_t(FMT6_A8_UNORM));
+    CHECK_EQ(r.fake->stats().faults, 0u);
+}
+
+// A draw that samples a texture over the memory of an attachment its own still-open pass has drawn into is a read after
+// write inside one pass: the colour sits in the CCU, and the texture unit would read the memory as it was before (on the
+// phone the mask/blur/compose passes CoreAnimation draws its shadows with are exactly this shape). The barrier before
+// the draw is the chained pass's (PC_CCU_FLUSH_COLOR_TS on a word of its own, waited for, then CACHE_INVALIDATE); the
+// fake refuses such a read without one ("sampled at ... while what a draw ... wrote there earlier ... is still in the
+// CCU"). A sample from another buffer gets no barrier, and a framebuffer fetch's own barrier is not one of these.
+TEST(a_draw_that_samples_what_the_open_pass_wrote_gets_a_barrier) {
+    Rig r;
+    auto t = target(r);   // 64 x 64 RGBA8Unorm, render target and readable
+    auto other = target(r);
+    Sampler smp = nearestClamp();
+    std::string why;
+    TextureDesc v;
+    v.format = PixelFormat::kR8Unorm;   // a one-channel view over attachment 0's bytes
+    v.width = v.height = 64;
+    v.usage = kTextureUsageRead;
+    auto over = Texture::overBuffer(t->buffer(), 0, 64, v, &why);
+    CHECK(over != nullptr);
+    if (over == nullptr) return;
+    RenderPass pass;
+    pass.color0 = t.get();
+    Bindings sampleTheTarget, sampleElsewhere;
+    sampleTheTarget.textures = {over.get()};
+    sampleTheTarget.samplers = {&smp};
+    sampleElsewhere.textures = {other.get()};
+    sampleElsewhere.samplers = {&smp};
+    auto run = [&](const Bindings& second) {
+        const uint32_t faults = r.fake->stats().faults;
+        auto cb = r.queue->commandBuffer();
+        cb->setProfile(true);
+        cb->setGmem(false);
+        CHECK(cb->draw(flatProgram(), pass, wholeDraw(), Bindings{}, Bindings{}));
+        CHECK(cb->draw(texProgram(), pass, wholeDraw(6), Bindings{}, second));
+        cb->commit();
+        cb->waitUntilCompleted();
+        if (cb->status() != CommandBuffer::kCompleted) std::printf("       %s | %s\n", cb->error().c_str(), r.fake->stats().lastFault.c_str());
+        CHECK(cb->status() == CommandBuffer::kCompleted);
+        CHECK_EQ(r.fake->stats().faults, faults);
+        return cb;
+    };
+    // the hazard: one barrier, before the sampling draw, and the pass summary says it was this pass's own
+    auto cb = run(sampleTheTarget);
+    CHECK_EQ(cb->counts().barriers, 1u);
+    const auto times = cb->passTimes();
+    CHECK(!times.empty());
+    if (!times.empty()) {
+        CHECK_EQ(times.back().inPassBarriers, 1u);
+        CHECK_EQ(times.back().draws, 2u);
+        CHECK(times.back().attachedFmt == "RGBA8Unorm");
+    }
+    // ...and the stream itself: a 4-word flush, a wait for its word, the invalidate, then the draw
+    // (the barrier's words are a piece of the command buffer's; the fake's hazard check read them)
+    CHECK_EQ(r.fake->stats().faults, 0u);
+    // nothing over the target's memory: no barrier at all
+    auto plain = run(sampleElsewhere);
+    CHECK_EQ(plain->counts().barriers, 0u);
+    if (!plain->passTimes().empty()) CHECK_EQ(plain->passTimes().back().inPassBarriers, 0u);
+    // a framebuffer fetch's barrier is the fetch's, not an in-pass read after write (the attachment is read, not bound)
+    const Program fb{kernels::tri_flat_vs_air, kernels::tri_fb_fs_air, Linkage{}, "tri_fb"};
+    auto f = r.queue->commandBuffer();
+    f->setProfile(true);
+    f->setGmem(false);
+    CHECK(f->draw(fb, pass, wholeDraw(6), Bindings{}, Bindings{}));
+    CHECK(f->draw(fb, pass, wholeDraw(6), Bindings{}, Bindings{}));
+    f->commit();
+    f->waitUntilCompleted();
+    CHECK(f->status() == CommandBuffer::kCompleted);
+    // (the fetch's barrier is written inside the draw's own stream by encodeInPass, not a chained pass's: counts_.barriers
+    // stays 0, and it is no in-pass read after write either -- a_draw_that_reads_its_target_* holds the flush itself)
+    CHECK_EQ(f->counts().barriers, 0u);
+    CHECK(!f->passTimes().empty());
+    if (!f->passTimes().empty()) {
+        CHECK_EQ(f->passTimes().back().fetchDraws, 2u);
+        CHECK_EQ(f->passTimes().back().inPassBarriers, 0u);   // (not counted twice)
+    }
+}
+
+// A draw that writes an attachment after the barrier that flushed it is owed another barrier before a later draw samples
+// it: a barrier puts out what was written BEFORE it, so a write clears that attachment from the pass's barriered mask
+// again. Two shapes, the same bookkeeping: inside one pass (write A, sample A, write A, sample A), and at a pass's
+// start (a cross-pass barrier before its first draw, which writes A, then a second draw that samples A -- the cross-pass
+// barrier flushed what the LAST pass wrote, not this pass's first draw). The fake faults on the missing barrier itself.
+TEST(a_sample_of_an_attachment_rewritten_after_a_barrier_gets_another_barrier) {
+    Rig r;
+    auto a = target(r), b = target(r);
+    Sampler smp = nearestClamp();
+    std::string why;
+    TextureDesc v;
+    v.format = PixelFormat::kR8Unorm;   // a one-channel view over an attachment's bytes
+    v.width = v.height = 64;
+    v.usage = kTextureUsageRead;
+    auto overA = Texture::overBuffer(a->buffer(), 0, 64, v, &why);
+    auto overB = Texture::overBuffer(b->buffer(), 0, 64, v, &why);
+    CHECK(overA != nullptr);
+    CHECK(overB != nullptr);
+    if (overA == nullptr || overB == nullptr) return;
+    Bindings sampleA, sampleB;
+    sampleA.textures = {overA.get()};
+    sampleA.samplers = {&smp};
+    sampleB.textures = {overB.get()};
+    sampleB.samplers = {&smp};
+    auto run = [&](const std::function<void(CommandBuffer&)>& record) {
+        const uint32_t faults = r.fake->stats().faults;
+        auto cb = r.queue->commandBuffer();
+        cb->setProfile(true);
+        cb->setGmem(false);
+        record(*cb);
+        cb->commit();
+        cb->waitUntilCompleted();
+        if (cb->status() != CommandBuffer::kCompleted || r.fake->stats().faults != faults) {
+            std::printf("       %s | %s\n", cb->error().c_str(), r.fake->stats().lastFault.c_str());
+        }
+        CHECK(cb->status() == CommandBuffer::kCompleted);
+        CHECK_EQ(r.fake->stats().faults, faults);
+        return cb;
+    };
+    // one pass: write A, sample A (barrier), write A over it, sample A again (a second barrier)
+    RenderPass pa;
+    pa.color0 = a.get();
+    auto cb = run([&](CommandBuffer& c) {
+        CHECK(c.draw(flatProgram(), pa, wholeDraw(), Bindings{}, Bindings{}));
+        CHECK(c.draw(texProgram(), pa, wholeDraw(6), Bindings{}, sampleA));
+        CHECK(c.draw(texProgram(), pa, wholeDraw(6), Bindings{}, sampleA));
+    });
+    CHECK_EQ(cb->counts().barriers, 2u);
+    const auto times = cb->passTimes();
+    CHECK(!times.empty());
+    if (!times.empty()) {
+        CHECK_EQ(times.back().inPassBarriers, 2u);
+        CHECK_EQ(times.back().draws, 3u);
+    }
+    // two passes: the first writes B, the second's first draw samples B (the cross-pass barrier) and writes A, and its
+    // second samples A -- the cross-pass barrier has flushed B, not the A the first draw just wrote
+    auto cross = run([&](CommandBuffer& c) {
+        RenderPass pb;
+        pb.color0 = b.get();
+        CHECK(c.draw(flatProgram(), pb, wholeDraw(), Bindings{}, Bindings{}));   // pass 1: writes B
+        CHECK(c.draw(texProgram(), pa, wholeDraw(6), Bindings{}, sampleB));      // pass 2: a barrier (B), writes A
+        CHECK(c.draw(texProgram(), pa, wholeDraw(6), Bindings{}, sampleA));      // ...A is in the CCU: a barrier again
+    });
+    CHECK_EQ(cross->counts().barriers, 2u);
+    if (!cross->passTimes().empty()) {
+        CHECK_EQ(cross->passTimes().back().inPassBarriers, 1u);   // (only the second is this pass's own)
+        CHECK_EQ(cross->passTimes().back().draws, 2u);
+    }
+}
+
+// A blend factor that reads the destination's alpha, on a target with no alpha channel: the destination alpha reads 1.0
+// (Metal's (x, y, z, 1), the rule texSwizzle keeps for the texture side), so DST_ALPHA is ONE and ONE_MINUS_DST_ALPHA
+// ZERO before the word is written, whatever the RB's leftover alpha would be. On a target with alpha they stay as
+// Metal's pipeline wrote them.
+TEST(blending_into_a_target_without_alpha_translates_the_destination_alpha_factors) {
+    using namespace a6xx;
+    Rig r;
+    auto r8 = target(r, 64, 64, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kR8Unorm);
+    auto bgra = target(r, 64, 64, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
+    Program p = flatProgram();
+    p.blend = ColorBlend{true, 0, 0, 4 /*SourceAlpha*/, 8 /*DestinationAlpha*/, 1 /*One*/, 9 /*OneMinusDestinationAlpha*/, 0xf};
+    RenderPass noAlpha;
+    noAlpha.color0 = r8.get();
+    Encoded e(r, p, noAlpha, wholeDraw());
+    CHECK(e.ok);
+    if (!e.ok) std::printf("       %s\n", e.error.c_str());
+    uint32_t word = e.reg(regRbMrt(REG_A6XX_RB_MRT_BLEND_CONTROL, 0));
+    CHECK_EQ(fieldOf(word, A6XX_RB_MRT_BLEND_CONTROL_RGB_SRC_FACTOR__MASK, A6XX_RB_MRT_BLEND_CONTROL_RGB_SRC_FACTOR__SHIFT), uint32_t(FACTOR_SRC_ALPHA));
+    CHECK_EQ(fieldOf(word, A6XX_RB_MRT_BLEND_CONTROL_RGB_DEST_FACTOR__MASK, A6XX_RB_MRT_BLEND_CONTROL_RGB_DEST_FACTOR__SHIFT), uint32_t(FACTOR_ONE));
+    CHECK_EQ(fieldOf(word, A6XX_RB_MRT_BLEND_CONTROL_ALPHA_SRC_FACTOR__MASK, A6XX_RB_MRT_BLEND_CONTROL_ALPHA_SRC_FACTOR__SHIFT), uint32_t(FACTOR_ONE));
+    CHECK_EQ(fieldOf(word, A6XX_RB_MRT_BLEND_CONTROL_ALPHA_DEST_FACTOR__MASK, A6XX_RB_MRT_BLEND_CONTROL_ALPHA_DEST_FACTOR__SHIFT), uint32_t(FACTOR_ZERO));
+    // the twin with an alpha channel: as written, the translation being for the formats without one
+    RenderPass withAlpha;
+    withAlpha.color0 = bgra.get();
+    Encoded a(r, p, withAlpha, wholeDraw());
+    CHECK(a.ok);
+    word = a.reg(regRbMrt(REG_A6XX_RB_MRT_BLEND_CONTROL, 0));
+    CHECK_EQ(fieldOf(word, A6XX_RB_MRT_BLEND_CONTROL_RGB_DEST_FACTOR__MASK, A6XX_RB_MRT_BLEND_CONTROL_RGB_DEST_FACTOR__SHIFT), uint32_t(FACTOR_DST_ALPHA));
+    CHECK_EQ(fieldOf(word, A6XX_RB_MRT_BLEND_CONTROL_ALPHA_DEST_FACTOR__MASK, A6XX_RB_MRT_BLEND_CONTROL_ALPHA_DEST_FACTOR__SHIFT),
+             uint32_t(FACTOR_ONE_MINUS_DST_ALPHA));
+    // the fake judges the factors' enum too: both streams run
+    auto cb = drawOnce(r, p, noAlpha, wholeDraw());
+    CHECK(cb->status() == CommandBuffer::kCompleted);
+    CHECK_EQ(r.fake->stats().faults, 0u);
+    if (r.fake->stats().faults) std::printf("       %s\n", r.fake->stats().lastFault.c_str());
+}
+
+// Two colour attachments, the second one channel (R8Unorm): each its own RB_MRT[i] and SP_FS_MRT_REG[i], MRT 2, and
+// both stored -- the combination the pass summary's fmt= list and CoreAnimation's mask + weight passes stand on.
+TEST(a_second_attachment_of_one_channel_encodes_and_stores_as_its_own_target) {
+    using namespace a6xx;
+    Rig r;
+    auto t0 = target(r, 64, 64, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kBGRA8Unorm);
+    auto t1 = target(r, 64, 64, kTextureUsageRenderTarget | kTextureUsageRead, PixelFormat::kR8Unorm);
+    const Program mrt{kernels::tri_flat_vs_air, kernels::tri_mrt_fs_air, Linkage{}, "tri_mrt"};
+    RenderPass pass;
+    pass.color0 = t0.get();
+    pass.more[0].texture = t1.get();
+    Encoded e(r, mrt, pass, wholeDraw(6));
+    CHECK(e.ok);
+    if (!e.ok) std::printf("       %s\n", e.error.c_str());
+    CHECK_EQ(e.reg(REG_A6XX_RB_FS_OUTPUT_CNTL1), A6XX_RB_FS_OUTPUT_CNTL1_MRT(2));
+    CHECK_EQ(e.reg(regSpFsMrtReg(1)) & A6XX_SP_FS_MRT_REG_COLOR_UINT, 0u);
+    CHECK_EQ(fieldOf(e.reg(regSpFsOutputReg(1)), A6XX_SP_FS_OUTPUT_REG_REGID__MASK, A6XX_SP_FS_OUTPUT_REG_REGID__SHIFT), 0x04u);
+    const uint32_t bufInfo = e.reg(regRbMrt(REG_A6XX_RB_MRT_BUF_INFO, 1));
+    CHECK_EQ(fieldOf(bufInfo, A6XX_RB_MRT_BUF_INFO_COLOR_FORMAT__MASK, A6XX_RB_MRT_BUF_INFO_COLOR_FORMAT__SHIFT), uint32_t(FMT6_8_UNORM));
+    CHECK_EQ(fieldOf(bufInfo, A6XX_RB_MRT_BUF_INFO_COLOR_SWAP__MASK, A6XX_RB_MRT_BUF_INFO_COLOR_SWAP__SHIFT), uint32_t(WZYX));
+    CHECK_EQ(e.reg(regRbMrt(REG_A6XX_RB_MRT_PITCH, 1)) << A6XX_RB_MRT_PITCH__SCALE, uint32_t(t1->bytesPerRow()));
+    CHECK_EQ(uint64_t(e.reg(regRbMrt(REG_A6XX_RB_MRT_BASE, 1))) | uint64_t(e.reg(regRbMrt(REG_A6XX_RB_MRT_BASE, 1) + 1)) << 32, t1->gpuAddress());
+    // both drawn through one command buffer's pass: the summary's fmt list names both formats and both stores
+    auto cb = r.queue->commandBuffer();
+    cb->setProfile(true);
+    cb->setGmem(false);
+    CHECK(cb->draw(mrt, pass, wholeDraw(6), Bindings{}, Bindings{}));
+    CHECK(cb->draw(mrt, pass, wholeDraw(6), Bindings{}, Bindings{}));
+    cb->commit();
+    cb->waitUntilCompleted();
+    if (cb->status() != CommandBuffer::kCompleted) std::printf("       %s | %s\n", cb->error().c_str(), r.fake->stats().lastFault.c_str());
+    CHECK(cb->status() == CommandBuffer::kCompleted);
+    CHECK_EQ(r.fake->stats().lastDraw.mrtCount, 2u);
+    CHECK_EQ(r.fake->stats().lastDraw.mrtFormats[1], uint32_t(FMT6_8_UNORM));
+    CHECK_EQ(r.fake->stats().lastDraw.mrtBases[1], t1->gpuAddress());
+    const auto times = cb->passTimes();
+    CHECK(!times.empty());
+    if (!times.empty()) {
+        CHECK_EQ(times.back().attached, 0x3u);   // (the pass summary's fmt list, by slot)
+        CHECK_EQ(times.back().stores & 0x3u, 0x3u);
+        CHECK(times.back().attachedFmt == "BGRA8Unorm,R8Unorm");
+    }
+    CHECK_EQ(r.fake->stats().faults, 0u);
+}
+
+// v29i (D1): what a 2-second pass summary says about a pass -- the rows its draws' viewports and scissors reach, which
+// surface they draw into, and what they sampled that nothing had written since it was made. One line a window is
+// reportPasses'; these are the fields it reads.
+TEST(a_pass_summary_sees_the_row_bands_its_draws_cover) {
+    Rig r;
+    auto t = target(r);
+    RenderPass pass;
+    pass.color0 = t.get();
+    Draw top = wholeDraw();
+    top.viewport = Viewport{0, 0, 64, 32, 0, 1};   // (the top half of a 64 x 64 target: bands 0 to 7)
+    {
+        auto cb = r.queue->commandBuffer();
+        cb->setProfile(true);
+        CHECK(cb->draw(flatProgram(), pass, top, Bindings{}, Bindings{}));
+        cb->commit();
+        cb->waitUntilCompleted();
+        const auto p = cb->passTimes();
+        CHECK_EQ(p.size(), size_t(1));
+        if (p.size() == 1) {
+            CHECK_EQ(p[0].bands, uint16_t(0x00ff));
+            CHECK_EQ(p[0].bandsNoClear, uint16_t(0x00ff));
+            CHECK_EQ(p[0].targetSurface, 0u);   // (a texture of its own memory, not an IOSurface)
+        }
+    }
+    {
+        auto cb = r.queue->commandBuffer();
+        cb->setProfile(true);
+        CHECK(cb->draw(flatProgram(), pass, wholeDraw(), Bindings{}, Bindings{}));
+        cb->commit();
+        cb->waitUntilCompleted();
+        const auto p = cb->passTimes();
+        CHECK_EQ(p.size(), size_t(1));
+        if (p.size() == 1) CHECK_EQ(p[0].bands, uint16_t(0xffff));
+    }
+}
+
+TEST(a_pass_summary_counts_the_draws_that_sampled_a_texture_nothing_wrote) {
+    Rig r;
+    auto t = target(r);
+    auto tex = target(r, 8, 4);   // (render target and read: a draw writes it below, something samples it here)
+    Sampler smp = nearestClamp();
+    RenderPass pass;
+    pass.color0 = t.get();
+    Bindings fsb;
+    fsb.textures = {tex.get()};
+    fsb.samplers = {&smp};
+    CHECK(!tex->everWritten());   // (fresh memory, nothing has reached it)
+    {
+        auto cb = r.queue->commandBuffer();
+        cb->setProfile(true);
+        CHECK(cb->draw(texProgram(), pass, wholeDraw(6), Bindings{}, fsb));
+        cb->commit();
+        cb->waitUntilCompleted();
+        const auto p = cb->passTimes();
+        CHECK_EQ(p.size(), size_t(1));
+        if (p.size() == 1) {
+            CHECK_EQ(p[0].neverWrittenDraws, 1u);
+            CHECK_EQ(p[0].neverWrittenCount, 1);
+            if (p[0].neverWrittenCount == 1) {
+                CHECK_EQ(p[0].neverWritten[0].width, 8u);
+                CHECK_EQ(p[0].neverWritten[0].height, 4u);
+                CHECK_EQ(p[0].neverWritten[0].surface, 0u);
+            }
+        }
+    }
+    {
+        // (a draw into it is a write: from the next buffer on, sampling it is not counted)
+        RenderPass into;
+        into.color0 = tex.get();
+        auto cb = r.queue->commandBuffer();
+        CHECK(cb->draw(flatProgram(), into, wholeDraw(), Bindings{}, Bindings{}));
+        cb->commit();
+        cb->waitUntilCompleted();
+        CHECK(tex->everWritten());
+        cb = r.queue->commandBuffer();
+        cb->setProfile(true);
+        CHECK(cb->draw(texProgram(), pass, wholeDraw(6), Bindings{}, fsb));
+        cb->commit();
+        cb->waitUntilCompleted();
+        const auto p = cb->passTimes();
+        CHECK_EQ(p.size(), size_t(1));
+        if (p.size() == 1) CHECK_EQ(p[0].neverWrittenDraws, 0u);
+    }
+}
+
+// --- v29i (P1): CoreAnimation's full-target clear quad, written by the 2D engine's fill ---------------------------------
+//
+// path_blit_vert + attachment_clear_frag over the whole target cost 3.2 to 3.6 ms drawn by the 3D pipe and 0.84 ms as the
+// 2D engine's fill (work/v29i/INVESTIGATION-anim-gpu-cost.md). render::clearQuadFillMask decides when the two write the
+// same pixels: the fragment function's name (QuartzCore's own, which returns a constant (0,0,0,0) to both of its targets
+// and takes no argument), the draw's shape and state, the pass's window over every attachment it writes, and the clip
+// square's coverage by the quad's own rectangle -- read out of the two bound buffers -- which is what tells a full-target
+// clear from a rectangle's. These tests hold the fill to the pixels, the draw to its absence, and the fallbacks to the
+// 3D pipe still drawing.
+namespace {
+Program clearQuadProgram() {
+    Program p = handProgram();
+    p.vs.k.name = "path_blit_vert_lph";             // (QuartzCore's two functions, by the names the decision goes by)
+    p.fs.k.name = "attachment_clear_frag_lph";
+    p.name = "path_blit_vert_lph+attachment_clear_frag_lph";
+    p.ssboWrites = 0;                               // (what linkProgram says of the real pair: no stage stores to a buffer)
+    return p;
+}
+
+Draw clearQuadDraw(uint32_t w = 64, uint32_t h = 64) {
+    Draw d;
+    d.primitive = Primitive::kTriangleStrip;        // one quad: four vertices, the strip the blit is drawn as
+    d.vertexCount = 4;
+    d.viewport = Viewport{0, 0, double(w), double(h), 0, 1};
+    return d;
+}
+
+// path_blit_vert's uniforms: buffer(0) a float4x4 that scales the clip square, buffer(1) a CA::OGL::AxisAlignedRect from
+// -0.5 to 0.5 (min.xy then max.xy). SCALE 2 carries the rectangle out to -1..1, the whole target; 1 does not.
+struct QuadBuffers {
+    QuadBuffers(Rig& r, float scale) {
+        std::string why;
+        _m = newBuffer(*r.gpu, 64, &why);
+        _r = newBuffer(*r.gpu, 16, &why);
+        CHECK(_m != nullptr && _r != nullptr);
+        if (_m == nullptr || _r == nullptr) return;
+        auto* mv = static_cast<float*>(_m->contents());
+        memset(mv, 0, 64);
+        mv[0] = scale;   // column 0: x'
+        mv[5] = scale;   // column 1: y'
+        auto* rv = static_cast<float*>(_r->contents());
+        rv[0] = -0.5f; rv[1] = -0.5f; rv[2] = 0.5f; rv[3] = 0.5f;
+        b.buffers = {Binding{_m.get(), 0}, Binding{_r.get(), 0}};
+    }
+    std::shared_ptr<Buffer> _m, _r;   // (the draw names them: they must outlive the commit)
+    Bindings b;
+};
+}  // namespace
+
+TEST(a_full_target_clear_quad_is_the_fills_work_and_no_draw_reaches_the_gpu) {
+    Rig r;
+    auto t = target(r);
+    fillWords(*t, 0xa5a5a5a5u);
+    RenderPass pass;
+    pass.color0 = t.get();
+    QuadBuffers vb(r, 2.0f);
+    const Program p = clearQuadProgram();
+    render::Options sysmem;   // (CoreAnimation's 1125 x 2436 passes are sysmem: the fill is the sysmem Clear's)
+    sysmem.gmem = false;
+    auto cb = drawOnce(r, p, pass, clearQuadDraw(), sysmem, vb.b);
+    CHECK(cb->error().empty());
+    if (!cb->error().empty()) std::printf("       %s; %s\n", cb->error().c_str(), r.fake->stats().lastFault.c_str());
+    CHECK(cb->status() == CommandBuffer::kCompleted);
+    const FakeGpu::Stats s = r.fake->stats();
+    CHECK_EQ(s.faults, 0u);
+    CHECK_EQ(s.draws, 0u);        // (the 3D pipe never ran it: the quad is not in the stream)
+    CHECK_EQ(s.fills, 1u);        // (the 2D engine's solid fill is)
+    CHECK(allWords(*t, 0u));       // (0,0,0,0) into every pixel: what attachment_clear_frag returns, at 2D-fill cost
+}
+
+TEST(a_clear_quad_whose_rectangle_does_not_cover_the_target_is_drawn_after_all) {
+    Rig r;
+    auto t = target(r);
+    fillWords(*t, 0xa5a5a5a5u);
+    RenderPass pass;
+    pass.color0 = t.get();
+    QuadBuffers vb(r, 1.0f);   // (the rectangle through it is -0.5..0.5 of the clip square: a quarter of the target)
+    const Program p = clearQuadProgram();
+    auto cb = drawOnce(r, p, pass, clearQuadDraw(), render::Options{}, vb.b);
+    CHECK(cb->error().empty());
+    CHECK(cb->status() == CommandBuffer::kCompleted);
+    const FakeGpu::Stats s = r.fake->stats();
+    CHECK_EQ(s.faults, 0u);
+    CHECK_EQ(s.draws, 1u);
+    CHECK_EQ(s.fills, 0u);
+    CHECK(allWords(*t, 0xa5a5a5a5u));   // (the fake rasterizes nothing: the draw left memory as it was)
+}
+
+TEST(a_clear_quad_after_an_earlier_draw_of_its_pass_is_drawn_after_all) {
+    Rig r;
+    auto t = target(r);
+    fillWords(*t, 0xa5a5a5a5u);
+    RenderPass pass;
+    pass.color0 = t.get();
+    QuadBuffers vb(r, 2.0f);
+    const Program p = clearQuadProgram();
+    auto cb = r.queue->commandBuffer();
+    CHECK(cb->draw(flatProgram(), pass, wholeDraw(), Bindings{}, Bindings{}));
+    CHECK(cb->draw(p, pass, clearQuadDraw(), vb.b, Bindings{}));   // (joins the open pass: not its first draw)
+    cb->commit();
+    cb->waitUntilCompleted();
+    CHECK(cb->error().empty());
+    const FakeGpu::Stats s = r.fake->stats();
+    CHECK_EQ(s.faults, 0u);
+    CHECK_EQ(s.draws, 2u);   // (nothing under it may be lost: the quad stays a draw, in its place in the pass)
+    CHECK_EQ(s.fills, 0u);
+}
+
+TEST(a_blended_clear_quad_is_drawn_after_all) {
+    Rig r;
+    auto t = target(r);
+    fillWords(*t, 0xa5a5a5a5u);
+    RenderPass pass;
+    pass.color0 = t.get();
+    QuadBuffers vb(r, 2.0f);
+    Program p = clearQuadProgram();
+    p.blend.enabled = true;   // (a blend reads what the pixel held: the fill would not be the same pixels)
+    auto cb = drawOnce(r, p, pass, clearQuadDraw(), render::Options{}, vb.b);
+    CHECK(cb->error().empty());
+    CHECK(cb->status() == CommandBuffer::kCompleted);
+    const FakeGpu::Stats s = r.fake->stats();
+    CHECK_EQ(s.draws, 1u);
+    CHECK_EQ(s.fills, 0u);
+}
+
+TEST(a_clear_quads_fill_takes_the_passes_own_clear_with_it) {
+    // the pass asks for a Clear of its own and the quad then writes (0,0,0,0) over it: one fill, not two (two would share
+    // an attachment's flush word), and the pixels the quad's own colour
+    Rig r;
+    auto t = target(r);
+    fillWords(*t, 0xa5a5a5a5u);
+    RenderPass pass;
+    pass.color0 = t.get();
+    pass.load = LoadAction::kClear;
+    pass.clearColor[0] = 1.0;
+    pass.clearColor[3] = 1.0;
+    QuadBuffers vb(r, 2.0f);
+    const Program p = clearQuadProgram();
+    render::Options sysmem;
+    sysmem.gmem = false;
+    auto cb = drawOnce(r, p, pass, clearQuadDraw(), sysmem, vb.b);
+    CHECK(cb->error().empty());
+    CHECK(cb->status() == CommandBuffer::kCompleted);
+    const FakeGpu::Stats s = r.fake->stats();
+    CHECK_EQ(s.faults, 0u);
+    CHECK_EQ(s.draws, 0u);
+    CHECK_EQ(s.fills, 1u);          // (the pass's Clear was the quad's to write: skipped, and the fill wrote (0,0,0,0))
+    CHECK(allWords(*t, 0u));
 }

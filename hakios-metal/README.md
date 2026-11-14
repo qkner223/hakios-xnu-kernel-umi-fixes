@@ -3,7 +3,7 @@
 This is part of the kernel's tree: `make ios` here, and `userland/build.sh` links what it builds.
 
 The Metal driver of [hakios](https://github.com/oosexgang/hakios-xnu-kernel), in C++: Metal's command model on the phone's
-Adreno GPU (an Adreno 7c+ Gen 3, chip id 0x06030500), through the kernel's own GPU driver (HakiosGPU), without Mesa
+Adreno GPU (an Adreno 650, chip id 0x06050002), through the kernel's own GPU driver (HakiosGPU), without Mesa
 in between.
 
 What there is today, and what each part is checked by:
@@ -299,7 +299,7 @@ in 287 us; the hang on purpose reset in 2.1 s and the fill after it landed.
    v
  Transport     iokit_transport.cpp on the phone  |  fake_gpu.cpp in the tests
    v
- the kernel's HakiosGPU (hakios: drivers/gpu/hakios.gpu.cpp) -> the Adreno 7c+ Gen 3 (chip id 0x06030500)
+ the kernel's HakiosGPU (hakios: drivers/gpu/hakios.gpu.cpp) -> the Adreno 650 (chip id 0x06050002)
 ```
 
 UniXNU's AdrenoMetal goes another way (Metal to Vulkan, then Mesa's Turnip). This driver does not use its code. The

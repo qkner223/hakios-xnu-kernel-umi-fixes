@@ -305,6 +305,16 @@ if [ -d $DARWIN/rootfs/usr/lib ]; then
 			fi
 			$DYN -bundle -framework Foundation -framework IOKit -framework IOSurface -framework Metal -lobjc \
 				-I$HM/include -o obj/HakiosMetal src/HakiosMetalCA.m $METAL_GPU $M2V_OBJS
+			# The bundle links with dynamic lookup, so a symbol nothing defines is not a link error but "dyld: missing
+			# symbol called" in backboardd (a v2 build did that: two static functions inside an @interface block became
+			# undefined externals). Only the weak _native_bridge_metal_* hooks (M2V) may be looked up at run time.
+			HM_NM=$(command -v nm || command -v llvm-nm)
+			HM_LOOKUP=$("$HM_NM" -u -m obj/HakiosMetal | grep "dynamically looked up" | grep -v "(undefined) weak external" || true)
+			if [ -n "$HM_LOOKUP" ]; then
+				echo "build.sh: obj/HakiosMetal leaves symbols to be looked up at run time, which nothing defines:" >&2
+				echo "$HM_LOOKUP" >&2
+				exit 1
+			fi
 		else
 		$DYN -bundle -framework Foundation -framework Metal -lobjc -I$METAL_SRC -o obj/HakiosMetal $METAL_SRC/HakiosMetal.m \
 			$METAL_SRC/hakios_metallib.c $METAL_GPU
@@ -518,6 +528,15 @@ done
 if [ -n "$ADSP" ] && [ -f ../fw-audio/adsp.mdt ]; then
 	mkdir -p root/fw
 	install -m 0644 ../fw-audio/adsp.mdt ../fw-audio/adsp.b0[2-9] ../fw-audio/adsp.b[1-9][0-9] root/fw/
+fi
+# External SDX55 images are supplied only from a local path. Validate the
+# complete Sahara map/checksum set before putting it in the small payload;
+# flash-init exposes this directory as /fw to the XNU modem driver. Never
+# copy this proprietary bundle into the source tree.
+if [ -n "${UMI_MODEM_FW_DIR:-}" ]; then
+	[ -d "$UMI_MODEM_FW_DIR" ] || { echo "build.sh: UMI_MODEM_FW_DIR is not a directory" >&2; exit 1; }
+	python3 ../devices/xiaomi-mi-10/tools/stage-modem-firmware.py \
+		--source "$UMI_MODEM_FW_DIR" --target root/fw/sdx55
 fi
 # Firmware that is not there is otherwise silent at build time and speaks only much later, deep in a
 # device log -- "adreno: THE GPU IS NOT STARTED: the small image has no fw/a660_gmu.bin" cost a phone

@@ -2,7 +2,10 @@
 #include <atomic>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
+#include <string>
+#include <unistd.h>
 #include <vector>
 
 #include "hakios-metal/hakios_metal.h"
@@ -19,7 +22,7 @@ void counted(hakios_metal_cb* cb, void* context) {
 TEST(c_api_copy_and_callbacks) {
     hakios_metal_device* d = hakios_metal_open_fake();
     CHECK(d != nullptr);
-    CHECK_EQ(hakios_metal_gpu_id(d), 0x06030500ull);
+    CHECK_EQ(hakios_metal_gpu_id(d), 0x06050002ull);
     hakios_metal_buffer* a = hakios_metal_buffer_new(d, 4096);
     hakios_metal_buffer* b = hakios_metal_buffer_new(d, 4096);
     CHECK_EQ(hakios_metal_buffer_length(a), 4096ull);
@@ -58,7 +61,7 @@ TEST(c_api_copy_and_callbacks) {
     hakios_metal_queue_free(q);
     hakios_metal_close(d);
     CHECK(hakios_metal_open() == nullptr);      // no kernel GPU on this machine
-    CHECK(hakios_metal_chip_known(0x06030500));  // this phone's
+    CHECK(hakios_metal_chip_known(0x06050002));  // this phone's
     CHECK(hakios_metal_chip_known(0));           // a kernel that does not say
     CHECK(!hakios_metal_chip_known(0x06060000)); // another Adreno: the tables here would hang it
     CHECK(strlen(hakios_metal_error()) > 0);
@@ -404,7 +407,7 @@ TEST(c_api_program_and_draw) {
     CHECK(hakios_metal_error()[0] != '\0');
     // one draw: the whole target (NULL viewport and scissor), triangles (3), vertices 0..3, one instance, no buffers
     hakios_metal_queue* q = hakios_metal_queue_new(d);
-    struct hakios_metal_render_pass pass = {rt, 1, 1, {0, 0, 0, 0}, {0, 0, 0, 0}, nullptr, 0, 0, 1.0, 0, 7, 0, {}, 0, nullptr, 0, 0, 0, 0, {}, {}, 0, 0, nullptr, 0, 0, 0, 0, 0, 0, 0, 0};
+    struct hakios_metal_render_pass pass = {rt, 1, 1, {0, 0, 0, 0}, {0, 0, 0, 0}, nullptr, 0, 0, 1.0, 0, 7, 0, {}, 0, nullptr, 0, 0, 0, 0, {}, {}, 0, 0, nullptr, 0, 0, 0, 0, 0, 0, 0, 0, 0};
     hakios_metal_cb* cb = hakios_metal_cb_new(q);
     CHECK_EQ(hakios_metal_cb_draw(cb, p, &pass, nullptr, nullptr, 3, 0, 3, 1, nullptr, nullptr, 0, nullptr, nullptr, 0), 0);
     hakios_metal_program_free(p);   // the command buffer keeps what the draw needs
@@ -438,7 +441,7 @@ TEST(c_api_program_and_draw) {
             return true;
         };
         memset(bytes, 0xa5, pitch * 64);
-        struct hakios_metal_render_pass clear = {rt, 2, 1, {1.0, 0.0, 0.5, 1.0}, {0, 0, 0, 0}, nullptr, 0, 0, 1.0, 0, 7, 0, {}, 0, nullptr, 0, 0, 0, 0, {}, {}, 0, 0, nullptr, 0, 0, 0, 0, 0, 0, 0, 0};
+        struct hakios_metal_render_pass clear = {rt, 2, 1, {1.0, 0.0, 0.5, 1.0}, {0, 0, 0, 0}, nullptr, 0, 0, 1.0, 0, 7, 0, {}, 0, nullptr, 0, 0, 0, 0, {}, {}, 0, 0, nullptr, 0, 0, 0, 0, 0, 0, 0, 0, 0};
         cb = hakios_metal_cb_new(q);
         CHECK_EQ(hakios_metal_cb_draw(cb, p, &clear, nullptr, nullptr, 3, 0, 3, 1, nullptr, nullptr, 0, nullptr, nullptr, 0), 0);
         hakios_metal_cb_commit(cb, nullptr, nullptr);
@@ -447,7 +450,7 @@ TEST(c_api_program_and_draw) {
         CHECK(everywhere(255, 0, 128, 255));
         hakios_metal_cb_free(cb);
         memset(bytes, 0xa5, pitch * 64);
-        struct hakios_metal_render_pass green = {rt, 2, 1, {0.0, 1.0, 0.0, 0.0}, {0, 0, 0, 0}, nullptr, 0, 0, 1.0, 0, 7, 0, {}, 0, nullptr, 0, 0, 0, 0, {}, {}, 0, 0, nullptr, 0, 0, 0, 0, 0, 0, 0, 0};
+        struct hakios_metal_render_pass green = {rt, 2, 1, {0.0, 1.0, 0.0, 0.0}, {0, 0, 0, 0}, nullptr, 0, 0, 1.0, 0, 7, 0, {}, 0, nullptr, 0, 0, 0, 0, {}, {}, 0, 0, nullptr, 0, 0, 0, 0, 0, 0, 0, 0, 0};
         cb = hakios_metal_cb_new(q);
         CHECK_EQ(hakios_metal_cb_clear(cb, &green), 0);
         hakios_metal_cb_commit(cb, nullptr, nullptr);
@@ -458,7 +461,7 @@ TEST(c_api_program_and_draw) {
         // blending through C: the program's setter and the pass's blend colour reach the registers; the fake runs the draw
         // (it cannot blend, so the bytes stay the clear's: the phone measures the blend)
         hakios_metal_program_set_blend(p, 1, 0, 0, 11, 0, 1, 0, 0xf);   // rgb BlendColor * src + 0, alpha One
-        struct hakios_metal_render_pass blended = {rt, 1, 1, {0, 0, 0, 0}, {0.25f, 0.5f, 0.75f, 1.0f}, nullptr, 0, 0, 1.0, 0, 7, 0, {}, 0, nullptr, 0, 0, 0, 0, {}, {}, 0, 0, nullptr, 0, 0, 0, 0, 0, 0, 0, 0};
+        struct hakios_metal_render_pass blended = {rt, 1, 1, {0, 0, 0, 0}, {0.25f, 0.5f, 0.75f, 1.0f}, nullptr, 0, 0, 1.0, 0, 7, 0, {}, 0, nullptr, 0, 0, 0, 0, {}, {}, 0, 0, nullptr, 0, 0, 0, 0, 0, 0, 0, 0, 0};
         cb = hakios_metal_cb_new(q);
         CHECK_EQ(hakios_metal_cb_draw(cb, p, &blended, nullptr, nullptr, 3, 0, 3, 1, nullptr, nullptr, 0, nullptr, nullptr, 0), 0);
         hakios_metal_cb_commit(cb, nullptr, nullptr);
@@ -483,7 +486,7 @@ TEST(c_api_program_and_draw) {
     hakios_metal_cb_free(cb);
     cb = hakios_metal_cb_new(q);
     CHECK_EQ(hakios_metal_cb_draw(cb, p, &pass, nullptr, nullptr, 7, 0, 2, 1, nullptr, nullptr, 0, nullptr, nullptr, 0), -1);   // no such primitive
-    CHECK(strcmp(hakios_metal_error(), "primitive 7: MTLPrimitiveType is Point (0), Line (1), LineStrip (2), Triangle (3) or TriangleStrip (4)") == 0);
+    CHECK(strcmp(hakios_metal_error(), "primitive 7: MTLPrimitiveType is Point (0), Line (1), LineStrip (2), Triangle (3) or TriangleStrip (4), and Apple's private LineLoop (5) and TriangleFan (6)") == 0);
     hakios_metal_cb_free(cb);
     cb = hakios_metal_cb_new(q);
     CHECK_EQ(hakios_metal_cb_draw(cb, p, &pass, nullptr, nullptr, 3, 0, 3, 0, nullptr, nullptr, 0, nullptr, nullptr, 0), -1);
@@ -548,18 +551,18 @@ TEST(c_api_program_and_draw) {
         hakios_metal_program_free(ap);
     }
     hakios_metal_texture* plain = hakios_metal_texture_new(d, 2, 70, 64, 64, 3);
-    struct hakios_metal_render_pass notRt = {plain, 1, 1, {0, 0, 0, 0}, {0, 0, 0, 0}, nullptr, 0, 0, 1.0, 0, 7, 0, {}, 0, nullptr, 0, 0, 0, 0, {}, {}, 0, 0, nullptr, 0, 0, 0, 0, 0, 0, 0, 0};
+    struct hakios_metal_render_pass notRt = {plain, 1, 1, {0, 0, 0, 0}, {0, 0, 0, 0}, nullptr, 0, 0, 1.0, 0, 7, 0, {}, 0, nullptr, 0, 0, 0, 0, {}, {}, 0, 0, nullptr, 0, 0, 0, 0, 0, 0, 0, 0, 0};
     cb = hakios_metal_cb_new(q);
     CHECK_EQ(hakios_metal_cb_draw(cb, p, &notRt, nullptr, nullptr, 3, 0, 3, 1, nullptr, nullptr, 0, nullptr, nullptr, 0), -1);
     CHECK(strcmp(hakios_metal_error(), "the 64 x 64 RGBA8Unorm texture was made without render-target usage (MTLTextureUsageRenderTarget, 4); a draw needs it") == 0);
     hakios_metal_cb_free(cb);
     hakios_metal_texture_free(plain);
-    struct hakios_metal_render_pass nanClear = {rt, 2, 1, {0, 0, NAN, 1}, {0, 0, 0, 0}, nullptr, 0, 0, 1.0, 0, 7, 0, {}, 0, nullptr, 0, 0, 0, 0, {}, {}, 0, 0, nullptr, 0, 0, 0, 0, 0, 0, 0, 0};
+    struct hakios_metal_render_pass nanClear = {rt, 2, 1, {0, 0, NAN, 1}, {0, 0, 0, 0}, nullptr, 0, 0, 1.0, 0, 7, 0, {}, 0, nullptr, 0, 0, 0, 0, {}, {}, 0, 0, nullptr, 0, 0, 0, 0, 0, 0, 0, 0, 0};
     cb = hakios_metal_cb_new(q);
     CHECK_EQ(hakios_metal_cb_draw(cb, p, &nanClear, nullptr, nullptr, 3, 0, 3, 1, nullptr, nullptr, 0, nullptr, nullptr, 0), -1);
     CHECK(strcmp(hakios_metal_error(), "a clear colour with a non-finite channel (channel 2) into RGBA8Unorm") == 0);
     hakios_metal_cb_free(cb);
-    struct hakios_metal_render_pass none = {nullptr, 1, 1, {0, 0, 0, 0}, {0, 0, 0, 0}, nullptr, 0, 0, 1.0, 0, 7, 0, {}, 0, nullptr, 0, 0, 0, 0, {}, {}, 0, 0, nullptr, 0, 0, 0, 0, 0, 0, 0, 0};
+    struct hakios_metal_render_pass none = {nullptr, 1, 1, {0, 0, 0, 0}, {0, 0, 0, 0}, nullptr, 0, 0, 1.0, 0, 7, 0, {}, 0, nullptr, 0, 0, 0, 0, {}, {}, 0, 0, nullptr, 0, 0, 0, 0, 0, 0, 0, 0, 0};
     cb = hakios_metal_cb_new(q);
     CHECK_EQ(hakios_metal_cb_draw(cb, p, &none, nullptr, nullptr, 3, 0, 3, 1, nullptr, nullptr, 0, nullptr, nullptr, 0), -1);
     CHECK(strcmp(hakios_metal_error(), "a render pass with no attachment at all: nothing to draw into") == 0);
@@ -610,7 +613,7 @@ TEST(c_api_draw_with_a_fragment_texture) {
     hakios_metal_sampler* s = hakios_metal_sampler_new(d, &sd);
     CHECK(rt != nullptr && tex != nullptr && s != nullptr);
     hakios_metal_queue* q = hakios_metal_queue_new(d);
-    struct hakios_metal_render_pass pass = {rt, 1, 1, {0, 0, 0, 0}, {0, 0, 0, 0}, nullptr, 0, 0, 1.0, 0, 7, 0, {}, 0, nullptr, 0, 0, 0, 0, {}, {}, 0, 0, nullptr, 0, 0, 0, 0, 0, 0, 0, 0};
+    struct hakios_metal_render_pass pass = {rt, 1, 1, {0, 0, 0, 0}, {0, 0, 0, 0}, nullptr, 0, 0, 1.0, 0, 7, 0, {}, 0, nullptr, 0, 0, 0, 0, {}, {}, 0, 0, nullptr, 0, 0, 0, 0, 0, 0, 0, 0, 0};
     hakios_metal_cb* cb = hakios_metal_cb_new(q);
     CHECK_EQ(hakios_metal_cb_draw2(cb, p, &pass, nullptr, nullptr, 3, 0, 6, 1, nullptr, nullptr, 0, nullptr, nullptr, 0, &tex, 1, &s, 1), 0);
     hakios_metal_texture_free(tex);   // the command buffer keeps what the draw samples
@@ -663,7 +666,7 @@ TEST(c_api_draw_with_a_vertex_texture) {
     hakios_metal_sampler* s = hakios_metal_sampler_new(d, &sd);
     CHECK(rt != nullptr && tex != nullptr && ints != nullptr && s != nullptr);
     hakios_metal_queue* q = hakios_metal_queue_new(d);
-    struct hakios_metal_render_pass pass = {rt, 1, 1, {0, 0, 0, 0}, {0, 0, 0, 0}, nullptr, 0, 0, 1.0, 0, 7, 0, {}, 0, nullptr, 0, 0, 0, 0, {}, {}, 0, 0, nullptr, 0, 0, 0, 0, 0, 0, 0, 0};
+    struct hakios_metal_render_pass pass = {rt, 1, 1, {0, 0, 0, 0}, {0, 0, 0, 0}, nullptr, 0, 0, 1.0, 0, 7, 0, {}, 0, nullptr, 0, 0, 0, 0, {}, {}, 0, 0, nullptr, 0, 0, 0, 0, 0, 0, 0, 0, 0};
     hakios_metal_cb* cb = hakios_metal_cb_new(q);
     hakios_metal_cb_set_vertex_textures(cb, &ints, 1, &s, 1);
     CHECK_EQ(hakios_metal_cb_draw(cb, p, &pass, nullptr, nullptr, 3, 0, 6, 1, nullptr, nullptr, 0, nullptr, nullptr, 0), -1);
@@ -805,7 +808,7 @@ TEST(c_api_indexed_draw) {
     const uint16_t idx[3] = {0, 1, 2};
     memcpy(hakios_metal_buffer_contents(ib), idx, sizeof idx);
     hakios_metal_queue* q = hakios_metal_queue_new(d);
-    struct hakios_metal_render_pass pass = {rt, 1, 1, {0, 0, 0, 0}, {0, 0, 0, 0}, nullptr, 0, 0, 1.0, 0, 7, 0, {}, 0, nullptr, 0, 0, 0, 0, {}, {}, 0, 0, nullptr, 0, 0, 0, 0, 0, 0, 0, 0};
+    struct hakios_metal_render_pass pass = {rt, 1, 1, {0, 0, 0, 0}, {0, 0, 0, 0}, nullptr, 0, 0, 1.0, 0, 7, 0, {}, 0, nullptr, 0, 0, 0, 0, {}, {}, 0, 0, nullptr, 0, 0, 0, 0, 0, 0, 0, 0, 0};
     hakios_metal_cb* cb = hakios_metal_cb_new(q);
     CHECK_EQ(hakios_metal_cb_draw_indexed(cb, p, &pass, nullptr, nullptr, 3, 3, 0, ib, 0, 1, 3, 0, nullptr, nullptr, 0, nullptr, nullptr, 0, nullptr, 0,
                                           nullptr, 0), 0);
@@ -845,7 +848,7 @@ TEST(c_api_draw_with_a_constexpr_sampler) {
     hakios_metal_texture* rt = hakios_metal_texture_new(d, 2, 70, 64, 64, HAKIOS_METAL_TEXTURE_USAGE_RENDER_TARGET);
     hakios_metal_texture* tex = hakios_metal_texture_new(d, 2, 70, 4, 4, 1);
     hakios_metal_queue* q = hakios_metal_queue_new(d);
-    struct hakios_metal_render_pass pass = {rt, 1, 1, {0, 0, 0, 0}, {0, 0, 0, 0}, nullptr, 0, 0, 1.0, 0, 7, 0, {}, 0, nullptr, 0, 0, 0, 0, {}, {}, 0, 0, nullptr, 0, 0, 0, 0, 0, 0, 0, 0};
+    struct hakios_metal_render_pass pass = {rt, 1, 1, {0, 0, 0, 0}, {0, 0, 0, 0}, nullptr, 0, 0, 1.0, 0, 7, 0, {}, 0, nullptr, 0, 0, 0, 0, {}, {}, 0, 0, nullptr, 0, 0, 0, 0, 0, 0, 0, 0, 0};
     hakios_metal_cb* cb = hakios_metal_cb_new(q);
     CHECK_EQ(hakios_metal_cb_draw2(cb, p, &pass, nullptr, nullptr, 3, 0, 6, 1, nullptr, nullptr, 0, nullptr, nullptr, 0, &tex, 1, nullptr, 0), 0);
     hakios_metal_cb_commit(cb, nullptr, nullptr);
@@ -874,5 +877,130 @@ TEST(c_api_the_device_counts_what_it_has_allocated) {
     CHECK_EQ(hakios_metal_device_allocated_bytes(d) - before, 32768ull);
     hakios_metal_buffer_free(b);
     CHECK_EQ(hakios_metal_device_allocated_bytes(d), before);
+    hakios_metal_close(d);
+}
+
+// hakios_metal_program_specialize_cached, what a draw asks before it queues a specialisation (HakiosMetalCA.m
+// hakiosProgramFor): nothing until a specialisation for those bytes has been compiled into the cache, then that one --
+// the same words -- without compiling
+TEST(c_api_specialise_from_the_cache_only) {
+    std::vector<uint8_t> vsBc = readFile("out/host/kernels/tri_flat_vs.bc"), fsBc = readFile("out/host/kernels/tri_cflat_fs.bc");
+    if (!hakios_metal_has_compiler()) return;
+    CHECK(!vsBc.empty() && !fsBc.empty());
+    hakios_metal_program* base = hakios_metal_program_new_bitcode(vsBc.data(), vsBc.size(), fsBc.data(), fsBc.size(), 70);
+    CHECK(base != nullptr);
+    if (base == nullptr) return;
+    char dir[] = "/tmp/hakios-metal-spec-cache-XXXXXX";
+    CHECK(mkdtemp(dir) != nullptr);
+    setenv("HAKIOS_METAL_CACHE", dir, 1);
+    unsetenv("HAKIOS_METAL_CACHE_SEED");
+    const float c[4] = {0.25f, 0.5f, 0.75f, 1.0f};
+    uint8_t mask[16];
+    hakios_metal_program_constant_reads(base, 1, 0, mask, sizeof mask);
+    CHECK(hakios_metal_program_specialize_cached(base, fsBc.data(), fsBc.size(), nullptr, 0, 0, c, mask, sizeof c) == nullptr);
+    CHECK(strcmp(hakios_metal_error(), "not in the cache") == 0);
+    hakios_metal_program* compiled = hakios_metal_program_specialize(base, fsBc.data(), fsBc.size(), nullptr, 0, 0, c, mask, sizeof c);
+    hakios_metal_program* cached = hakios_metal_program_specialize_cached(base, fsBc.data(), fsBc.size(), nullptr, 0, 0, c, mask, sizeof c);
+    CHECK(compiled != nullptr && cached != nullptr);
+    if (compiled != nullptr && cached != nullptr) {
+        CHECK_EQ(hakios_metal_program_stage_words(cached, 1), hakios_metal_program_stage_words(compiled, 1));
+        CHECK_EQ(hakios_metal_program_resource_count(cached, 1), hakios_metal_program_resource_count(compiled, 1));
+    }
+    hakios_metal_program_free(cached);
+    hakios_metal_program_free(compiled);
+    hakios_metal_program_free(base);
+    unsetenv("HAKIOS_METAL_CACHE");
+    std::string cmd = std::string("rm -rf ") + dir;
+    CHECK(system(cmd.c_str()) == 0);
+}
+
+// OpenGL ES through Metal: the AIR Apple's GL code generator makes of ijkplayer's NV12 program (gl_ijk_vs + gl_ijk_fs:
+// "#main" functions returning literal structs, user(slot8) varyings, the default-uniform block as buffer 0, two
+// textures with two samplers) compiles, links and draws on the fake GPU through a vertex descriptor with the vertices
+// in buffer 2, as AppleMetalGLRenderer binds them; so does the textured quad (gl_quad_vs + gl_quad_fs) under each GL
+// mode, and gl_ijk_vs before mem2reg (its allocas as scratch). Each draw's refusal would print its sentence.
+TEST(c_api_draw_gles_programs) {
+    if (!hakios_metal_has_compiler()) {
+        std::printf("       (no compiler in this build: the GLES programs did not run)\n");
+        return;
+    }
+    hakios_metal_device* d = hakios_metal_open_fake();
+    std::vector<uint8_t> ivs = readFile("out/host/kernels/gl_ijk_vs.bc"), ifs = readFile("out/host/kernels/gl_ijk_fs.bc");
+    std::vector<uint8_t> qvs = readFile("out/host/kernels/gl_quad_vs.bc"), qfs = readFile("out/host/kernels/gl_quad_fs.bc");
+    std::vector<uint8_t> rvs = readFile("out/host/kernels/gl_ijk_vs_raw.bc");
+    CHECK(!ivs.empty() && !ifs.empty() && !qvs.empty() && !qfs.empty() && !rvs.empty());
+    hakios_metal_texture* rt = hakios_metal_texture_new(d, 2, 80, 64, 64, HAKIOS_METAL_TEXTURE_USAGE_RENDER_TARGET | 1);
+    hakios_metal_texture* luma = hakios_metal_texture_new(d, 2, 10, 64, 64, 1);     // R8Unorm: the Y plane
+    hakios_metal_texture* chroma = hakios_metal_texture_new(d, 2, 30, 32, 32, 1);   // RG8Unorm: CbCr
+    struct hakios_metal_sampler_desc sd = {};
+    sd.min_filter = sd.mag_filter = 1;
+    sd.normalized_coordinates = 1;
+    sd.lod_max_clamp = 1000.0f;
+    sd.max_anisotropy = 1;
+    hakios_metal_sampler* s0 = hakios_metal_sampler_new(d, &sd);
+    hakios_metal_sampler* s1 = hakios_metal_sampler_new(d, &sd);
+    hakios_metal_buffer* uniforms = hakios_metal_buffer_new(d, 144);
+    hakios_metal_buffer* vertices = hakios_metal_buffer_new(d, 4 * 24);
+    CHECK(rt != nullptr && luma != nullptr && chroma != nullptr && s0 != nullptr && s1 != nullptr && uniforms != nullptr && vertices != nullptr);
+    {
+        float* u = static_cast<float*>(hakios_metal_buffer_contents(uniforms));
+        memset(u, 0, 144);
+        for (int i = 0; i < 4; i++) u[i * 5] = 1.0f;   // the identity MVP
+        const float bt601[9] = {1.164f, 1.164f, 1.164f, 0.0f, -0.392f, 2.017f, 1.596f, -0.813f, 0.0f};
+        for (int c = 0; c < 3; c++)
+            for (int r = 0; r < 3; r++) u[24 + c * 4 + r] = bt601[c * 3 + r];
+        const float quad[4][6] = {{-1, -1, 0, 1, 0, 1}, {1, -1, 0, 1, 1, 1}, {-1, 1, 0, 1, 0, 0}, {1, 1, 0, 1, 1, 0}};
+        memcpy(hakios_metal_buffer_contents(vertices), quad, sizeof quad);
+    }
+    hakios_metal_queue* q = hakios_metal_queue_new(d);
+    hakios_metal_buffer* vsTable[3] = {uniforms, nullptr, vertices};
+    hakios_metal_buffer* fsTable[1] = {uniforms};
+    hakios_metal_texture* textures[2] = {luma, chroma};
+    hakios_metal_sampler* samplers[2] = {s0, s1};
+    auto drawWith = [&](const std::vector<uint8_t>& vs, const std::vector<uint8_t>& fs, unsigned textureCount, unsigned glMode, const char* what,
+                        unsigned primitive = 4, const struct hakios_metal_viewport* viewport = nullptr) {
+        hakios_metal_program* p = hakios_metal_program_new_bitcode(vs.data(), vs.size(), fs.data(), fs.size(), 80);
+        CHECK(p != nullptr);
+        if (p == nullptr) {
+            std::printf("       %s: %s\n", what, hakios_metal_error());
+            return;
+        }
+        CHECK_EQ(hakios_metal_program_set_vertex_attribute(p, 0, 31, 0, 2), 0);    // Float4 position at 0 of buffer 2
+        CHECK_EQ(hakios_metal_program_set_vertex_attribute(p, 1, 29, 16, 2), 0);   // Float2 texcoord at 16
+        CHECK_EQ(hakios_metal_program_set_vertex_layout(p, 2, 24, 1, 1), 0);
+        struct hakios_metal_render_pass pass = {};
+        pass.color0 = rt;
+        pass.load_action = 2;
+        pass.store_action = 1;
+        pass.clear_depth = 1.0;
+        pass.gl_mode = glMode;
+        hakios_metal_cb* cb = hakios_metal_cb_new(q);
+        const int r = hakios_metal_cb_draw2(cb, p, &pass, viewport, nullptr, primitive, 0, 4, 1, vsTable, nullptr, 3, fsTable, nullptr, 1, textures,
+                                            textureCount, samplers, textureCount);
+        CHECK_EQ(r, 0);
+        if (r != 0) std::printf("       %s, gl_mode %u: %s\n", what, glMode, hakios_metal_error());
+        hakios_metal_cb_commit(cb, nullptr, nullptr);
+        hakios_metal_cb_wait(cb);
+        CHECK(hakios_metal_cb_status(cb) == HAKIOS_METAL_COMPLETED);
+        if (hakios_metal_cb_status(cb) != HAKIOS_METAL_COMPLETED) std::printf("       %s: %s\n", what, hakios_metal_cb_error(cb));
+        hakios_metal_cb_free(cb);
+        hakios_metal_program_free(p);
+    };
+    drawWith(ivs, ifs, 2, HAKIOS_METAL_GL_DEPTH | HAKIOS_METAL_GL_PROVOKING_LAST, "gl_ijk");
+    for (unsigned mode : {0u, 1u, 5u, 13u}) drawWith(qvs, qfs, 1, mode, "gl_quad");
+    drawWith(rvs, ifs, 2, HAKIOS_METAL_GL_DEPTH | HAKIOS_METAL_GL_PROVOKING_LAST, "gl_ijk before mem2reg");
+    // what AppleMetalGLRenderer sent on the phone (v26): a GL quad as a triangle fan (its private MTLPrimitiveType 6) through
+    // the upside-down viewport it draws every GL framebuffer with (height -64 from y 64)
+    const struct hakios_metal_viewport glViewport = {0, 64, 64, -64, 0, 1};
+    drawWith(ivs, ifs, 2, HAKIOS_METAL_GL_DEPTH, "gl_ijk as a fan through GL's viewport", 6, &glViewport);
+    drawWith(qvs, qfs, 1, HAKIOS_METAL_GL_DEPTH, "gl_quad as a line loop", 5, &glViewport);
+    hakios_metal_queue_free(q);
+    hakios_metal_buffer_free(vertices);
+    hakios_metal_buffer_free(uniforms);
+    hakios_metal_sampler_free(s1);
+    hakios_metal_sampler_free(s0);
+    hakios_metal_texture_free(chroma);
+    hakios_metal_texture_free(luma);
+    hakios_metal_texture_free(rt);
     hakios_metal_close(d);
 }

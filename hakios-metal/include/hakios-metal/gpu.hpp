@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace hakios::metal {
@@ -71,9 +72,10 @@ struct SurfaceInfo {
 };
 
 // GET_PARAM's numbers (msm_drm.h's MSM_PARAM_*), the ones the kernel answers. GPU_ID is 0 there: the chip id says
-// what the GPU is, 0x06030500 (dt qcom,chipid, an A635-family part, "Adreno 7c+ Gen 3" to Mesa) with the phone's
-// speed bin in the word above it. FAULTS counts the GPU's resets after hangs (boot-arg gpu_recover=1): a submission
-// that completes after the count rose was given up by a reset, not run (command.cpp uses it that way).
+// what the GPU is, 0x06050002 (dt qcom,chipid, an A650-family part, "Adreno 650" to Mesa) with the phone's
+// speed bin in the word above it. FAULTS counts the GPU's resets after hangs (boot-arg gpu_recover=1). A reset gives up
+// the submission the GPU hung on and runs the ones behind it again; GIVEN_UP (hakios's own number) answers, for the
+// submission put in VALUE, whether a reset gave it up, not run (command.cpp uses the two that way).
 enum : uint32_t {
     kPipe3D = 1,
     kParamGpuId = 1,
@@ -90,10 +92,12 @@ enum : uint32_t {
     kParamRaytracing = 0x11,
     kParamUbwcSwizzle = 0x12,
     kParamMacrotileMode = 0x13,
+    kParamGivenUp = 0x80,
     kInfoGetOffset = 0,
     kInfoGetIova = 1,
     kBoGpuReadOnly = 0x2,
     kBoWriteCombined = 0x00020000,
+    kBoUncleared = 0x00000100,   // hakios: one of the client's own kept buffers may come back uncleared (an attachment's contents start undefined)
     kSubmitBoRead = 0x1,
     kSubmitBoWrite = 0x2,
     kSubmitCmdBuf = 1,
@@ -153,14 +157,17 @@ struct BoUse {
 
 class Gpu {
 public:
-    explicit Gpu(std::unique_ptr<Transport> transport) : t_(std::move(transport)) {}
+    explicit Gpu(std::unique_ptr<Transport> transport);
 
     // what the driver says about the GPU (kParam...): 0 and *value, or an errno
     int param(uint32_t which, uint64_t* value);
-    // the chip id without the speed bin above it: 0x06030500 on the phone, 0 if the driver does not say
+    // the chip id without the speed bin above it: 0x06050002 on the phone, 0 if the driver does not say
     uint32_t chipId();
     // how many times the kernel has reset a hung GPU in this run (0 when it cannot say)
     uint64_t faults();
+    // whether a reset gave submission FENCE up, not run (true when the driver cannot say: a kernel that gave up every
+    // submission it had)
+    bool givenUp(uint32_t fence);
 
     // a buffer of SIZE bytes (rounded up to a page), its GPU address and its mapping; nullptr with *error set
     std::unique_ptr<Bo> newBo(uint64_t size, uint32_t flags, int* error);
@@ -185,6 +192,10 @@ public:
     // 0 and the fence, or an errno
     int submit(uint32_t queue, const Bo& commands, uint32_t offsetBytes, uint32_t words, const std::vector<BoUse>& uses,
                uint32_t* fence);
+    // ...the same stream handed over as consecutive PIECES of it, (first word, words) each from OFFSET_BYTES: one
+    // CP_INDIRECT_BUFFER apiece in the ring, each within pm4::kMaxIbWords (pm4::pieces cuts them)
+    int submit(uint32_t queue, const Bo& commands, uint32_t offsetBytes, const std::vector<std::pair<uint32_t, uint32_t>>& pieces,
+               const std::vector<BoUse>& uses, uint32_t* fence);
 
     // until the fence has passed, or TIMEOUT_NS: 0, ETIMEDOUT, or another errno
     int wait(uint32_t queue, uint32_t fence, int64_t timeoutNs);

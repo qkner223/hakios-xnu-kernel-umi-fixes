@@ -13,11 +13,16 @@
 #include <initializer_list>
 #include <tuple>
 
+#include <unistd.h>
+
 #include "hakios-metal/a6xx.hpp"
 #include "hakios-metal/command.hpp"
+#include "hakios-metal/perf.h"
 #include "hakios-metal/texture.hpp"
 
 namespace hakios::metal {
+
+void appendStream(pm4::Stream& to, const pm4::Stream& from);
 
 namespace render {
 
@@ -97,6 +102,17 @@ void loadIndirect(pm4::Stream& st, const Stage& s, a6xx_state_type type, uint32_
 }
 
 void loadDirect(pm4::Stream& st, const Stage& s, a6xx_state_type type, uint32_t dstOff, uint32_t units, const uint32_t* data, uint32_t dwords) {
+    // The packet's three words and DATA. A stack buffer for the sizes a draw usually loads (a driver params vec4, UBO
+    // descriptors, a stage's immediates): the std::vector here was a malloc and a copy a call.
+    uint32_t stack[3 + 64];
+    if (dwords <= 64) {
+        stack[0] = loadState6_0(dstOff, type, SS6_DIRECT, shaderBlock(s), units);
+        stack[1] = 0;
+        stack[2] = 0;
+        if (dwords != 0) memcpy(stack + 3, data, size_t(dwords) * sizeof(uint32_t));
+        st.packet(loadOpcode(s), stack, 3 + dwords);
+        return;
+    }
     std::vector<uint32_t> w;
     w.reserve(3 + dwords);
     w.push_back(loadState6_0(dstOff, type, SS6_DIRECT, shaderBlock(s), units));
@@ -219,9 +235,8 @@ struct PushedRange {
     uint64_t bufferOffset = 0;
 };
 
-// The stage's pushed ranges against its own [[buffer(n)]] table, by compute's rules (compute.cpp: the range is ir3's,
-// in whole vec4 and padded -- a 16-byte float4 is pushed as 64 bytes -- so the read must stay inside the bound object's
-// pages, not inside the length bound; it must land inside the stage's constlen). False with *why naming the stage.
+// ir3 pads pushed ranges to whole vec4 (a 16-byte float4 can be pushed as 64 bytes). Short bindings are copied into
+// zero-padded direct constants; never read the next resource's bytes, even when they share the same mapped BO.
 bool pushedRanges(const Stage& s, const Bindings& b, std::vector<PushedRange>* out, std::string* why) {
     const Kernel& k = s.k;
     auto name = [&s]() { return std::string(stageName(s)); };   // (built only for a refusal: a string a draw is an allocation a draw)
@@ -248,19 +263,24 @@ bool pushedRanges(const Stage& s, const Bindings& b, std::vector<PushedRange>* o
         if (x.offset % 4 != 0 || x.offset > x.buffer->length()) {
             return refuse(why, name() + ": buffer " + n(r.block) + ": offset " + n(x.offset) + " is not a multiple of 4 inside it");
         }
-        uint64_t bytes = x.buffer->length() - x.offset, mapped = x.buffer->bo().size() - x.offset;
+        uint64_t bytes = x.buffer->length() - x.offset;
         if (r.sizeDwords == 0 || r.sizeDwords % 4 != 0) {
             return refuse(why, name() + ": a constant range of " + n(r.sizeDwords) + " dwords, not a whole number of vec4");
-        }
-        if (uint64_t(r.startDword) * 4 + uint64_t(r.sizeDwords) * 4 > mapped) {
-            return refuse(why, name() + " reads " + n(r.sizeDwords * 4) + " bytes at " + n(r.startDword * 4) + " of constant buffer " + n(r.block) + "; " +
-                                   n(bytes) + " are bound and " + n(mapped) + " mapped behind the offset");
         }
         if (r.offsetVec4 + r.sizeDwords / 4 > k.constlen) {
             return refuse(why, name() + ": constant buffer " + n(r.block) + "'s range at vec4 " + n(r.offsetVec4) + " runs past its constlen of " + n(k.constlen));
         }
         PushedRange p{r.offsetVec4, r.sizeDwords / 4, x.buffer->gpuAddress() + x.offset + 4ull * r.startDword, {}};
-        if (p.from % 16 != 0) {
+        const uint64_t start = 4ull * r.startDword, size = 4ull * r.sizeDwords;
+        if (start + size > bytes) {
+            p.words.resize(r.sizeDwords, 0u);
+            if (start < bytes) {
+                if (x.buffer->contents() == nullptr) {
+                    return refuse(why, name() + ": a short constant buffer is mapped nowhere to copy from");
+                }
+                memcpy(p.words.data(), static_cast<const uint8_t*>(x.buffer->contents()) + x.offset + start, bytes - start);
+            }
+        } else if (p.from % 16 != 0) {
             p.copy = true;
             p.buffer = x.buffer;
             p.bufferOffset = x.offset + 4ull * r.startDword;
@@ -360,47 +380,47 @@ struct VertexFetch {
 // a step other than per vertex, a stride of 0, no buffer bound at the layout's index, and a fetch that reads past the
 // bound length for the draw's last vertex (Metal requires the bytes to be there; the GPU would read whatever follows).
 bool vertexFetch(const Stage& vs, const VertexDescriptor& vd, const Draw& draw, const Bindings& b, VertexFetch* f, std::string* why) {
-    const std::string name = stageName(vs);
+    const char* const name = stageName(vs);   // (built only for a refusal: a string a draw is an allocation a draw)
     for (uint32_t i = 0; i < vs.numInputs; i++) {
         const StageInput& in = vs.inputs[i];
         if (in.sysval || in.regid == kRegidNone) continue;
         if (in.slot < kVertAttribGeneric0 || in.slot - kVertAttribGeneric0 >= kMaxVertexAttributes) {
-            return refuse(why, name + ": an input at slot " + n(in.slot) + " that is not a [[stage_in]] attribute");
+            return refuse(why, std::string(name) + ": an input at slot " + n(in.slot) + " that is not a [[stage_in]] attribute");
         }
         const uint32_t loc = in.slot - kVertAttribGeneric0;
         const VertexAttribute& a = vd.attributes[loc];
         if (a.format == VertexFormat::kInvalid) {
-            return refuse(why, name + " reads [[attribute(" + n(loc) + ")]], which the vertex descriptor does not describe");
+            return refuse(why, std::string(name) + " reads [[attribute(" + n(loc) + ")]], which the vertex descriptor does not describe");
         }
         const VertexFormatInfo* fi = vertexFormatInfo(a.format);
         if (fi == nullptr) {
-            return refuse(why, name + ": [[attribute(" + n(loc) + ")]] is MTLVertexFormat " + n(uint32_t(a.format)) +
+            return refuse(why, std::string(name) + ": [[attribute(" + n(loc) + ")]] is MTLVertexFormat " + n(uint32_t(a.format)) +
                                    ": the 1010102, RG11B10 and RGB9E5 formats are not served");
         }
         if (a.bufferIndex >= kMaxVertexBuffers) {
-            return refuse(why, name + ": [[attribute(" + n(loc) + ")]] is fetched from buffer " + n(a.bufferIndex) + ": the layouts are 0 to 30");
+            return refuse(why, std::string(name) + ": [[attribute(" + n(loc) + ")]] is fetched from buffer " + n(a.bufferIndex) + ": the layouts are 0 to 30");
         }
         if (a.offset > 0xfff) {
-            return refuse(why, name + ": [[attribute(" + n(loc) + ")]] at offset " + n(a.offset) + ": VFD_DECODE_INSTR.OFFSET holds 12 bits");
+            return refuse(why, std::string(name) + ": [[attribute(" + n(loc) + ")]] at offset " + n(a.offset) + ": VFD_DECODE_INSTR.OFFSET holds 12 bits");
         }
         const VertexLayout& l = vd.layouts[a.bufferIndex];
         const bool perInstance = l.step == VertexStep::kPerInstance;
         if (l.step != VertexStep::kPerVertex && !perInstance) {
-            return refuse(why, name + ": buffer " + n(a.bufferIndex) + " steps " + (l.step == VertexStep::kConstant ? "constantly" : "in an unknown way") +
+            return refuse(why, std::string(name) + ": buffer " + n(a.bufferIndex) + " steps " + (l.step == VertexStep::kConstant ? "constantly" : "in an unknown way") +
                                    ": per-vertex and per-instance fetch are served");
         }
         if (perInstance && l.stepRate == 0) {
-            return refuse(why, name + ": buffer " + n(a.bufferIndex) + " steps per instance at a rate of 0: Metal's step rate is 1 or more");
+            return refuse(why, std::string(name) + ": buffer " + n(a.bufferIndex) + " steps per instance at a rate of 0: Metal's step rate is 1 or more");
         }
         if (l.stride == 0 || l.stride > 0xfff) {
-            return refuse(why, name + ": buffer " + n(a.bufferIndex) + "'s stride of " + n(l.stride) + ": 1 to 4095 bytes (VFD_FETCH_STRIDE holds 12 bits)");
+            return refuse(why, std::string(name) + ": buffer " + n(a.bufferIndex) + "'s stride of " + n(l.stride) + ": 1 to 4095 bytes (VFD_FETCH_STRIDE holds 12 bits)");
         }
         if (a.bufferIndex >= b.buffers.size() || b.buffers[a.bufferIndex].buffer == nullptr) {
-            return refuse(why, name + ": no buffer bound at index " + n(a.bufferIndex) + " (the vertex buffer of [[attribute(" + n(loc) + ")]])");
+            return refuse(why, std::string(name) + ": no buffer bound at index " + n(a.bufferIndex) + " (the vertex buffer of [[attribute(" + n(loc) + ")]])");
         }
         const Binding& x = b.buffers[a.bufferIndex];
         if (x.offset > x.buffer->length()) {
-            return refuse(why, name + ": buffer " + n(a.bufferIndex) + ": offset " + n(x.offset) + " lies past its end");
+            return refuse(why, std::string(name) + ": buffer " + n(a.bufferIndex) + ": offset " + n(x.offset) + " lies past its end");
         }
         const uint64_t bytes = x.buffer->length() - x.offset;
         // the last element the draw fetches: for a per-instance attribute baseInstance + (instanceCount - 1) / stepRate
@@ -416,7 +436,7 @@ bool vertexFetch(const Stage& vs, const VertexDescriptor& vd, const Draw& draw, 
                                               : uint64_t(draw.vertexStart) + (draw.vertexCount == 0 ? 0 : draw.vertexCount - 1);
             const uint64_t need = last * l.stride + a.offset + fi->bytes;
             if (need > bytes) {
-                return refuse(why, name + ": [[attribute(" + n(loc) + ")]] of " + (perInstance ? "instance step " : "vertex ") + n(uint32_t(last)) + " ends at byte " +
+                return refuse(why, std::string(name) + ": [[attribute(" + n(loc) + ")]] of " + (perInstance ? "instance step " : "vertex ") + n(uint32_t(last)) + " ends at byte " +
                                        n(need) + " of buffer " + n(a.bufferIndex) + "; " + n(bytes) + " are bound");
             }
             // per instance: INSTANCED and the divisor in VFD_DECODE_STEP_RATE (tu6_emit_vertex_input, tu_pipeline.cc:2345-2354);
@@ -439,6 +459,14 @@ bool vertexFetch(const Stage& vs, const VertexDescriptor& vd, const Draw& draw, 
 }
 
 bool finite(double v) { return std::isfinite(v); }
+// The rectangle a viewport covers, its height made positive. A NEGATIVE height is a viewport turned upside down: Metal
+// takes one (Apple's GPU does), and AppleMetalGLRenderer draws every OpenGL ES framebuffer through one -- originY at GL's
+// top edge, height minus GL's, so that NDC y -1 lands on the first row, where GL's bottom row is kept (its viewport
+// function at 0x2093b8e24 of iOS 16.5's cache). The words keep the sign (YSCALE = -height / 2 comes out positive); the
+// scissors, the guardband's centre and every check here read the rectangle.
+Viewport upright(const Viewport& vp) {
+    return vp.height < 0.0 ? Viewport{vp.x, vp.y + vp.height, vp.width, -vp.height, vp.znear, vp.zfar} : vp;
+}
 
 // float to IEEE half, rounding to nearest even as _mesa_float_to_half does (r2d_clear_value's R2D_FLOAT16 branch)
 uint32_t halfOf(float f) {
@@ -614,6 +642,10 @@ std::pair<uint32_t, uint32_t> windowOf(const RenderPass& pass) {
         w = std::min(w, pass.depth->level(pass.depthLevel).width);
         h = std::min(h, pass.depth->level(pass.depthLevel).height);
     }
+    if (pass.stencil != nullptr) {
+        w = std::min(w, pass.stencil->width());
+        h = std::min(h, pass.stencil->height());
+    }
     return {w, h};
 }
 
@@ -622,7 +654,7 @@ const Texture* firstAttachment(const RenderPass& pass) {
     for (uint32_t i = 0; i < kMaxColorOutputs; i++) {
         if (attachmentOf(pass, i).texture != nullptr) return attachmentOf(pass, i).texture;
     }
-    return pass.depth;
+    return pass.depth != nullptr ? pass.depth : pass.stencil;
 }
 
 Attachment attachmentOf(const RenderPass& p, uint32_t i) {
@@ -631,13 +663,29 @@ Attachment attachmentOf(const RenderPass& p, uint32_t i) {
     return Attachment{c.texture, c.level, c.load, c.store, c.clearColor, c.slice};
 }
 
+// The colour attachments a pass has, by Metal's format name, in slot order (the gaps a fetched-only pass leaves are
+// skipped): what the periodic pass summary line names (CommandBuffer::PassTime::attachedFmt, command.cpp's reportPasses).
+std::string attachedFormats(const RenderPass& pass, uint8_t* attached) {
+    std::string names;
+    uint8_t mask = 0;
+    for (uint32_t i = 0; i < kMaxColorOutputs; i++) {
+        const Attachment a = attachmentOf(pass, i);
+        if (a.texture == nullptr) continue;
+        if (!names.empty()) names += ",";
+        names += a.texture->info().name;
+        mask |= 1u << i;
+    }
+    if (attached != nullptr) *attached = mask;
+    return names;
+}
+
 bool stageTextures(const Stage& fs, const Bindings& b, const RenderPass& pass, StageTextures* out, std::string* why, const GmemPlan* gmem = nullptr) {
     const Kernel& k = fs.k;
-    const std::string name = stageName(fs);
+    const char* const name = stageName(fs);   // (built only for a refusal: a string a draw is an allocation a draw)
     out->numTex = k.numTextureSlots;
     if (out->numTex == 0) {
         if (fs.numSamplerPrefetch != 0) {
-            return refuse(why, name + " prefetches a texture and loads none: ir3's tables disagree");
+            return refuse(why, std::string(name) + " prefetches a texture and loads none: ir3's tables disagree");
         }
         return true;
     }
@@ -648,14 +696,35 @@ bool stageTextures(const Stage& fs, const Bindings& b, const RenderPass& pass, S
             // a framebuffer fetch's slot (compiler.cpp: lowerFbRead): the attachment it reads, at the level the pass draws
             const Attachment a = attachmentOf(pass, kt.fbTarget - 1u);
             if (a.texture == nullptr) {
-                return refuse(why, name + " reads [[color(" + n(kt.fbTarget - 1u) + ")]] through framebuffer fetch and the pass has no colour attachment " +
+                return refuse(why, std::string(name) + " reads [[color(" + n(kt.fbTarget - 1u) + ")]] through framebuffer fetch and the pass has no colour attachment " +
                                        n(kt.fbTarget - 1u));
             }
             if (a.slice != 0) {
-                return refuse(why, name + " reads [[color(" + n(kt.fbTarget - 1u) + ")]] through framebuffer fetch from slice " + n(a.slice) +
+                return refuse(why, std::string(name) + " reads [[color(" + n(kt.fbTarget - 1u) + ")]] through framebuffer fetch from slice " + n(a.slice) +
                                        ": a fetch from a layer, face or plane past the first is not served");
             }
-            TexConst d = a.texture->levelDescriptor(a.level);
+            // levelDescriptor is a one-sample linear view of the level (texture.cpp: its construction). An MSAA fetch
+            // needs the sample count for the MS fetch, or x addresses a sample of x / samples; and the same one-sample
+            // view of a multisample attachment would read its samples interleaved as narrower rows -- wrong memory,
+            // silently -- so a 2D fetch of one is refused rather than served (Metal's per-sample fetch is the MS form).
+            // The other way -- an MS fetch of a one-sample attachment, a pipeline built at 4 samples drawn into a target
+            // of 1 -- is served from the texture's own one-sample sampledDescriptor (txf_ms of it is its sample 0).
+            const bool ms = kt.dim == kTexDimMS;
+            if (!ms && a.texture->samples() > 1) {
+                return refuse(why, std::string(name) + " reads [[color(" + n(kt.fbTarget - 1u) + ")]] through a one-sample framebuffer fetch of a " +
+                                       n(a.texture->samples()) + "-sample attachment: the samples are interleaved in its memory, which a 2D view reads as rows");
+            }
+            // A compressed attachment's tiles and flag buffer are what sampledDescriptor knows and levelDescriptor does
+            // not: never reachable today (a compressed texture is refused as a colour attachment, so it cannot be the
+            // target of the pass this fetch is in), refused so that it cannot become a silent wrong read.
+            if (a.texture->compressed()) {
+                return refuse(why, std::string(name) + " reads [[color(" + n(kt.fbTarget - 1u) + ")]] through framebuffer fetch from a compressed (" +
+                                       a.texture->info().name + ") attachment: its UBWC layout is not a linear level");
+            }
+            // The switch-off path still compiles the legacy 2D fetch. (A layer, face or plane past the first was refused
+            // above; slice 0 of an array, cube or 3D attachment is its level's 2D rows, which the level's one-sample
+            // descriptor reads, and the GMEM branch below only ever names a 2D bin.)
+            TexConst d = ms ? a.texture->sampledDescriptor() : a.texture->levelDescriptor(a.level);
             if (gmem != nullptr) {
                 // In a tile the attachment is its bin in GMEM, which the fetch reads where the draws before it in the
                 // tile left it (tu_emit_input_attachments' patch for GMEM): GMEM's layout, the bin's width a row, the bin
@@ -674,7 +743,7 @@ bool stageTextures(const Stage& fs, const Bindings& b, const RenderPass& pass, S
             continue;
         }
         if (t >= b.textures.size() || b.textures[t] == nullptr) {
-            return refuse(why, name + ": no texture bound at index " + n(t));
+            return refuse(why, std::string(name) + ": no texture bound at index " + n(t));
         }
         const Texture* tex = b.textures[t];
         if (kt.isNull || ((b.nullMask >> t) & 1) != 0) {
@@ -688,17 +757,14 @@ bool stageTextures(const Stage& fs, const Bindings& b, const RenderPass& pass, S
             continue;
         }
         if (!tex->isShaped(kt)) {
-            return refuse(why, name + " samples texture " + n(t) + " as " +
+            return refuse(why, std::string(name) + " samples texture " + n(t) + " as " +
                                    (kt.dim == kTexDim1D ? "1D" : kt.dim == kTexDim2D ? "2D" : kt.dim == kTexDim3D ? "3D" : kt.dim == kTexDimCube ? "a cube" : kt.dim == kTexDimMS ? "2D multisample" : "another kind") +
                                    (kt.isArray ? " array" : "") + " and texture " + n(t) + " is of type " + n(uint32_t(tex->type())) +
                                    ": 1D, 2D, 2D array, 2D multisample, cube and 3D, each as itself, are served in a draw");
         }
         if (kt.element != tex->info().element) {
-            return refuse(why, "texture " + n(t) + " is " + tex->info().name + " (" + elementOf(tex->info().element) + "); " + name + " reads it as texture2d<" +
+            return refuse(why, "texture " + n(t) + " is " + tex->info().name + " (" + elementOf(tex->info().element) + "); " + std::string(name) + " reads it as texture2d<" +
                                    elementOf(kt.element) + ">");
-        }
-        if ((tex->usage() & kTextureUsageRead) == 0) {
-            return refuse(why, "texture " + n(t) + " was made without shader-read usage; " + name + " samples it");
         }
         TexConst d = tex->sampledDescriptor();
         memcpy(out->texWords[t], d.dword, sizeof d.dword);
@@ -719,18 +785,18 @@ bool stageTextures(const Stage& fs, const Bindings& b, const RenderPass& pass, S
         memcpy(out->sampWords[m], b.samplers[m]->words, 16);
     }
     if (fs.numSamplerPrefetch > kMaxSamplerPrefetch) {
-        return refuse(why, name + " has " + n(fs.numSamplerPrefetch) + " texture prefetches: ir3 makes at most " + n(kMaxSamplerPrefetch));
+        return refuse(why, std::string(name) + " has " + n(fs.numSamplerPrefetch) + " texture prefetches: ir3 makes at most " + n(kMaxSamplerPrefetch));
     }
     for (uint32_t i = 0; i < fs.numSamplerPrefetch; i++) {
         const SamplerPrefetch& pf = fs.prefetch[i];
         if (pf.bindless != 0) {
-            return refuse(why, name + "'s prefetch " + n(i) + " is bindless: the textures here are SB6_FS_TEX tables");
+            return refuse(why, std::string(name) + "'s prefetch " + n(i) + " is bindless: the textures here are SB6_FS_TEX tables");
         }
         if (pf.cmd != TEX_PREFETCH_SAM) {
-            return refuse(why, name + "'s prefetch " + n(i) + " is not a plain sample (TEX_PREFETCH_SAM): no other prefetch is written here");
+            return refuse(why, std::string(name) + "'s prefetch " + n(i) + " is not a plain sample (TEX_PREFETCH_SAM): no other prefetch is written here");
         }
         if (pf.texId >= out->numTex || k.textures[pf.texId].kind != kTexSampled || ((k.samplerMask >> pf.sampId) & 1) == 0) {
-            return refuse(why, name + "'s prefetch " + n(i) + " samples texture " + n(pf.texId) + " with sampler " + n(pf.sampId) +
+            return refuse(why, std::string(name) + "'s prefetch " + n(i) + " samples texture " + n(pf.texId) + " with sampler " + n(pf.sampId) +
                                    ": not a texture and a sampler the FS declares");
         }
     }
@@ -881,13 +947,25 @@ bool blendWords(const ColorBlend& b, const FormatInfo& f, BlendWords* out, std::
     if (b.rgbOp > 4 || b.alphaOp > 4) {
         return refuse(why, "blend operation " + n(b.rgbOp > 4 ? b.rgbOp : b.alphaOp) + ": MTLBlendOperation runs Add 0 to Max 4");
     }
+    // A destination format without an alpha channel reads its alpha as 1.0 (Metal's (x, y, z, 1), the same rule the
+    // texture side keeps in SWIZ_W: a6xx.hpp's texSwizzle), so DST_ALPHA there is ONE and ONE_MINUS_DST_ALPHA ZERO.
+    // The RB takes the factor as RB_MRT_BLEND_CONTROL holds it and has no format in it (adreno_rb_blend_factor), and
+    // turnip passes Vulkan's factors through unchanged (tu_util.h:246-271, which has no such translation), so a
+    // DST_ALPHA written into an R8 or RG8 target would blend by the register's leftover alpha instead of by one --
+    // the translation is the driver's. SRC_ALPHA and the other factors are the shader's own values and stay.
+    auto factorOf = [&](uint32_t v) -> adreno_rb_blend_factor {
+        if (!f.hasAlpha && (v == 8 || v == 9 /* MTLBlendFactor DestinationAlpha, OneMinusDestinationAlpha */)) {
+            return v == 8 ? FACTOR_ONE : FACTOR_ZERO;
+        }
+        return kFactor[v];
+    };
     out->mrtControl |= A6XX_RB_MRT_CONTROL_BLEND | A6XX_RB_MRT_CONTROL_BLEND2;
-    out->mrtBlendControl = A6XX_RB_MRT_BLEND_CONTROL_RGB_SRC_FACTOR(kFactor[b.srcRgb]) |
+    out->mrtBlendControl = A6XX_RB_MRT_BLEND_CONTROL_RGB_SRC_FACTOR(factorOf(b.srcRgb)) |
                            A6XX_RB_MRT_BLEND_CONTROL_RGB_BLEND_OPCODE(a3xx_rb_blend_opcode(b.rgbOp)) |
-                           A6XX_RB_MRT_BLEND_CONTROL_RGB_DEST_FACTOR(kFactor[b.dstRgb]) |
-                           A6XX_RB_MRT_BLEND_CONTROL_ALPHA_SRC_FACTOR(kFactor[b.srcAlpha]) |
+                           A6XX_RB_MRT_BLEND_CONTROL_RGB_DEST_FACTOR(factorOf(b.dstRgb)) |
+                           A6XX_RB_MRT_BLEND_CONTROL_ALPHA_SRC_FACTOR(factorOf(b.srcAlpha)) |
                            A6XX_RB_MRT_BLEND_CONTROL_ALPHA_BLEND_OPCODE(a3xx_rb_blend_opcode(b.alphaOp)) |
-                           A6XX_RB_MRT_BLEND_CONTROL_ALPHA_DEST_FACTOR(kFactor[b.dstAlpha]);
+                           A6XX_RB_MRT_BLEND_CONTROL_ALPHA_DEST_FACTOR(factorOf(b.dstAlpha));
     return true;
 }
 
@@ -914,7 +992,7 @@ void fillStream(pm4::Stream& stream, const Texture& target, const ClearWords& c,
     reg(stream, REG_A6XX_SP_2D_DST_FORMAT, sp2dDstFormat(colorFmt(f), f.element == kElemInt, f.element == kElemUint, f.srgb));
     regs(stream, REG_A6XX_GRAS_2D_DST_TL, {regXY(0, 0), regXY(W - 1, H - 1)});
     regs(stream, REG_A6XX_RB_2D_SRC_SOLID_C0, {c.value[0], c.value[1], c.value[2], c.value[3]});
-    regs(stream, REG_A6XX_RB_2D_DST_INFO, {rb2dDstInfo(colorFmt(f), tile, f.swap, f.srgb), uint32_t(at), uint32_t(at >> 32), A6XX_RB_2D_DST_PITCH(uint32_t(L.pitch))});
+    regs(stream, REG_A6XX_RB_2D_DST_INFO, {rb2dDstInfo(colorFmt(f), wholeLayout ? TILE6_LINEAR : tile, f.swap, f.srgb), uint32_t(at), uint32_t(at >> 32), A6XX_RB_2D_DST_PITCH(uint32_t(L.pitch))});
     regs(stream, REG_A6XX_RB_2D_DST_FLAGS, {0, 0, 0});
     command1(stream, CP_BLIT, cpBlit0(BLIT_OP_SCALE));
 }
@@ -948,7 +1026,10 @@ void depthClearStream(pm4::Stream& stream, const Texture& depth, double clearDep
 // SOLID_C0, FMT6_8_UINT through R2D_INT8, TILE6_3 as the plane is laid out), then the colour CCU and the depth CCU
 // cleaned -- the depth CCU holds stencil -- and the depth one invalidated, as depthClearStream does
 void stencilClearStream(pm4::Stream& stream, const Texture& t, uint32_t value, uint64_t table) {
-    const uint32_t W = t.width(), H = t.height();
+    // Clear all samples and padding as a constant linear fill. A single-sample
+    // TILE6_3 reinterpretation would use a different microtile shape for MSAA.
+    const uint32_t W = t.samples() > 1 ? uint32_t(t.stencilPitch()) : t.width();
+    const uint32_t H = t.samples() > 1 ? (t.height() + 15) / 16 * 16 : t.height();
     const uint32_t blit = rb2dBlitCntlClear(FMT6_8_UINT, R2D_INT8);
     const uint64_t at = t.gpuAddress() + t.stencilOffset();
     reg(stream, REG_A6XX_RB_2D_UNKNOWN_8C01, 0);
@@ -957,7 +1038,7 @@ void stencilClearStream(pm4::Stream& stream, const Texture& t, uint32_t value, u
     reg(stream, REG_A6XX_SP_2D_DST_FORMAT, sp2dDstFormat(FMT6_8_UINT, false, true, false));
     regs(stream, REG_A6XX_GRAS_2D_DST_TL, {regXY(0, 0), regXY(W - 1, H - 1)});
     regs(stream, REG_A6XX_RB_2D_SRC_SOLID_C0, {value & 0xffu, 0, 0, 0});
-    regs(stream, REG_A6XX_RB_2D_DST_INFO, {rb2dDstInfo(FMT6_8_UINT, TILE6_3, WZYX, false), uint32_t(at), uint32_t(at >> 32), A6XX_RB_2D_DST_PITCH(uint32_t(t.stencilPitch()))});
+    regs(stream, REG_A6XX_RB_2D_DST_INFO, {rb2dDstInfo(FMT6_8_UINT, t.samples() > 1 ? TILE6_LINEAR : TILE6_3, WZYX, false), uint32_t(at), uint32_t(at >> 32), A6XX_RB_2D_DST_PITCH(uint32_t(t.stencilPitch()))});
     regs(stream, REG_A6XX_RB_2D_DST_FLAGS, {0, 0, 0});
     command1(stream, CP_BLIT, cpBlit0(BLIT_OP_SCALE));
     eventTimestamp(stream, PC_CCU_FLUSH_COLOR_TS, table + kTableStencilClearFlushAt, kStencilClearFlushValue, false);
@@ -968,12 +1049,13 @@ void stencilClearStream(pm4::Stream& stream, const Texture& t, uint32_t value, u
     stream.waitForIdle();
 }
 
-// the depth attachment's Clear and the stencil attachment's, each when asked for (tu_clear_sysmem_attachment, each aspect in turn)
-void zsClears(pm4::Stream& stream, const RenderPass& pass, uint64_t table) {
-    if (pass.depth != nullptr && pass.depthLoad == LoadAction::kClear) {
+// the depth attachment's Clear and the stencil attachment's, each when asked for (tu_clear_sysmem_attachment, each aspect in turn);
+// not those SKIP has (kSkipDepthClear, kSkipStencilClear: a tiled pass clears them in its tiles)
+void zsClears(pm4::Stream& stream, const RenderPass& pass, uint64_t table, uint32_t skip = 0) {
+    if (pass.depth != nullptr && pass.depthLoad == LoadAction::kClear && !(skip & kSkipDepthClear)) {
         depthClearStream(stream, *pass.depth, pass.clearDepth, table, pass.depthLevel, pass.depthSlice);
     }
-    if (pass.stencil != nullptr && pass.stencilLoad == LoadAction::kClear) {
+    if (pass.stencil != nullptr && pass.stencilLoad == LoadAction::kClear && !(skip & kSkipStencilClear)) {
         stencilClearStream(stream, *pass.stencil, pass.clearStencil, table);
     }
 }
@@ -1029,7 +1111,7 @@ bool checkTarget(const RenderPass& pass, std::string* why) {
         if (a.store != StoreAction::kStore && a.store != StoreAction::kDontCare) {
             return refuse(why, at + "store action " + n(uint32_t(a.store)) + ": Store (1) and DontCare (0) are served");
         }
-        if (f.depth) {
+        if (f.depth || f.stencil) {
             return refuse(why, std::string("a ") + f.name + " texture as " + which + ": a depth format is the depth attachment's");
         }
         if (a.level >= t.levels()) {
@@ -1043,7 +1125,7 @@ bool checkTarget(const RenderPass& pass, std::string* why) {
     }
     if (pass.depth != nullptr) {
         const Texture& d = *pass.depth;
-        if (!d.info().depth) {
+        if (!d.info().depth || d.format() == PixelFormat::kX32Stencil8) {
             return refuse(why, std::string("a ") + d.info().name + " texture as the depth attachment: Depth32Float (252) is served");
         }
         if (d.samples() != firstAttachment(pass)->samples()) {
@@ -1087,8 +1169,12 @@ bool checkTarget(const RenderPass& pass, std::string* why) {
         }
     }
     if (pass.stencil != nullptr) {
-        if (pass.stencil != pass.depth || !pass.stencil->info().stencil) {
-            return refuse(why, "a stencil attachment that is not the depth attachment's own Depth32Float_Stencil8 texture: the S8 plane of that one texture is what is served");
+        const Texture& s = *pass.stencil;
+        if (!s.info().stencil) {
+            return refuse(why, "a stencil attachment must be Stencil8 or Depth32Float_Stencil8");
+        }
+        if ((s.usage() & kTextureUsageRenderTarget) == 0 || s.samples() != firstAttachment(pass)->samples()) {
+            return refuse(why, "a stencil attachment needs render-target usage and the pass's sample count");
         }
         if (pass.stencilLoad != LoadAction::kLoad && pass.stencilLoad != LoadAction::kDontCare && pass.stencilLoad != LoadAction::kClear) {
             return refuse(why, "stencil load action " + n(uint32_t(pass.stencilLoad)) + ": MTLLoadAction is DontCare (0), Load (1) or Clear (2)");
@@ -1248,18 +1334,29 @@ namespace {
 // the pass's table, which the batch start pointed the border colours at and the tail writes, is the pass's)
 bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& pass, const Draw& draw, const Bindings& vsBindings,
                 const Bindings& fsBindings, uint64_t vsProgram, uint64_t fsProgram, uint64_t table, uint8_t* tableCpu, std::string* why,
-                const Options& o, bool whole, const GmemPlan* gmem = nullptr, bool afterFetch = false) {
+                Options o, bool whole, const GmemPlan* gmem = nullptr, bool afterFetch = false,
+                PipelineState* pipeline = nullptr, DrawState* state = nullptr, bool fbBarrierOwed = true) {
     const Stage& vs = program.vs;
     // A [[color(n)]] the pass has no attachment n for is written nowhere: Metal leaves that pipeline slot's format Invalid
     // and discards the output (CoreAnimation's fixed_frag_lph_cpf writes three into passes of one). The stage is drawn
     // as if it did not write it -- no register for the slot, RB_MRT_CONTROL 0 -- which is the slot nothing writes.
-    Stage fsDrawn = program.fs;
     // (a dual-source stage's second colour is the blend's second source, not attachment 1's: it is kept)
+    // The copy is made only for a draw that drops a slot: the usual draw keeps every colour it writes and draws the
+    // program's stage as it is (a Stage is 1.5 KB, and this is a draw).
+    Stage fsDrawn;
+    bool dropsColor = false;
     for (uint32_t i = 0; i < kMaxColorOutputs; i++) {
         if (i == 1 && program.fs.dualSrcBlend) continue;
-        if (fsDrawn.colorRegid[i] != kRegidNone && attachmentOf(pass, i).texture == nullptr) fsDrawn.colorRegid[i] = kRegidNone;
+        dropsColor = dropsColor || (program.fs.colorRegid[i] != kRegidNone && attachmentOf(pass, i).texture == nullptr);
     }
-    const Stage& fs = fsDrawn;
+    if (dropsColor) {
+        fsDrawn = program.fs;
+        for (uint32_t i = 0; i < kMaxColorOutputs; i++) {
+            if (i == 1 && program.fs.dualSrcBlend) continue;
+            if (fsDrawn.colorRegid[i] != kRegidNone && attachmentOf(pass, i).texture == nullptr) fsDrawn.colorRegid[i] = kRegidNone;
+        }
+    }
+    const Stage& fs = dropsColor ? fsDrawn : program.fs;
     // --- the two stages ---
     if (vs.kind != kStageVertex) {
         return refuse(why, std::string(stageName(vs)) + " is not a vertex stage");
@@ -1315,14 +1412,15 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
     if (fs.sampleMaskRegid != kRegidNone || fs.writesSmask) {
         return refuse(why, std::string(stageName(fs)) + " writes a sample mask: no multisampling is served");
     }
-    if (fs.sampleIdRegid != kRegidNone || fs.sampleMaskInRegid != kRegidNone) {
+    const bool sampleFetch = fs.fbRead && fs.perSamp && program.samples > 1;
+    if ((fs.sampleIdRegid != kRegidNone && !sampleFetch) || fs.sampleMaskInRegid != kRegidNone) {
         return refuse(why, std::string(stageName(fs)) + " reads the sample id or the sample mask: no multisampling is served");
     }
-    if (validReg(fs.ijRegid[IJ_PERSP_SAMPLE]) || validReg(fs.ijRegid[IJ_PERSP_CENTROID]) || validReg(fs.ijRegid[IJ_LINEAR_SAMPLE]) ||
-        validReg(fs.ijRegid[IJ_LINEAR_CENTROID])) {
+    if (!sampleFetch && (validReg(fs.ijRegid[IJ_PERSP_SAMPLE]) || validReg(fs.ijRegid[IJ_PERSP_CENTROID]) || validReg(fs.ijRegid[IJ_LINEAR_SAMPLE]) ||
+        validReg(fs.ijRegid[IJ_LINEAR_CENTROID]))) {
         return refuse(why, std::string(stageName(fs)) + " reads centroid or per-sample barycentrics: no multisampling is served");
     }
-    if (fs.perSamp) {
+    if (fs.perSamp && !sampleFetch) {
         return refuse(why, std::string(stageName(fs)) + " runs per sample: no multisampling is served");
     }
     // (a dual-source stage, [[color(0), index(1)]]: ir3 gives its second colour FRAG_RESULT_DATA1, which is not an
@@ -1449,8 +1547,13 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
     // a point is as large as the VS's [[point_size]] (linked after the position, PC_VS_OUT_CNTL.PSIZE), else the
     // GRAS_SU_POINT_SIZE of 1 the rasterizer state writes; Metal leaves a point with no size undefined
     case Primitive::kPoint: prim = DI_PT_POINTLIST; break;
+    // the two private MTLPrimitiveTypes AppleMetalGLRenderer draws GL_LINE_LOOP and GL_TRIANGLE_FAN with (its GL mode to
+    // Metal table, 0x2093c2938 of iOS 16.5's cache: {0, 1, 5, 2, 3, 4, 6}): native on this GPU, as fd6_screen maps them
+    case Primitive::kLineLoop: prim = DI_PT_LINELOOP; break;
+    case Primitive::kTriangleFan: prim = DI_PT_TRIFAN; break;
     default:
-        return refuse(why, "primitive " + n(uint32_t(draw.primitive)) + ": MTLPrimitiveType is Point (0), Line (1), LineStrip (2), Triangle (3) or TriangleStrip (4)");
+        return refuse(why, "primitive " + n(uint32_t(draw.primitive)) + ": MTLPrimitiveType is Point (0), Line (1), LineStrip (2), Triangle (3) or "
+                                                                       "TriangleStrip (4), and Apple's private LineLoop (5) and TriangleFan (6)");
     }
     const bool indirect = draw.indirect != nullptr;
     if (indirect) {
@@ -1503,13 +1606,18 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
     if (draw.cullMode > 2 || draw.winding > 1) {
         return refuse(why, "cull mode " + n(draw.cullMode) + ", winding " + n(draw.winding) + ": MTLCullMode is 0 to 2, MTLWinding 0 or 1");
     }
+    if ((draw.glMode & ~13u) != 0) {
+        return refuse(why, "GL mode " + n(draw.glMode) + ": GL depth 1, no viewport transform 4 and the last vertex provoking 8 are the bits there are");
+    }
     const auto [W, H] = windowOf(pass);
-    const Viewport& vp = draw.viewport;
-    if (!finite(vp.x) || !finite(vp.y) || !finite(vp.width) || !finite(vp.height) || !finite(vp.znear) || !finite(vp.zfar)) {
+    if (!finite(draw.viewport.x) || !finite(draw.viewport.y) || !finite(draw.viewport.width) || !finite(draw.viewport.height) ||
+        !finite(draw.viewport.znear) || !finite(draw.viewport.zfar)) {
         return refuse(why, "a viewport with a non-finite value");
     }
+    const Viewport vp = upright(draw.viewport);   // (a negative height is an upside-down viewport: upright())
     if (!(vp.width > 0.0) || !(vp.height > 0.0)) {
-        return refuse(why, "a viewport of " + n(uint64_t(std::max(vp.width, 0.0))) + " x " + n(uint64_t(std::max(vp.height, 0.0))) + " pixels: both sides must be positive");
+        return refuse(why, "a viewport of " + n(uint64_t(std::max(vp.width, 0.0))) + " x " + n(uint64_t(std::max(vp.height, 0.0))) +
+                               " pixels: the width must be positive and the height not 0");
     }
     // A viewport may reach past the target, as Metal's may (sokol's sgl sample draws through a 406 x 406 one into a 375 x
     // 812 drawable): what falls outside is clipped by the viewport scissor, which step 16 clamps to the window. One that
@@ -1540,28 +1648,75 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
     if (whole) {
         tableStart(tableCpu);
     }
-    memset(tableCpu + kTableFbReadFlushAt, 0, 4);   // (the draw's own table: zero before the flush below writes it)
+    auto changed = [](std::vector<uint8_t>& previous, const void* bytes, size_t size) {
+        const auto* at = static_cast<const uint8_t*>(bytes);
+        if (previous.size() == size && std::memcmp(previous.data(), at, size) == 0) return false;
+        previous.assign(at, at + size);
+        return true;
+    };
+    if (state != nullptr) {
+        // StageTextures' prefix is counts + descriptor words, with no pointers or padding.
+        const size_t bytes = 8 + sizeof vsTex.texWords + sizeof vsTex.sampWords;
+        const bool vsChanged = changed(state->vsTextures, &vsTex, bytes);
+        const bool fsChanged = changed(state->fsTextures, &fsTex, bytes);
+        o.vsTextures = o.vsTextures && (vsChanged || o.programConfig);
+        o.fsTextures = o.fsTextures && (fsChanged || o.programConfig);
+        // The bytes compared for the vertex fetch and the viewport: on the stack, where they were two std::vectors (a
+        // malloc each, a draw). The buffer is a struct of the fetch's fields, sizes included, and the draw's offsets.
+        uint8_t vertex[sizeof(VertexFetch) + 64];
+        size_t vn = 0;
+        auto add = [&](const void* at, size_t n) {
+            memcpy(vertex + vn, at, n);
+            vn += n;
+        };
+        add(&fetch.count, sizeof fetch.count);
+        add(fetch.decode, sizeof fetch.decode); add(fetch.stepRate, sizeof fetch.stepRate);
+        add(fetch.dest, sizeof fetch.dest); add(fetch.used, sizeof fetch.used);
+        add(fetch.base, sizeof fetch.base); add(fetch.size, sizeof fetch.size); add(fetch.stride, sizeof fetch.stride);
+        add(&vs.vertexIdRegid, sizeof vs.vertexIdRegid); add(&vs.instanceIdRegid, sizeof vs.instanceIdRegid);
+        const uint32_t offsets[] = {draw.indexBuffer ? uint32_t(draw.baseVertex) : draw.vertexStart, draw.baseInstance, draw.indexBuffer != nullptr && draw.indexType == 0 ? 0xffffu : 0xffffffffu};
+        static_assert(sizeof fetch.count + sizeof fetch.decode + sizeof fetch.stepRate + sizeof fetch.dest + sizeof fetch.used + sizeof fetch.base +
+                              sizeof fetch.size + sizeof fetch.stride + sizeof vs.vertexIdRegid + sizeof vs.instanceIdRegid + sizeof offsets <=
+                          sizeof(VertexFetch) + 64,
+                      "the vertex fetch's shadow bytes fit the stack buffer");
+        add(offsets, sizeof offsets);
+        // Indirect draws change VFD offsets on the GPU; invalidate the CPU's shadow afterwards.
+        const bool vertexChanged = changed(state->vertex, vertex, vn);
+        o.vfd = o.vfd && (vertexChanged || draw.indirect != nullptr);
+        if (draw.indirect != nullptr) state->vertex.clear();
+        uint8_t viewport[sizeof draw.viewport + sizeof draw.scissor];
+        memcpy(viewport, &draw.viewport, sizeof draw.viewport);
+        memcpy(viewport + sizeof draw.viewport, &draw.scissor, sizeof draw.scissor);
+        o.viewportScissor = o.viewportScissor && changed(state->viewport, viewport, sizeof viewport);
+    }
+    memset(tableCpu + kTableFbReadFlushAt, 0, 4); // each fetch barrier has its own word
     memcpy(tableCpu + kGfxIboAt, ibos.words, size_t(ibos.count) * 64);
-    memset(tableCpu + kFsTexConstAt, 0, kMaxTextureSlots * 64);
-    memset(tableCpu + kFsTexSampAt, 0, kMaxTextureSlots * 16);
-    memcpy(tableCpu + kFsTexConstAt, fsTex.texWords, sizeof fsTex.texWords);
-    memcpy(tableCpu + kFsTexSampAt, fsTex.sampWords, sizeof fsTex.sampWords);
-    memcpy(tableCpu + kVsTexConstAt, vsTex.texWords, sizeof vsTex.texWords);
-    memcpy(tableCpu + kVsTexSampAt, vsTex.sampWords, sizeof vsTex.sampWords);
+    // Only the slots the CP_LOAD_STATE6 reads are copied (its NUM_UNIT is the stage's numTex, numSamp; the descriptors
+    // past them are never named): the whole 1024-byte texture and 256-byte sampler table of each stage were copied into
+    // write-combined memory every draw, 2560 bytes of which a few hundred were read.
+    if (o.fsTextures) {
+        memcpy(tableCpu + kFsTexConstAt, fsTex.texWords, size_t(fsTex.numTex) * sizeof fsTex.texWords[0]);
+        memcpy(tableCpu + kFsTexSampAt, fsTex.sampWords, size_t(fsTex.numSamp) * sizeof fsTex.sampWords[0]);
+    }
+    if (o.vsTextures) {
+        memcpy(tableCpu + kVsTexConstAt, vsTex.texWords, size_t(vsTex.numTex) * sizeof vsTex.texWords[0]);
+        memcpy(tableCpu + kVsTexSampAt, vsTex.sampWords, size_t(vsTex.numSamp) * sizeof vsTex.sampWords[0]);
+    }
     MrtWords mrts[kMaxColorOutputs] = {};
     uint32_t srgbMask = 0;
     for (uint32_t i = 0; i < numRt; i++) {
         // (an unwritten slot with no attachment of its own names another attachment's memory: valid, and never written.
-        // In a pass of depth alone it names the depth texture's, as RGBA8 -- 4 bytes a pixel as Depth32Float's plane is,
-        // so its rows are the depth's rows -- which RB_MRT_CONTROL 0 never lets it write; memory the pass owns rather
-        // than address 0, which nothing maps)
+        // With only depth/stencil, use a colour format of the same byte width.
+        // RB_MRT_CONTROL 0 prevents writes; the base still names mapped memory.)
         const Attachment a = attachmentOf(pass, i);
-        const Texture* named = a.texture != nullptr ? a.texture : firstAttachment(pass) != pass.depth ? firstAttachment(pass) : nullptr;
+        const Texture* first = firstAttachment(pass);
+        const Texture* named = a.texture != nullptr ? a.texture : (!first->info().depth && !first->info().stencil) ? first : nullptr;
         if (named == nullptr) {
-            const FormatInfo& rgba = *formatInfo(PixelFormat::kRGBA8Unorm);
-            const Texture& d = *pass.depth;
+            const Texture& d = *first;
+            const FormatInfo& rgba = *formatInfo(d.info().bytesPerPixel == 1 ? PixelFormat::kR8Uint :
+                                                d.info().bytesPerPixel == 2 ? PixelFormat::kR16Unorm : PixelFormat::kRGBA8Unorm);
             mrts[i] = MrtWords{rbMrtBufInfo(rgba.fmt6, TILE6_LINEAR, rgba.swap), rbMrtPitch(uint32_t(d.bytesPerRow())), rbMrtArrayPitch(uint32_t(d.buffer()->length())),
-                               uint32_t(d.gpuAddress()), uint32_t(d.gpuAddress() >> 32), 0, spFsMrtReg(rgba.fmt6, false, false), false};
+                               uint32_t(d.gpuAddress()), uint32_t(d.gpuAddress() >> 32), 0, spFsMrtReg(rgba.fmt6, false, rgba.element == kElemUint), false};
             continue;
         }
         mrts[i] = a.texture != nullptr ? mrtWords(*named, a.level, a.slice)
@@ -1597,8 +1752,11 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
     // ordering alone showed a widget's text cut by a band and the App Library's blur in blocks.
     // (in GMEM only: in sysmem the ordering bought nothing measurable over the barrier -- SpringBoard's heaviest passes
     // took some 50 ms either way -- and the barrier is what SpringBoard was looked at with)
+    // In sysmem FB_BARRIER_OWED (v29i) says whether anything has been written to the fetched targets since the last
+    // flush: the flush is the whole colour CCU's, so one covers every fetch after it until a draw writes a target
+    // again, and a fetch with nothing written since reads memory that the last barrier already put there.
     const bool ordered = fs.fbRead && o.fbReadOrdered && gmem != nullptr;
-    const bool barrier = fs.fbRead && o.fbReadBarrier && (!ordered || !afterFetch);
+    const bool barrier = fs.fbRead && o.fbReadBarrier && (gmem != nullptr ? (!ordered || !afterFetch) : fbBarrierOwed);
     if (barrier && gmem != nullptr) {
         stream.waitForIdle();
         event(stream, CACHE_INVALIDATE);
@@ -1626,20 +1784,22 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
         const Texture& d = *pass.depth;
         // (a depth array's layer: that many tiled planes on, sliceBytes apart)
         const uint64_t depthAt = d.levelAddress(pass.depthLevel) + uint64_t(pass.depthSlice) * d.sliceBytes();
+        const auto format = d.format() == PixelFormat::kDepth16Unorm ? DEPTH6_16 : DEPTH6_32;
         regs(stream, REG_A6XX_RB_DEPTH_BUFFER_INFO,
-             {A6XX_RB_DEPTH_BUFFER_INFO_DEPTH_FORMAT(DEPTH6_32), A6XX_RB_DEPTH_BUFFER_PITCH(uint32_t(d.level(pass.depthLevel).pitch)),
-              A6XX_RB_DEPTH_BUFFER_ARRAY_PITCH(uint32_t(d.depthPlaneBytes())), uint32_t(depthAt), uint32_t(depthAt >> 32), 0});
-        reg(stream, REG_A6XX_GRAS_SU_DEPTH_BUFFER_INFO, A6XX_GRAS_SU_DEPTH_BUFFER_INFO_DEPTH_FORMAT(DEPTH6_32));
+             {A6XX_RB_DEPTH_BUFFER_INFO_DEPTH_FORMAT(format), A6XX_RB_DEPTH_BUFFER_PITCH(uint32_t(d.level(pass.depthLevel).pitch)),
+              A6XX_RB_DEPTH_BUFFER_ARRAY_PITCH(uint32_t(d.depthPlaneBytes())), uint32_t(depthAt), uint32_t(depthAt >> 32),
+              gmem != nullptr ? gmem->depthBase : 0u});   // (BASE_GMEM: its bin in a tiled pass)
+        reg(stream, REG_A6XX_GRAS_SU_DEPTH_BUFFER_INFO, A6XX_GRAS_SU_DEPTH_BUFFER_INFO_DEPTH_FORMAT(format));
         regs(stream, REG_A6XX_RB_DEPTH_FLAG_BUFFER_BASE, {0, 0, 0});
-        if (pass.stencil != nullptr) {
-            // the S8 plane as a separate stencil buffer (tu6_emit_zs's D32_SFLOAT_S8_UINT branch): SEPARATE_STENCIL, its
-            // pitch and layer, its base, BASE_GMEM 0; A6XX's RB_STENCIL_INFO has no tile field -- stencil is TILE6_3, as laid out
-            const uint64_t sb = d.gpuAddress() + d.stencilOffset();
-            regs(stream, REG_A6XX_RB_STENCIL_INFO, {A6XX_RB_STENCIL_INFO_SEPARATE_STENCIL, uint32_t(d.stencilPitch() >> 6), uint32_t(d.stencilPlaneBytes() >> 6),
-                                                    uint32_t(sb), uint32_t(sb >> 32), 0});
-        } else {
-            reg(stream, REG_A6XX_RB_STENCIL_INFO, 0);
-        }
+    }
+    if (pass.stencil != nullptr) {
+        const Texture& d = *pass.stencil;
+        // tu6_emit_zs: D32_SFLOAT_S8_UINT's separate plane, or an S8_UINT image.
+        const uint64_t sb = d.gpuAddress() + d.stencilOffset();
+        regs(stream, REG_A6XX_RB_STENCIL_INFO, {A6XX_RB_STENCIL_INFO_SEPARATE_STENCIL, uint32_t(d.stencilPitch() >> 6), uint32_t(d.stencilPlaneBytes() >> 6),
+                                             uint32_t(sb), uint32_t(sb >> 32), gmem != nullptr ? gmem->stencilBase : 0u});
+    } else if (o.zsNone || pass.depth != nullptr) {
+        reg(stream, REG_A6XX_RB_STENCIL_INFO, 0);
     }
     // 5. the colour target (tu6_emit_mrt, tu_cmd_buffer.cc:482-576; r3d_dst, tu_clear_blit.cc:1380-1408; fd6 emit_mrt,
     // fd6_gmem.cc:60-147): RB_MRT[0]'s six registers as one pkt4 (BUF_INFO, PITCH, ARRAY_PITCH, BASE lo/hi, BASE_GMEM;
@@ -1679,8 +1839,10 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
         reg(stream, REG_A6XX_RB_BLIT_GMEM_MSAA_CNTL, 0);
     }
     // 7. RB_RENDER_CNTL: CCUSINGLECACHELINESIZE 2 in both pipelines (tu_cmd_buffer.cc:633-693; fd6_gmem.cc:531-552), 0 in
-    // r3d_dst (tu_clear_blit.cc:1408) -- renderCntlZero for the bisect. A plain type-4: has_cp_reg_write is false here.
-    if (o.renderCntl) {
+    // r3d_dst (tu_clear_blit.cc:1408) -- renderCntlZero for the bisect. A plain type-4 in sysmem. Not in a tile's draws:
+    // they are replayed by the binning pass too, where RB_RENDER_CNTL must keep BINNING, and encodeGmem writes it for
+    // both through the command processor's tracker (turnip guards its write in the draws with CP_COND_REG_EXEC instead)
+    if (o.renderCntl && gmem == nullptr) {
         uint32_t flagMrts = 0;
         for (uint32_t i = 0; i < numRt; i++) flagMrts |= mrts[i].flagPitch != 0 ? 1u << i : 0u;
         reg(stream, REG_A6XX_RB_RENDER_CNTL, o.renderCntlZero ? 0u : rbRenderCntlSysmem() | A6XX_RB_RENDER_CNTL_FLAG_MRTS(flagMrts));
@@ -1731,20 +1893,31 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
     // tu_shader.cc:1397-1421) into the stage's own block
     auto programOf = [&](const Stage& s, const Bindings& b, const std::vector<PushedRange>& ranges, const std::vector<uint32_t>& ubos, uint64_t address,
                          uint32_t ctrlReg0, uint32_t regCtrl0, uint32_t regInstrlen, uint32_t regObjFirstExec, uint32_t regHwStackOffset) {
-        reg(stream, regCtrl0, ctrlReg0);
-        reg(stream, regInstrlen, s.k.instrlen);
-        // (the CS's field helpers: the VS's and the FS's registers lay their fields out the same, and tu6_emit_xs writes
-        // every stage's through the VS's)
-        const PrivateMemory pm = s.k.pvtmemSize != 0 ? b.privateMemory : PrivateMemory{};
-        regs(stream, regObjFirstExec,
-             {0, uint32_t(address), uint32_t(address >> 32), A6XX_SP_CS_PVT_MEM_PARAM_MEMSIZEPERITEM(pm.perFiber), uint32_t(pm.address),
-              uint32_t(pm.address >> 32), A6XX_SP_CS_PVT_MEM_SIZE_TOTALPVTMEMSIZE(pm.perSp) | (pm.perWave ? A6XX_SP_CS_PVT_MEM_SIZE_PERWAVEMEMLAYOUT : 0u)});
-        reg(stream, regHwStackOffset, A6XX_SP_CS_PVT_MEM_HW_STACK_OFFSET_OFFSET(pm.perSp));
-        loadIndirect(stream, s, ST6_SHADER, 0, std::min(s.k.instrlen, kInstrCacheSize), address);
-        if (s.k.numImmediates != 0) {
-            std::vector<uint32_t> imm(s.k.immediates, s.k.immediates + s.k.numImmediates);
-            imm.resize((imm.size() + 3) & ~size_t(3), 0);
-            loadDirect(stream, s, ST6_CONSTANTS, s.k.immediatesOffsetVec4, uint32_t(imm.size() / 4), imm.data(), uint32_t(imm.size()));
+        if (o.shaderState) {
+            auto emit = [&](pm4::Stream& stream) {
+                reg(stream, regCtrl0, ctrlReg0);
+                reg(stream, regInstrlen, s.k.instrlen);
+                // (the CS's field helpers: the VS's and the FS's registers lay their fields out the same, and tu6_emit_xs writes
+                // every stage's through the VS's)
+                const PrivateMemory pm = s.k.pvtmemSize != 0 ? b.privateMemory : PrivateMemory{};
+                regs(stream, regObjFirstExec,
+                     {0, uint32_t(address), uint32_t(address >> 32), A6XX_SP_CS_PVT_MEM_PARAM_MEMSIZEPERITEM(pm.perFiber), uint32_t(pm.address),
+                      uint32_t(pm.address >> 32), A6XX_SP_CS_PVT_MEM_SIZE_TOTALPVTMEMSIZE(pm.perSp) | (pm.perWave ? A6XX_SP_CS_PVT_MEM_SIZE_PERWAVEMEMLAYOUT : 0u)});
+                reg(stream, regHwStackOffset, A6XX_SP_CS_PVT_MEM_HW_STACK_OFFSET_OFFSET(pm.perSp));
+                loadIndirect(stream, s, ST6_SHADER, 0, std::min(s.k.instrlen, kInstrCacheSize), address);
+                if (s.k.numImmediates != 0) {
+                    std::vector<uint32_t> imm(s.k.immediates, s.k.immediates + s.k.numImmediates);
+                    imm.resize((imm.size() + 3) & ~size_t(3), 0);
+                    loadDirect(stream, s, ST6_CONSTANTS, s.k.immediatesOffsetVec4, uint32_t(imm.size() / 4), imm.data(), uint32_t(imm.size()));
+                }
+            };
+            if (pipeline != nullptr) {
+                pm4::Stream& cached = s.kind == kStageVertex ? pipeline->vs : pipeline->fs;
+                if (cached.size() == 0) emit(cached);
+                appendStream(stream, cached);
+            } else {
+                emit(stream);
+            }
         }
         for (const PushedRange& r : ranges) {
             if (r.copy) {
@@ -1898,7 +2071,8 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
     // :1747-1756), RB_RENDER_CONTROL0's UNK10 with varyings, RB_RENDER_CONTROL1 from the face/sample regids; the
     // sample registers 0; VPC_VAR_DISABLE[0..3] = ~varmask; VPC_CNTL_0 with NUMNONPOSVAR = total_in
     const bool needSize = validReg(fs.faceRegid) || fs.fragcoordCompmask != 0;
-    const uint32_t ijbits = ijBits(ij, needSize, false);
+    const uint32_t ijbits = ijBits(ij, needSize || (!sampleFetch && validReg(ij[IJ_PERSP_CENTER_RHW])),
+                                 sampleFetch && validReg(ij[IJ_PERSP_CENTER_RHW]));
     if (o.fsInputs) {
         {
             // with the prefetch commands after it in the same pkt4 (fd6 emit_fs_inputs, fd6_program.cc:947-971; A6XX keeps the
@@ -1920,10 +2094,13 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
         reg(stream, REG_A6XX_GRAS_CNTL, grasCntl(ijbits, fs.fragcoordCompmask));
         regs(stream, REG_A6XX_RB_RENDER_CONTROL0,
              {rbRenderControl0(ijbits, fs.fragcoordCompmask, fs.totalIn != 0),
-              rbRenderControl1(validReg(fs.faceRegid), validReg(fs.sampleIdRegid), validReg(fs.sampleMaskInRegid), validReg(ij[IJ_PERSP_CENTER_RHW]))});
-        reg(stream, REG_A6XX_RB_SAMPLE_CNTL, 0);
-        reg(stream, REG_A6XX_GRAS_LRZ_PS_INPUT_CNTL, 0);
-        reg(stream, REG_A6XX_GRAS_SAMPLE_CNTL, 0);
+              rbRenderControl1(validReg(fs.faceRegid), validReg(fs.sampleIdRegid), validReg(fs.sampleMaskInRegid), validReg(ij[IJ_PERSP_CENTER_RHW]),
+                               sampleFetch ? FRAGCOORD_SAMPLE : FRAGCOORD_CENTER)});
+        reg(stream, REG_A6XX_RB_SAMPLE_CNTL, sampleFetch ? A6XX_RB_SAMPLE_CNTL_PER_SAMP_MODE : 0);
+        reg(stream, REG_A6XX_GRAS_LRZ_PS_INPUT_CNTL,
+            (validReg(fs.sampleIdRegid) ? A6XX_GRAS_LRZ_PS_INPUT_CNTL_SAMPLEID : 0u) |
+            A6XX_GRAS_LRZ_PS_INPUT_CNTL_FRAGCOORDSAMPLEMODE(sampleFetch ? FRAGCOORD_SAMPLE : FRAGCOORD_CENTER));
+        reg(stream, REG_A6XX_GRAS_SAMPLE_CNTL, sampleFetch ? A6XX_GRAS_SAMPLE_CNTL_PER_SAMP_MODE : 0);
         uint32_t disable[kVpcVarDisableRegs];
         for (uint32_t i = 0; i < kVpcVarDisableRegs; i++) disable[i] = vpcVarDisable(link.varmask[i]);
         stream.registers(regVpcVarDisable(0), disable, kVpcVarDisableRegs);
@@ -1960,7 +2137,11 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
     // registers 0 (has_legacy_pipeline_shading_rate); GRAS_SC_CNTL for sysmem (:3351-3380); PC_PRIMITIVE_CNTL_0 0 (the
     // first vertex provokes, no restart)
     if (o.rast) {
-        reg(stream, REG_A6XX_GRAS_CL_CNTL, grasClCntl());
+        // (an OpenGL ES draw, gl_mode: GL's -w..w depth without ZERO_GB_SCALE_Z; window coordinates with the clipper, the
+        // viewport transform and the division off, turnip's r3d word for its own blits)
+        reg(stream, REG_A6XX_GRAS_CL_CNTL,
+            grasClCntl((draw.glMode & 1u) == 0) |
+                ((draw.glMode & 4u) != 0 ? A6XX_GRAS_CL_CNTL_CLIP_DISABLE | A6XX_GRAS_CL_CNTL_VP_XFORM_DISABLE | A6XX_GRAS_CL_CNTL_PERSP_DIVISION_DISABLE : 0u));
         reg(stream, REG_A6XX_GRAS_SU_CNTL, grasSuCntl(draw.cullMode == 1, draw.cullMode == 2, draw.winding == 0));
         reg(stream, REG_A6XX_VPC_POLYGON_MODE, A6XX_VPC_POLYGON_MODE_MODE(POLYMODE6_TRIANGLES));
         reg(stream, REG_A6XX_PC_POLYGON_MODE, A6XX_PC_POLYGON_MODE_MODE(POLYMODE6_TRIANGLES));
@@ -1979,7 +2160,10 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
             ordered ? A6XX_GRAS_SC_CNTL_CCUSINGLECACHELINESIZE(2) | A6XX_GRAS_SC_CNTL_SINGLE_PRIM_MODE(FLUSH_PER_OVERLAP) : grasScCntlSysmem());
         // primitive restart on for an indexed draw (Metal restarts at the all-ones index; tu6_draw_common's primitive_restart,
         // :5851-5862, which is off for a draw without indices, where the index register would be stale)
-        reg(stream, REG_A6XX_PC_PRIMITIVE_CNTL_0, draw.indexBuffer != nullptr ? A6XX_PC_PRIMITIVE_CNTL_0_PRIMITIVE_RESTART : 0u);
+        // (and GL's flat varyings from the LAST vertex of a primitive, gl_mode 8: PROVOKING_VTX_LAST, as fd6_rasterizer sets it
+        // for !flatshade_first)
+        reg(stream, REG_A6XX_PC_PRIMITIVE_CNTL_0, (draw.indexBuffer != nullptr ? A6XX_PC_PRIMITIVE_CNTL_0_PRIMITIVE_RESTART : 0u) |
+                                                      ((draw.glMode & 8u) != 0 ? A6XX_PC_PRIMITIVE_CNTL_0_PROVOKING_VTX_LAST : 0u));
     }
     // 16. the viewport and the scissors (tu6_emit_viewport, tu_pipeline.cc:2432-2540; tu6_emit_scissor :2657-2688):
     // GRAS_CL_VPORT[0]'s six floats with Metal's NEGATIVE y scale (viewportWords: NDC y up, row 0 at the top -- reasoning
@@ -1988,14 +2172,19 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
     // (fd_calc_guardband; MAX_GB for a 64x64 viewport), the screen scissor as Metal's scissor rectangle (the whole target
     // when none), BR inclusive (both witnesses: the fd6 'off by one' in a6xx-draw.md was spurious)
     if (o.viewportScissor) {
-        const ViewportWords v = viewportWords(vp.x, vp.y, vp.width, vp.height, vp.znear, vp.zfar);
+        // (the viewport as given: an upside-down one, height negative, is a positive YSCALE -- what AppleMetalGLRenderer
+        // draws GL through; an OpenGL ES draw's depth words are Metal's too: the renderer hands znear = GL's z offset and
+        // zfar - znear = its scale, so z * ZSCALE + ZOFFSET is GL's transform, and GL_DEPTH changes the clipper alone)
+        const Viewport& signedVp = draw.viewport;
+        const ViewportWords v = viewportWords(signedVp.x, signedVp.y, signedVp.width, signedVp.height, signedVp.znear, signedVp.zfar);
         regs(stream, regGrasClVport(REG_A6XX_GRAS_CL_VPORT_XOFFSET, 0), {v.xoffset, v.xscale, v.yoffset, v.yscale, v.zoffset, v.zscale});
         const uint32_t vx0 = uint32_t(std::max(0.0, std::floor(vp.x))), vy0 = uint32_t(std::max(0.0, std::floor(vp.y)));   // (clamped to the window)
         const uint32_t vx1 = std::min(W, uint32_t(std::ceil(vp.x + vp.width))) - 1, vy1 = std::min(H, uint32_t(std::ceil(vp.y + vp.height))) - 1;
         regs(stream, regGrasScViewportScissor(REG_A6XX_GRAS_SC_VIEWPORT_SCISSOR_TL, 0), {scissorXY(vx0, vy0), scissorXY(vx1, vy1)});
         const float zmin = float(std::min(vp.znear, vp.zfar)), zmax = float(std::max(vp.znear, vp.zfar));
         regs(stream, regGrasClZClamp(REG_A6XX_GRAS_CL_Z_CLAMP_MIN, 0), {fui(zmin), fui(zmax)});
-        reg(stream, REG_A6XX_GRAS_CL_GUARDBAND_CLIP_ADJ, guardbandClipAdj(vp.x + vp.width / 2, vp.width / 2, vp.y + vp.height / 2, -vp.height / 2));
+        reg(stream, REG_A6XX_GRAS_CL_GUARDBAND_CLIP_ADJ,
+            guardbandClipAdj(vp.x + vp.width / 2, vp.width / 2, vp.y + vp.height / 2, -signedVp.height / 2));
         regs(stream, REG_A6XX_RB_Z_CLAMP_MIN, {fui(zmin), fui(zmax)});
         regs(stream, regGrasScScreenScissor(REG_A6XX_GRAS_SC_SCREEN_SCISSOR_TL, 0), {scissorXY(sc.x, sc.y), scissorXY(sc.x + sc.width - 1, sc.y + sc.height - 1)});
     }
@@ -2019,7 +2208,7 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
         // and the Z mode (tu6_build_depth_plane_z_mode, tu_cmd_buffer.cc:5538-5583: LATE_Z with the test off or a kill
         // that writes depth, EARLY_Z otherwise); with no depth attachment r3d's zeros and EARLY_Z, as measured
         const bool stencilWrites = st.enabled && (st.front.writeMask != 0 || st.back.writeMask != 0);
-        const a6xx_ztest_mode zmode = pass.depth == nullptr ? A6XX_EARLY_Z
+        const a6xx_ztest_mode zmode = pass.depth == nullptr && pass.stencil == nullptr ? A6XX_EARLY_Z
                                       : (!depthTest && !st.enabled) || (fs.hasKill && (draw.depth.write || stencilWrites)) || fs.depthRegid != kRegidNone
                                           ? A6XX_LATE_Z
                                           : A6XX_EARLY_Z;
@@ -2116,7 +2305,7 @@ bool encodeDraw(pm4::Stream& stream, const Program& program, const RenderPass& p
         stream.packet(pm4::kWaitMemWrites, nullptr, 0);
     }
     if (whole) {
-        passTail(stream, table, o, pass.depth != nullptr);
+        passTail(stream, table, o, pass.depth != nullptr || pass.stencil != nullptr);
     }
     return true;
 }
@@ -2130,8 +2319,9 @@ bool encode(pm4::Stream& stream, const Program& program, const RenderPass& pass,
 
 bool encodeInPass(pm4::Stream& stream, const Program& program, const RenderPass& pass, const Draw& draw, const Bindings& vsBindings,
                   const Bindings& fsBindings, uint64_t vsProgram, uint64_t fsProgram, uint64_t table, uint8_t* tableCpu, std::string* why,
-                  const Options& o, const GmemPlan* gmem, bool afterFetch) {
-    return encodeDraw(stream, program, pass, draw, vsBindings, fsBindings, vsProgram, fsProgram, table, tableCpu, why, o, false, gmem, afterFetch);
+                  const Options& o, const GmemPlan* gmem, bool afterFetch, PipelineState* pipeline, DrawState* state, bool fbBarrierOwed) {
+    return encodeDraw(stream, program, pass, draw, vsBindings, fsBindings, vsProgram, fsProgram, table, tableCpu, why, o, false, gmem, afterFetch, pipeline,
+                      state, fbBarrierOwed);
 }
 
 bool encodeBegin(pm4::Stream& stream, const RenderPass& pass, uint64_t table, uint8_t* tableCpu, std::string* why, const Options& o, uint32_t skipClears) {
@@ -2145,24 +2335,55 @@ bool encodeBegin(pm4::Stream& stream, const RenderPass& pass, uint64_t table, ui
     tableStart(tableCpu);
     passStart(stream, windowOf(pass).first, windowOf(pass).second, table, o);
     clearAll(stream, pass, clears, table, skipClears);
-    zsClears(stream, pass, table);
+    zsClears(stream, pass, table, skipClears);
     return true;
 }
 
-void encodeEnd(pm4::Stream& stream, const RenderPass& pass, uint64_t table, const Options& o) { passTail(stream, table, o, pass.depth != nullptr); }
+void encodeEnd(pm4::Stream& stream, const RenderPass& pass, uint64_t table, const Options& o) { passTail(stream, table, o, pass.depth != nullptr || pass.stencil != nullptr); }
+
+void encodeLightTail(pm4::Stream& stream, const Options& o) {
+    if (o.tailLrzFlush) event(stream, LRZ_FLUSH);
+}
+
+void encodeTail(pm4::Stream& stream, uint64_t table, const Options& o, bool depth) { passTail(stream, table, o, depth); }
+
+Options lightHeadOptions(const Options& options) {
+    Options o = options;
+    o.batchStart = false;
+    o.ccuCntl = false;
+    return o;
+}
+
+void encodeBarrier(pm4::Stream& stream, uint64_t words, bool depth) {
+    stream.waitForIdle();
+    eventTimestamp(stream, PC_CCU_FLUSH_COLOR_TS, words, 1, false);
+    waitForWord(stream, words, 1);
+    if (depth) {
+        eventTimestamp(stream, PC_CCU_FLUSH_DEPTH_TS, words + 4, 1, false);
+        waitForWord(stream, words + 4, 1);
+    }
+    event(stream, CACHE_INVALIDATE);
+    stream.waitForIdle();
+}
 
 namespace {
 uint32_t alignUp(uint32_t v, uint32_t a) { return (v + a - 1) / a * a; }
 uint32_t divUp(uint32_t v, uint32_t d) { return (v + d - 1) / d; }
 }  // namespace
 
-bool gmemPlan(const RenderPass& pass, GmemPlan* plan, std::string* why) {
-    if (pass.color0 == nullptr || pass.depth != nullptr || pass.stencil != nullptr) {
-        return refuse(why, "a pass without colour attachment 0, or with depth or stencil: sysmem");
+bool gmemPlan(const RenderPass& pass, GmemPlan* plan, std::string* why, bool msaaZs) {
+    if (pass.color0 == nullptr) {
+        return refuse(why, "a pass without colour attachment 0: sysmem");
     }
-    const auto [W, H] = windowOf(pass);
+    if (!msaaZs && (pass.depth != nullptr || pass.stencil != nullptr)) {
+        return refuse(why, "a pass with depth or stencil (metal_gmem_off 64): sysmem");
+    }
+    const auto window = windowOf(pass);
+    const uint32_t W = window.first, H = window.second;
     if (W == 0 || H == 0 || W > 0x3fff || H > 0x3fff) return refuse(why, "an empty or oversized window");
-    uint32_t bytes = 0;   // a pixel's, every attachment's together
+    const uint32_t samples = pass.color0->samples();
+    if (samples != 1 && !msaaZs) return refuse(why, "a multisample pass (metal_gmem_off 64): sysmem");
+    uint32_t bytes = 0;   // a pixel's in GMEM, every attachment's together
     for (uint32_t i = 0; i < kMaxColorOutputs; i++) {
         const Attachment a = attachmentOf(pass, i);
         if (a.texture == nullptr) continue;
@@ -2170,14 +2391,27 @@ bool gmemPlan(const RenderPass& pass, GmemPlan* plan, std::string* why) {
         const FormatInfo& f = t.info();
         const std::string which = "colour attachment " + n(i) + " (" + f.name + " " + n(t.width()) + "x" + n(t.height()) + ")";
         // (the formats the phone's GMEM test draws; another size or class is left in sysmem until one does)
-        if (t.samples() != 1 || f.depth || f.twoPlane || f.blockW != 1 || f.blockH != 1 || f.pvrtcBpp != 0 ||
-            (f.bytesPerPixel != 4 && f.bytesPerPixel != 8) || f.element != kElemFloat) {
-            return refuse(why, which + ": GMEM takes single-sampled 4- and 8-byte float formats");
+        if (f.depth || f.twoPlane || f.blockW != 1 || f.blockH != 1 || f.pvrtcBpp != 0 || (f.bytesPerPixel != 4 && f.bytesPerPixel != 8) ||
+            f.element != kElemFloat) {
+            return refuse(why, which + ": GMEM takes 4- and 8-byte float formats");
         }
+        if (t.samples() != samples) return refuse(why, which + ": not the pass's sample count");
         if (a.level >= t.levels()) return refuse(why, which + ": no such level");
         if (t.compressed()) return refuse(why, which + ": compressed, which the tiles' loads and stores do not serve yet");
         const TextureLevel L = t.level(a.level);
         if (L.width != W || L.height != H) return refuse(why, which + ": not the window's size, " + n(W) + "x" + n(H));
+        if (samples != 1) {
+            // Its samples live in the tile alone: cleared there or undefined, never loaded or stored (the resolve, from the
+            // tile, is all that leaves it), in a format whose samples the event blit averages (blit_can_resolve)
+            const LoadAction la = i == 0 ? pass.load : pass.more[i - 1].load;
+            const StoreAction sa = i == 0 ? pass.store : pass.more[i - 1].store;
+            if (la == LoadAction::kLoad || sa != StoreAction::kDontCare) {
+                return refuse(why, which + ": a multisample attachment loaded or stored keeps its samples in memory: sysmem");
+            }
+            if (f.fmt6 != FMT6_8_8_8_8_UNORM) return refuse(why, which + ": a multisample format the tile's resolve does not average");
+            bytes += f.bytesPerPixel * samples;
+            continue;
+        }
         // The event blit moves whole 16 x 4 granules: past the right edge it reads and writes the row's padding, past
         // the bottom the rows after the last (turnip: tu_attachment_store_unaligned, "x2/y2 can be unaligned if equal
         // to the size of the image, since it will write into padding space"). What it stores there is what it
@@ -2190,17 +2424,52 @@ bool gmemPlan(const RenderPass& pass, GmemPlan* plan, std::string* why) {
         }
         bytes += f.bytesPerPixel;
     }
-    // GMEM below the colour cache in shares by bytes a pixel, each 16 KiB aligned (bins of whole 32 x 16 granules fit
-    // their share whatever the bins' shape)
+    // the depth and the stencil: cleared in the tile or undefined, never stored (memoryless or DontCare), the pass's size
+    // and sample count, level 0 of a 2D texture
+    auto zsOk = [&](const Texture* t, const char* what, LoadAction la, StoreAction sa) {
+        if (t->samples() != samples || t->width() != W || t->height() != H) {
+            return refuse(why, std::string(what) + ": not the colour attachment's size and sample count");
+        }
+        if (la == LoadAction::kLoad || sa != StoreAction::kDontCare) {
+            return refuse(why, std::string(what) + " loaded or stored: its memory is its truth, sysmem");
+        }
+        return true;
+    };
+    uint32_t depthBpp = 0, stencilBpp = 0;
+    if (pass.depth != nullptr) {
+        if (!zsOk(pass.depth, "the depth attachment", pass.depthLoad, pass.depthStore)) return false;
+        if (pass.depthLevel != 0 || pass.depthSlice != 0) return refuse(why, "a depth attachment's level or layer past 0: sysmem");
+        depthBpp = (pass.depth->format() == PixelFormat::kDepth16Unorm ? 2 : 4) * samples;
+    }
+    if (pass.stencil != nullptr) {
+        if (!zsOk(pass.stencil, "the stencil attachment", pass.stencilLoad, pass.stencilStore)) return false;
+        stencilBpp = samples;
+    }
+    bytes += depthBpp + stencilBpp;
+    // GMEM below the colour cache in shares by bytes a pixel, each starting on kGmemBaseAlign (bins of whole 32 x 16
+    // granules fit their share whatever the bins' shape)
     GmemPlan p;
+    p.samples = samples;
     uint32_t before = 0;
+    auto aligned = [&](uint32_t share) { return uint32_t(uint64_t(kGmemCcuColorOffset) * share / bytes) / kGmemBaseAlign * kGmemBaseAlign; };
+    auto share = [&](uint32_t bpp, uint32_t* base, uint32_t* room) {
+        *base = aligned(before);
+        before += bpp;
+        *room = aligned(before) - *base;
+    };
     for (uint32_t i = 0; i < kMaxColorOutputs; i++) {
         const Attachment a = attachmentOf(pass, i);
         if (a.texture == nullptr) continue;
-        p.bpp[i] = a.texture->info().bytesPerPixel;
-        p.base[i] = uint32_t(uint64_t(kGmemCcuColorOffset) * before / bytes) & ~0x3fffu;
-        before += p.bpp[i];
-        p.room[i] = (uint32_t(uint64_t(kGmemCcuColorOffset) * before / bytes) & ~0x3fffu) - p.base[i];
+        p.bpp[i] = a.texture->info().bytesPerPixel * samples;
+        share(p.bpp[i], &p.base[i], &p.room[i]);
+    }
+    if (depthBpp != 0) {
+        p.depthBpp = depthBpp;
+        share(depthBpp, &p.depthBase, &p.depthRoom);
+    }
+    if (stencilBpp != 0) {
+        p.stencilBpp = stencilBpp;
+        share(stencilBpp, &p.stencilBase, &p.stencilRoom);
     }
     const uint32_t whole[4] = {0, 0, W - 1, H - 1};
     if (!gmemTiles(&p, whole)) return refuse(why, "a bin too wide for GMEM");
@@ -2208,16 +2477,33 @@ bool gmemPlan(const RenderPass& pass, GmemPlan* plan, std::string* why) {
     return true;
 }
 
+bool gmemResolveOk(const Texture& src, const Texture& dst, uint32_t level, std::string* why) {
+    const FormatInfo& f = dst.info();
+    if (src.samples() < 2 || dst.samples() != 1 || dst.format() != src.format() || f.fmt6 != FMT6_8_8_8_8_UNORM || dst.compressed() ||
+        level >= dst.levels()) {
+        return refuse(why, "a resolve the tile cannot do: into a one-sample texture of the same 8-bit RGBA format");
+    }
+    const TextureLevel L = dst.level(level);
+    if (L.width != src.width() || L.height != src.height()) return refuse(why, "a resolve into a level of another size");
+    const uint64_t start = dst.levelAddress(level) - dst.buffer()->gpuAddress();
+    if (L.pitch < uint64_t(alignUp(L.width, kGmemAlignW)) * f.bytesPerPixel || L.pitch % 64 != 0 ||
+        start + uint64_t(alignUp(L.height, kGmemAlignH)) * L.pitch > dst.buffer()->length()) {
+        return refuse(why, "a resolve target without room for the event blit's granules past the edge");
+    }
+    return true;
+}
+
 bool gmemTiles(GmemPlan* plan, const uint32_t area[4]) {
     GmemPlan p = *plan;
-    p.x0 = area[0] & ~(kTileAlignW - 1);
-    p.y0 = area[1] & ~(kTileAlignH - 1);
+    // FD650 aligns tiles to 96 pixels, not a power of two.
+    p.x0 = area[0] / kTileAlignW * kTileAlignW;
+    p.y0 = area[1] / kTileAlignH * kTileAlignH;
     const uint32_t w = area[2] + 1 - p.x0, h = area[3] + 1 - p.y0;
     // The bin width is fixed once a plan has one: a framebuffer fetch's descriptor holds it as its pitch (encodeInPass,
     // written before the area was known), and a tile laid out narrower read through it as sheared rows (the screen in
     // stripes over two tile columns). Only the grid's corner, the columns, the rows and the bin height follow the area.
     if (p.binW == 0) {
-        p.cols = divUp(alignUp(w, kTileAlignW), kTileMaxW);
+        p.cols = divUp(alignUp(w, kTileAlignW), kTileMaxW / kTileAlignW * kTileAlignW);
         p.binW = alignUp(divUp(w, p.cols), kTileAlignW);
     } else {
         p.cols = divUp(w, p.binW);
@@ -2226,6 +2512,8 @@ bool gmemTiles(GmemPlan* plan, const uint32_t area[4]) {
     for (uint32_t i = 0; i < kMaxColorOutputs; i++) {
         if (p.bpp[i] != 0) fit = std::min(fit, p.room[i] / (p.binW * p.bpp[i]) / kTileAlignH * kTileAlignH);
     }
+    if (p.depthBpp != 0) fit = std::min(fit, p.depthRoom / (p.binW * p.depthBpp) / kTileAlignH * kTileAlignH);
+    if (p.stencilBpp != 0) fit = std::min(fit, p.stencilRoom / (p.binW * p.stencilBpp) / kTileAlignH * kTileAlignH);
     if (fit < kTileAlignH) return false;
     p.rows = divUp(h, fit);
     p.binH = alignUp(divUp(h, p.rows), kTileAlignH);
@@ -2270,7 +2558,7 @@ bool gmemClearWords(const FormatInfo& f, const double rgba[4], uint32_t out[4]) 
 
 bool drawArea(const RenderPass& pass, const Draw& draw, uint32_t area[4]) {
     const auto [W, H] = windowOf(pass);
-    const Viewport& vp = draw.viewport;
+    const Viewport vp = upright(draw.viewport);
     if (!finite(vp.x) || !finite(vp.y) || !finite(vp.width) || !finite(vp.height) || !(vp.width > 0.0) || !(vp.height > 0.0) || vp.x >= double(W) ||
         vp.y >= double(H) || vp.x + vp.width <= 0.0 || vp.y + vp.height <= 0.0) {
         return false;
@@ -2310,6 +2598,8 @@ bool gmemDrawOk(const Program& program, const RenderPass& pass, const Draw& draw
         }
     }
     if (draw.visibilityMode != 0) return refuse(why, "a visibility result: the tiles would count each sample once a tile");
+    // (a framebuffer fetch reads the bin through a one-sample descriptor: stageTextures)
+    if (program.fs.fbRead && pass.color0 != nullptr && pass.color0->samples() != 1) return refuse(why, "a framebuffer fetch of a multisample target");
     for (const Bindings* b : {&vsBindings, &fsBindings}) {
         for (const Texture* t : b->textures) {
             // (a draw sampling what the pass draws into reads memory, which in GMEM holds the target as it was before the pass)
@@ -2318,23 +2608,186 @@ bool gmemDrawOk(const Program& program, const RenderPass& pass, const Draw& draw
                     return refuse(why, "a texture over colour attachment " + n(i) + "'s memory");
                 }
             }
+            for (const Texture* zs : {pass.depth, pass.stencil}) {
+                if (t != nullptr && zs != nullptr && t->buffer() == zs->buffer()) return refuse(why, "a texture over the depth or stencil attachment's memory");
+            }
         }
     }
     return true;
 }
 
-void encodeGmem(pm4::Stream& stream, const RenderPass& pass, const GmemPlan& plan, uint64_t bodies, uint32_t bodyWords, uint64_t table, const Options& o,
-                uint32_t load, uint32_t store, bool fetch, uint32_t clear, const uint32_t (*clearWords)[4], uint64_t vsc) {
+// v29i (P1): CoreAnimation's full-target clear quad, and whether the 2D engine's fill may write what it would have.
+//
+// When a pass is already open and MTLRenderPassDescriptor's Clear is no longer available, CoreAnimation draws one:
+// path_blit_vert over attachment_clear_frag across the whole target. Drawn by the 3D pipe it writes 11 MB at some
+// 3 GB/s (3.2-3.6 ms, work/v29i/INVESTIGATION-anim-gpu-cost.md), where this driver's 2D fill of the same 11 MB is
+// 0.84 ms (fillStream: CP_BLIT with RB_2D_BLIT_CNTL's SOLID_COLOR). The quad can be replaced when every pixel it
+// leaves behind is the one the fill leaves, which is what this decides; anything else is left to the draw.
+//
+// What the two functions are is read off QuartzCore's own default.metallib, both of its suffixes: attachment_clear_frag
+// takes no argument and returns <{half4, half4}> zeroinitializer -- (0,0,0,0) into both of its render targets, whatever
+// the pass's Clear colour is -- and path_blit_vert places a clip-space rectangle: vertex_id's two low bits pick a corner
+// of buffer(1)'s CA::OGL::AxisAlignedRect (min.xy then max.xy, 16 bytes a rect, the rect instance_id names) and
+// buffer(0)'s float4x4 carries it to clip space, z 0 and w 1. So the pixels the quad covers are that rectangle's
+// transform; the fill covers the whole target, and the two agree only when the rectangle covers the whole clip square.
+// (A name no other shader carries, so nothing here is guessed at by size or by shape.)
+//
+// Everything else the draw could do is required to do nothing: no blend, the full write mask, no depth write, stencil
+// write or depth test that could fail, nothing counted, no cull that could drop a triangle, one sample, no stage that
+// stores to a buffer or an image. And the pass's window must be the whole of every level it writes: a Clear covers the
+// whole attachment (Metal's rule, fillStream's comment) where the quad only reached the window.
+//
+// MASK: the colour attachments the fill is still owed -- 0 when the pass's own Clear already wrote (0,0,0,0) into them,
+// which is the redundant quad the investigation counts as 101 passes in the run it read.
+bool clearQuadFillMask(const Program& program, const RenderPass& pass, const Draw& draw, const Bindings& vsBindings, uint32_t* mask, std::string* why) {
+    *mask = 0;
+    static const bool on = access("/var/db/hakios-metal-cache/clearquad-fill-off", F_OK) != 0;
+    if (!on) return refuse(why, "the clear quad's fill is off (/var/db/hakios-metal-cache/clearquad-fill-off)");
+    const char* const fsName = program.fs.k.name;
+    const char* const vsName = program.vs.k.name;
+    if (fsName == nullptr || vsName == nullptr ||
+        !(strcmp(fsName, "attachment_clear_frag_lph") == 0 || strcmp(fsName, "attachment_clear_frag_lpf") == 0) ||
+        !(strcmp(vsName, "path_blit_vert_lph") == 0 || strcmp(vsName, "path_blit_vert_lpf") == 0)) {
+        return refuse(why, "not the clear quad's two functions");
+    }
+    // the draw as path_blit_vert is drawn: one quad (a strip of four, or two triangles over it), one instance, nothing
+    // indexed, nothing indirect, no cull (a culled triangle covers nothing), nothing counted, and no depth or stencil
+    // state that could keep a pixel from being written or write one
+    if (draw.indirect != nullptr || draw.indexBuffer != nullptr || draw.vertexStart != 0 || draw.baseVertex != 0 || draw.baseInstance != 0 ||
+        draw.instanceCount != 1 || draw.glMode != 0 || draw.cullMode != 0 || draw.visibilityMode != 0 ||
+        !((draw.primitive == Primitive::kTriangleStrip && draw.vertexCount == 4) || (draw.primitive == Primitive::kTriangle && draw.vertexCount == 6))) {
+        return refuse(why, "the clear quad, drawn in a shape or with state this does not take");
+    }
+    if (draw.depth.write || draw.depth.compare != 7 || draw.stencil.enabled) {
+        return refuse(why, "the clear quad with a depth or stencil write, or a depth test that could fail");
+    }
+    if (program.samples != 1 || program.ssboWrites != 0) return refuse(why, "the clear quad with samples, or a stage that stores to a buffer");
+    // a constant written over all four channels with no blend, per attachment the function writes
+    for (uint32_t i = 0; i < kMaxColorOutputs; i++) {
+        const ColorBlend& cb = i == 0 ? program.blend : program.moreBlend[i - 1];
+        if (cb.enabled || cb.writeMask != 0xf) return refuse(why, "the clear quad blended, or with a partial colour write mask");
+    }
+    const uint32_t written = drawnAttachments(program, pass);
+    if (written == 0) return refuse(why, "the clear quad with no attachment to write");
+    // its viewport and scissor the whole window, and the window the whole of each attachment's level
     const auto [W, H] = windowOf(pass);
-    // the colour cache out of the tiles' way (it is not pipelined: after a WFI, as the sysmem value is written)
+    uint32_t area[4];
+    if (W == 0 || H == 0 || !drawArea(pass, draw, area) || area[0] != 0 || area[1] != 0 || area[2] != W - 1 || area[3] != H - 1) {
+        return refuse(why, "the clear quad not over the whole target");
+    }
+    const double none[4] = {0, 0, 0, 0};
+    uint32_t fill = 0;
+    for (uint32_t i = 0; i < kMaxColorOutputs; i++) {
+        if (((written >> i) & 1) == 0) continue;
+        const Attachment a = attachmentOf(pass, i);
+        const Texture& t = *a.texture;
+        if (t.samples() != 1 || t.compressed()) return refuse(why, "the clear quad into a multisample or compressed target");
+        const TextureLevel L = t.level(a.level);
+        if (L.width != W || L.height != H) return refuse(why, "the clear quad into an attachment larger than the pass's window");
+        ClearWords zero{};
+        if (!clearWords(t.info(), none, &zero, nullptr)) return refuse(why, "the clear quad into a format the fill does not pack");
+        // the pass's own Clear already wrote exactly that: the quad leaves those pixels as they are
+        ClearWords passClear{};
+        if (a.load == LoadAction::kClear && clearWords(t.info(), a.clearColor, &passClear, nullptr) &&
+            std::memcmp(zero.value, passClear.value, sizeof zero.value) == 0) {
+            continue;
+        }
+        fill |= 1u << i;
+    }
+    // path_blit_vert's rectangle through its matrix, which must cover the whole clip square (x and y in -1..1: the
+    // position is clip space with w 1). An axis-aligned transform only -- a sheared or turned one's bounding box says
+    // nothing about what the quad covers.
+    if (vsBindings.buffers.size() < 2 || vsBindings.buffers[0].buffer == nullptr || vsBindings.buffers[1].buffer == nullptr) {
+        return refuse(why, "the clear quad without its two vertex buffers");
+    }
+    const Binding& m = vsBindings.buffers[0];   // float4x4: Metal's [[buffer(0)]]
+    const Binding& r = vsBindings.buffers[1];   // CA::OGL::AxisAlignedRect: [[buffer(1)]]
+    if (m.offset + 64 > m.buffer->length() || r.offset + 16 > r.buffer->length()) {
+        return refuse(why, "the clear quad whose vertex buffers are shorter than its transform and rectangle");
+    }
+    const auto* mat8 = static_cast<const uint8_t*>(m.buffer->contents());
+    const auto* rect8 = static_cast<const uint8_t*>(r.buffer->contents());
+    if (mat8 == nullptr || rect8 == nullptr) return refuse(why, "the clear quad whose vertex buffers this processor cannot read");
+    float mat[16], rect[4];
+    std::memcpy(mat, mat8 + m.offset, sizeof mat);
+    std::memcpy(rect, rect8 + r.offset, sizeof rect);
+    for (int i = 0; i < 16; i++) {
+        if (!std::isfinite(mat[i])) return refuse(why, "the clear quad with a non-finite transform");
+    }
+    for (int i = 0; i < 4; i++) {
+        if (!std::isfinite(rect[i])) return refuse(why, "the clear quad with a non-finite rectangle");
+    }
+    // (columns 0, 1 and 3: x' = x*m00 + y*m10 + m30, y' = x*m01 + y*m11 + m31)
+    if (mat[4] != 0.0f || mat[1] != 0.0f || mat[0] == 0.0f || mat[5] == 0.0f) {
+        return refuse(why, "the clear quad with a transform that is not axis-aligned");
+    }
+    // a quarter of a pixel short of an edge is not short of it at all: the target has one sample a pixel, so what a pixel
+    // holds is decided at its centre, half a pixel in from every edge (and the float32 matrix's own noise, 2/1125 times
+    // 1125, is a thousandth of that)
+    const float tolX = 0.5f / float(W), tolY = 0.5f / float(H);
+    const float x0 = std::min(mat[0] * rect[0], mat[0] * rect[2]) + mat[12];
+    const float x1 = std::max(mat[0] * rect[0], mat[0] * rect[2]) + mat[12];
+    const float y0 = std::min(mat[5] * rect[1], mat[5] * rect[3]) + mat[13];
+    const float y1 = std::max(mat[5] * rect[1], mat[5] * rect[3]) + mat[13];
+    if (!(x0 <= -1.0f + tolX && x1 >= 1.0f - tolX && y0 <= -1.0f + tolY && y1 >= 1.0f - tolY)) {
+        return refuse(why, "the clear quad whose rectangle does not cover the whole target");
+    }
+    *mask = fill;
+    return true;
+}
+
+// The fill CLEAR_QUAD's quad stood for, attachment by attachment, after encodeBegin's pass start (the 2D engine's write
+// of (0,0,0,0), the colour CCU cleaned and waited for, and a WFI: clearStream, as a Clear's own fill does it)
+void encodeClearFill(pm4::Stream& stream, const RenderPass& pass, uint32_t mask, uint64_t table) {
+    const double none[4] = {0, 0, 0, 0};
+    for (uint32_t i = 0; i < kMaxColorOutputs; i++) {
+        if (((mask >> i) & 1) == 0) continue;
+        const Attachment a = attachmentOf(pass, i);
+        if (a.texture == nullptr) continue;
+        ClearWords c{};
+        if (!clearWords(a.texture->info(), none, &c, nullptr)) continue;   // (the mask was made with the same packing)
+        clearStream(stream, *a.texture, c, clearFlushAt(table, i), a.level, a.slice);
+    }
+}
+
+void encodeGmem(pm4::Stream& stream, const RenderPass& pass, const GmemPlan& plan, uint64_t bodies, uint32_t bodyWords, uint64_t table, const Options& o,
+                uint32_t load, uint32_t store, bool fetch, uint32_t clear, const uint32_t (*clearWords)[4], uint64_t vsc, const GmemTileWork* work) {
+    const auto [W, H] = windowOf(pass);
+    const GmemTileWork none;
+    const GmemTileWork& wk = work != nullptr ? *work : none;
+    // where the command processor has got to, for a hang to say (GmemTileWork::trace): STEP in bits 28-31, the pass's
+    // tag in 16-27, the tile in 0-15
+    auto progress = [&](uint32_t step, uint32_t tile) {
+        if (wk.trace == 0) return;
+        const uint32_t v = step << 28 | (wk.traceTag & 0xfffu) << 16 | (tile & 0xffffu);
+        stream.memWrite(wk.trace, &v, 1);
+    };
+    progress(1, 0);
+    // The CCU given over to the tiles as turnip gives it (tu_emit_cache_flush_ccu, sysmem -> GMEM): both caches cleaned
+    // and invalidated, a wait for idle (RB_CCU_CNTL is not pipelined), then the GMEM layout -- the colour cache at
+    // GMEM's end, the depth cache's lines at GMEM's start, under the bins: what either held from sysmem passes must
+    // neither be lost nor written over the tiles later
+    eventTimestamp(stream, PC_CCU_FLUSH_COLOR_TS, table + kTableGmemCleanColorAt, kGmemCleanValue, false);
+    eventTimestamp(stream, PC_CCU_FLUSH_DEPTH_TS, table + kTableGmemCleanDepthAt, kGmemCleanValue, false);
+    event(stream, PC_CCU_INVALIDATE_COLOR);
+    event(stream, PC_CCU_INVALIDATE_DEPTH);
     stream.waitForIdle();
     reg(stream, REG_A6XX_RB_CCU_CNTL, rbCcuCntlGmem());
+    // the samples a pixel every event blit of the pass moves (event_blit_setup, clear_gmem_attachment); the draws write 0
+    // there, so it is written again before each tile's blits
+    const uint32_t blitMsaa = A6XX_RB_BLIT_GMEM_MSAA_CNTL_SAMPLES(plan.samples == 4 ? MSAA_FOUR : plan.samples == 2 ? MSAA_TWO : MSAA_ONE);
+    // RB_RENDER_CNTL through the tracker (A650: tu6_emit_render_cntl, fd6 update_render_cntl): BINNING while the binning
+    // pass runs, then without it for the tiles; the tiles' draws do not write it (encodeDraw)
+    auto renderCntl = [&](bool binning) {
+        const uint32_t w[3] = {TRACK_RENDER_CNTL, REG_A6XX_RB_RENDER_CNTL, rbRenderCntlSysmem() | (binning ? A6XX_RB_RENDER_CNTL_BINNING : 0u)};
+        stream.packet(CP_REG_WRITE, w, 3);
+    };
     // the event blit's state common to every load and store (event_blit_setup): over the render area in granules
     // (tu6_emit_blit_scissor with align), single-sampled
     const uint32_t bx1 = std::min(alignUp(plan.area[2] + 1, kGmemAlignW), alignUp(W, kGmemAlignW)) - 1;
     const uint32_t by1 = std::min(alignUp(plan.area[3] + 1, kGmemAlignH), alignUp(H, kGmemAlignH)) - 1;
     regs(stream, REG_A6XX_RB_BLIT_SCISSOR_TL, {regXY(plan.area[0] & ~(kGmemAlignW - 1), plan.area[1] & ~(kGmemAlignH - 1)), regXY(bx1, by1)});
-    reg(stream, REG_A6XX_RB_BLIT_GMEM_MSAA_CNTL, 0);
+    reg(stream, REG_A6XX_RB_BLIT_GMEM_MSAA_CNTL, blitMsaa);
     reg(stream, REG_A6XX_RB_UNKNOWN_88D0, 0);
     // one attachment's load or store (event_blit_run): its memory as the destination, its bin where RB_MRT's BASE_GMEM
     // puts it (plan.base, which the draws were given)
@@ -2363,6 +2816,9 @@ void encodeGmem(pm4::Stream& stream, const RenderPass& pass, const GmemPlan& pla
     };
     crumb(0xa);
     if (vsc != 0) {
+        // RB_RENDER_CNTL.BINNING before the binning pass, as turnip's tu6_tile_render_begin writes it
+        renderCntl(true);
+        progress(2, 0);
         // the binning pass (emit_binning_pass): the whole window, RM6_BIN_VISIBILITY, the bins' layout, every draw once
         regs(stream, REG_A6XX_GRAS_SC_WINDOW_SCISSOR_TL, {regXY(plan.x0, plan.y0), regXY(plan.x0 + plan.cols * plan.binW - 1, plan.y0 + plan.rows * plan.binH - 1)});
         command1(stream, CP_SET_MARKER, setMarker0(RM6_BIN_VISIBILITY));
@@ -2403,6 +2859,7 @@ void encodeGmem(pm4::Stream& stream, const RenderPass& pass, const GmemPlan& pla
         waitForWord(stream, table + kTableBinFlushAt, kBinFlushValue);
         stream.waitForMe();
         crumb(1);
+        progress(3, 0);
         // A stream past its pipe's limit is cut short and its tiles would miss draws: the command processor compares each
         // used pipe's sizes with the limits (turnip's emit_vsc_overflow_test) and marks the queue's word, which turns the
         // binning off from then on (CommandBuffer::finish) -- this frame is what it is, the next ones draw every draw
@@ -2425,7 +2882,10 @@ void encodeGmem(pm4::Stream& stream, const RenderPass& pass, const GmemPlan& pla
             const uint32_t w[3] = {(0x0c38u + 0x20u * k) | 32u << CP_REG_TO_MEM_0_CNT__SHIFT, uint32_t(at), uint32_t(at >> 32)};
             stream.packet(CP_REG_TO_MEM, w, 3);
         }
+        // (the draws skipped by the streams: turnip's and fd6's after the binning pass)
+        command1(stream, CP_SKIP_IB2_ENABLE_LOCAL, 1);
     }
+    renderCntl(false);
     for (uint32_t ry = 0; ry < plan.rows; ry++) {
         for (uint32_t rx = 0; rx < plan.cols; rx++) {
             const bool reverse = o.gmemBinningStage == 8;   // (the bisect's: the tiles last to first)
@@ -2474,6 +2934,9 @@ void encodeGmem(pm4::Stream& stream, const RenderPass& pass, const GmemPlan& pla
                 command1(stream, CP_SET_VISIBILITY_OVERRIDE, 1);
                 command1(stream, CP_SET_MODE, 0);
             }
+            const uint32_t tileNumber = ty * plan.cols + tx;
+            progress(4, tileNumber);
+            reg(stream, REG_A6XX_RB_BLIT_GMEM_MSAA_CNTL, blitMsaa);   // (the binning pass's and the last tile's draws wrote 0)
             for (uint32_t i = 0; o.gmemLoad && i < kMaxColorOutputs; i++) {
                 if ((load >> i) & 1) blit(i, BLIT_EVENT_LOAD);
             }
@@ -2487,36 +2950,75 @@ void encodeGmem(pm4::Stream& stream, const RenderPass& pass, const GmemPlan& pla
                 regs(stream, REG_A6XX_RB_BLIT_CLEAR_COLOR_DW0, {clearWords[i][0], clearWords[i][1], clearWords[i][2], clearWords[i][3]});
                 event(stream, BLIT);
             }
+            // the depth's and the stencil's Clears in the tile (tu_emit_clear_gmem_attachment: D32_SFLOAT_S8_UINT's two
+            // planes each as its own format -- Z32_FLOAT, S8_UINT -- at its own bin; Z16_UNORM as 16-bit unorm)
+            for (uint32_t k = 0; k < 2; k++) {
+                if (!((wk.zsClear >> k) & 1)) continue;
+                const bool depth = k == 0;
+                const a6xx_format f = !depth ? FMT6_8_UINT : pass.depth->format() == PixelFormat::kDepth16Unorm ? FMT6_16_UNORM : FMT6_32_FLOAT;
+                reg(stream, REG_A6XX_RB_BLIT_DST_INFO, rbBlitDstInfo(f, TILE6_LINEAR, WZYX));
+                reg(stream, REG_A6XX_RB_BLIT_INFO, rbBlitInfo(BLIT_EVENT_CLEAR, false, 0xf));
+                reg(stream, REG_A6XX_RB_BLIT_BASE_GMEM, depth ? plan.depthBase : plan.stencilBase);
+                reg(stream, REG_A6XX_RB_UNKNOWN_88D0, 0);
+                regs(stream, REG_A6XX_RB_BLIT_CLEAR_COLOR_DW0, {depth ? wk.depthWord : wk.stencilWord, 0, 0, 0});
+                event(stream, BLIT);
+            }
             // A framebuffer fetch reads GMEM through the texture caches, which still hold what the last tile's fetches
             // read at the same GMEM addresses (probe "GMEM: framebuffer fetch": 9221 pixels of 24 tiles from the tile
             // before): dropped once a tile, the loads waited for first
-            if (fetch) {
+            // Without visibility streams every draw's state executes in every tile.
+            // The first fetch's body already waits for preceding loads/draws and
+            // invalidates the same caches. With streams it can be culled: keep
+            // the tile barrier there, and for callers without body barriers.
+            if (fetch && !(wk.fetchBarrierInBody && !streams)) {
                 stream.waitForIdle();
                 event(stream, CACHE_INVALIDATE);
             }
             stream.indirect(bodies, bodyWords);   // (an IB2: the draws' words once in memory, not once a tile in the stream)
             crumb(0x300 + ty * plan.cols + tx);
+            progress(5, tileNumber);
             // The command processor queues each tile's streams and lets one go only at this marker (tu6_render_tile's,
             // under hw binning): without it the third tile's CP_SET_BIN_DATA5 found the queue full and its draws hung
             // in PC, in whichever order the tiles ran (probe --bin-trace)
             if (streams && o.gmemBinningStage != 9) command1(stream, CP_SET_MARKER, setMarker0(RM6_BIN_END_OF_DRAWS) | A6XX_CP_SET_MARKER_0_USES_GMEM);
             command1(stream, CP_SKIP_IB2_ENABLE_GLOBAL, 0);
             command1(stream, CP_SET_MARKER, setMarker0(RM6_BIN_RESOLVE) | A6XX_CP_SET_MARKER_0_USES_GMEM);
+            reg(stream, REG_A6XX_RB_BLIT_GMEM_MSAA_CNTL, blitMsaa);
             for (uint32_t i = 0; i < kMaxColorOutputs; i++) {
                 if ((store >> i) & 1) blit(i, BLIT_EVENT_STORE);
+            }
+            // each multisample attachment's resolve, from the tile into its one-sample texture (tu_store_gmem_attachment's
+            // fast path with a != gmem_a: the event blit with the bin's samples, a destination of one, averages them)
+            for (uint32_t i = 0; i < kMaxColorOutputs; i++) {
+                const Texture* r = wk.resolve[i];
+                if (r == nullptr) continue;
+                const FormatInfo& f = r->info();
+                const uint64_t at = r->levelAddress(wk.resolveLevel[i]);
+                regs(stream, REG_A6XX_RB_BLIT_DST_INFO,
+                     {rbBlitDstInfo(colorFmt(f), TILE6_LINEAR, f.swap), uint32_t(at), uint32_t(at >> 32), uint32_t(r->level(wk.resolveLevel[i]).pitch) >> 6});
+                regs(stream, REG_A6XX_RB_BLIT_FLAG_DST, {0, 0, 0});
+                reg(stream, REG_A6XX_RB_BLIT_BASE_GMEM, plan.base[i]);
+                reg(stream, REG_A6XX_RB_BLIT_INFO, rbBlitInfo(BLIT_EVENT_STORE, false));
+                event(stream, BLIT);
             }
             if (o.gmemTileWfi) stream.waitForIdle();
             command1(stream, CP_SET_MARKER, setMarker0(RM6_BIN_RENDER_END));
             crumb(0x400 + ty * plan.cols + tx);
+            progress(6, tileNumber);
         }
     }
     // the stores out of the blit cache (tu6_tile_render_end's FD_CCU_CLEAN_BLIT_CACHE: PC_CCU_RESOLVE_TS on A6XX), waited
     // for as the tail waits for its flushes; then the CCU back where every other pass here expects it
     eventTimestamp(stream, PC_CCU_RESOLVE_TS, table + kTableBlitFlushAt, kBlitFlushValue, false);
     waitForWord(stream, table + kTableBlitFlushAt, kBlitFlushValue);
+    // (GMEM -> sysmem: turnip invalidates both caches and waits for idle before RB_CCU_CNTL; nothing of the tiles' mode
+    // is in them to clean)
+    event(stream, PC_CCU_INVALIDATE_COLOR);
+    event(stream, PC_CCU_INVALIDATE_DEPTH);
     stream.waitForIdle();
     reg(stream, REG_A6XX_RB_CCU_CNTL, rbCcuCntlSysmem() | (o.ccuConcurrentResolve ? A6XX_RB_CCU_CNTL_CONCURRENT_RESOLVE : 0u));
     crumb(0x999);
+    progress(7, 0);
 }
 
 bool encodeClear(pm4::Stream& stream, const RenderPass& pass, uint64_t table, uint8_t* tableCpu, std::string* why, const Options& o) {
@@ -2535,7 +3037,7 @@ bool encodeClear(pm4::Stream& stream, const RenderPass& pass, uint64_t table, ui
     passStart(stream, windowOf(pass).first, windowOf(pass).second, table, o);
     clearAll(stream, pass, clears, table);
     zsClears(stream, pass, table);
-    passTail(stream, table, o, pass.depth != nullptr);
+    passTail(stream, table, o, pass.depth != nullptr || pass.stencil != nullptr);
     return true;
 }
 
@@ -2544,7 +3046,7 @@ uint32_t halfBitsOf(float f) { return halfOf(f); }
 bool encodeBlit(pm4::Stream& stream, const Texture& src, uint32_t srcLevel, BlitRect s, const Texture& dst, uint32_t dstLevel, BlitRect d, bool linear,
                 uint64_t table, uint8_t* tableCpu, std::string* why, const Options& o) {
     const FormatInfo &sf = src.info(), &df = dst.info();
-    if (sf.depth || df.depth) {
+    if (sf.depth || sf.stencil || df.depth || df.stencil) {
         return refuse(why, std::string("a copy of a ") + (sf.depth ? sf.name : df.name) + " texture: a depth texture is tiled, the 2D copy is written for linear ones");
     }
     if (src.compressed()) {
@@ -2699,6 +3201,17 @@ void encodeBytes(pm4::Stream& stream, uint64_t from, uint64_t to, uint64_t lengt
 
 }  // namespace render
 
+// v29i P1: a sysmem framebuffer-fetch barrier is PC_CCU_FLUSH_COLOR_TS (the whole colour CCU) and a CACHE_INVALIDATE,
+// so one covers every fetch after it until a draw writes a fetched target again. On by default;
+// /var/db/hakios-metal-cache/fbread-dedupe-off -- a file beside bo-cache-off and the other switches -- turns it off
+// without a rebuild. Read once, at the first draw of the process (no boot-arg: the 607-character line is full).
+namespace {
+bool fbReadDedupeOn() {
+    static const bool on = access("/var/db/hakios-metal-cache/fbread-dedupe-off", F_OK) != 0;
+    return on;
+}
+}  // namespace
+
 // a pass's words onto the command buffer's stream, packet by packet, behind a NOP that marks where an encoder began
 // (for whoever reads the stream back)
 void appendStream(pm4::Stream& to, const pm4::Stream& from) {
@@ -2761,8 +3274,18 @@ bool appendDeduped(pm4::Stream& to, const pm4::Stream& from, CommandBuffer::RegS
     return forgot;
 }
 
+namespace {
+// the memory a texture's view lies in: its buffer, whole (a view, a level or a texture over a buffer: the same memory)
+std::pair<uint64_t, uint64_t> spanOf(const Texture& t) {
+    const Buffer& b = *t.buffer();
+    return {b.gpuAddress(), b.gpuAddress() + std::max<uint64_t>(b.bo().size(), b.length())};
+}
+std::pair<uint64_t, uint64_t> spanOf(const Buffer& b) { return {b.gpuAddress(), b.gpuAddress() + std::max<uint64_t>(b.bo().size(), b.length())}; }
+}  // namespace
+
 bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const Draw& d, const Bindings& vsBindings, const Bindings& fsBindings,
                          const render::Options& options) {
+    const uint64_t encodeStart = profile_ ? hm_perf_clock(CLOCK_MONOTONIC) : 0;
     if (status_ > kEnqueued) {
         return fail("draw after commit");
     }
@@ -2829,6 +3352,28 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
     if (!piece(render::kTableBytes, &table, &why)) {
         return fail(std::string("no memory for the draw's table: ") + why);
     }
+    // what the draw reads -- its textures' and buffers' memory -- for the chained passes' hazards (render.hpp)
+    std::pair<uint64_t, uint64_t> reads[48];
+    uint32_t numReads = 0;
+    if (!passWfi_) {
+        auto read = [&](std::pair<uint64_t, uint64_t> r) {
+            if (numReads < sizeof reads / sizeof reads[0]) {
+                reads[numReads++] = r;
+            } else {
+                reads[numReads - 1] = {std::min(reads[numReads - 1].first, r.first), std::max(reads[numReads - 1].second, r.second)};
+            }
+        };
+        for (const Bindings* b : {vsb, fsb}) {
+            for (const Texture* t : b->textures) {
+                if (t != nullptr) read(spanOf(*t));
+            }
+            for (const Binding& x : b->buffers) {
+                if (x.buffer != nullptr) read(spanOf(*x.buffer));
+            }
+        }
+        if (d.indexBuffer != nullptr) read(spanOf(*d.indexBuffer));
+        if (d.indirect != nullptr) read(spanOf(*d.indirect));
+    }
     // A draw into the open pass's attachments joins it: no batch start, no pass begin and no tail of its own, which a
     // pass per draw spent on every draw (the CCU flush and the cache flush waited for, each time). It joins when the
     // attachments are the same textures, it asks for no Clear (a Clear begins a pass), and the options are the same.
@@ -2836,7 +3381,7 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
                  open_->pass.stencil == pass.stencil && !(pass.stencil != nullptr && pass.stencilLoad == LoadAction::kClear) &&
                  pass.load != LoadAction::kClear &&
                  !(pass.depth != nullptr && pass.depthLoad == LoadAction::kClear) && pass.store == open_->pass.store &&
-                 pass.depthStore == open_->pass.depthStore && std::memcmp(&open_->options, &options, sizeof options) == 0;
+                 pass.depthStore == open_->pass.depthStore && pass.stencilStore == open_->pass.stencilStore && std::memcmp(&open_->options, &options, sizeof options) == 0;
     for (uint32_t i = 0; joins && i < kMaxColorOutputs - 1; i++) {
         // (the attachments past 0 the same textures and stores, none asking for a Clear: the same pass)
         const ColorAttachment &a = pass.more[i], &b = open_->pass.more[i];
@@ -2859,7 +3404,35 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
         joins = false;
     }
     if (!joins) {
-        closePass();
+        closePass(true);   // (chained: the light tail, and what comes next decides when the full one is written)
+    }
+    // it samples what a chained pass wrote (the one just closed included): a barrier first
+    bool raw = false;
+    for (uint32_t i = 0; i < numReads && !dirty_.empty() && !raw; i++) raw = overlaps(dirty_, reads[i].first, reads[i].second, kColour | kDepth | kShader);
+    // ...and a draw that samples a texture over the memory of an attachment this still-open pass has already drawn
+    // into is a read after write inside ONE pass, which dirty_ never saw: it is filled when a pass closes (closePass),
+    // and the open pass's own writes are only its WRITTEN mask. gmemDrawOk refuses such a draw in a tile (a tile
+    // replays its draws together and the texture would read the memory as it was before the pass), so this is a
+    // sysmem pass -- CoreAnimation's mask -> blur -> compose passes do exactly this, which the GMEM refusal was
+    // recorded for ("a texture over colour attachment 0's memory"). The barrier is the one a chained pass's hazard
+    // gets, emitted before the draw below. The cost is a buffer compare per sampled binding, and only once the pass
+    // has written an attachment.
+    bool inPassRaw = false;
+    if (joins && !open_->gmem && (open_->written & ~open_->barriered) != 0 && !passWfi_) {
+        for (uint32_t a = 0; a < kMaxColorOutputs && !inPassRaw; a++) {
+            if ((((open_->written & ~open_->barriered) >> a) & 1) == 0) continue;
+            const render::Attachment at = render::attachmentOf(open_->pass, a);
+            if (at.texture == nullptr) continue;
+            for (const auto& [b, k] : {std::pair<const Bindings*, const Kernel*>{vsb, &program.vs.k}, {fsb, &program.fs.k}}) {
+                for (uint32_t s = 0; s < b->textures.size() && s < kMaxTextureSlots && s < k->numTextureSlots && !inPassRaw; s++) {
+                    const Texture* t = b->textures[s];
+                    // (a sampled slot alone: an image or a device buffer is written by the stage, a hazard of its own)
+                    if (t != nullptr && k->textures[s].kind == kTexSampled && t->buffer() == at.texture->buffer()) inPassRaw = true;
+                }
+                if (inPassRaw) break;
+            }
+        }
+        raw = raw || inPassRaw;
     }
     render::GmemPlan plan;
     bool gmem = false, dual = false;
@@ -2870,9 +3443,24 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
         dual = open_->dual;
         plan = open_->plan;
     } else if (options.gmem && gmem_) {
-        gmem = render::gmemPlan(pass, &plan, &gmemWhy_) && tileable;
+        gmem = render::gmemPlan(pass, &plan, &gmemWhy_, gmemMsaaZs_) && tileable;
         if (!tileable) gmemWhy_ = gmemWhy;
-        if (gmem && gmemMinDraws_ != 0) {
+        if (gmem && adaptive_) {
+            kind = render::tuneKeyOf(pass);
+            ordinal = ordinals_[kind]++;
+            const auto [w, h] = render::windowOf(pass);
+            if (plan.samples > 1) {
+                dual = false; // MSAA samples can stay on chip; transient replay below still applies.
+            } else if (uint64_t(w) * h <= 256u * 256u) {
+                gmem = false;
+                gmemWhy_ = "adaptive tiny target";
+            } else {
+                const uint32_t peak = queue_.peakDraws(kind, ordinal);
+                gmem = peak == 0 || peak >= gmemMinDraws_;
+                dual = gmem;
+                if (!gmem) gmemWhy_ = "adaptive recent light pass";
+            }
+        } else if (gmem && gmemMinDraws_ != 0) {
             // Both ways, unless this pass's like has had few draws for a while: then it is sysmem and recorded only so
             // (a light pass is most of CoreAnimation's, and recording each of its draws twice was 7.5 us a draw on the
             // phone). By the peak of its recent times, not the last: an animation's heavy passes come between light
@@ -2885,7 +3473,10 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
                 gmem = false;
                 gmemWhy_ = "its like had " + std::to_string(peak) + " draws at most lately";
             } else {
-                dual = true;
+                // (with a bar of 1 every pass that has a draw is drawn in GMEM: its sysmem recording is never taken, and
+                // recording each draw twice was 83% of a draw's encoding on the host, 34-43 us against 19-29 a draw on
+                // the phone under metal_gmem_draws=1, v22a/v25 against v21)
+                dual = gmemMinDraws_ > 1;
             }
         } else if (gmem && tuning_) {
             // (by what the pass draws into, not where: the plug-in draws into a fresh copy of a surface each frame; and by
@@ -2900,8 +3491,68 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
             gmem = queue_.preferGmem(tuneKey);
         }
     }
+    // An attachment discarded at the end still belongs to every draw of this Metal
+    // pass. If a later draw cannot run in tiles (MSAA framebuffer fetch, for example),
+    // closing the tiled prefix loses its Clear, colour, depth and stencil: none of
+    // those samples were stored. Keep a sysmem recording from the ORIGINAL load
+    // actions so the entire pass can change mode together. Stored single-sample
+    // colour passes can still split, since their tile stores preserve the prefix.
+    if (gmem && !joins) {
+        bool transient = pass.depth != nullptr || pass.stencil != nullptr;
+        for (uint32_t i = 0; i < kMaxColorOutputs; i++) {
+            const render::Attachment a = render::attachmentOf(pass, i);
+            transient |= a.texture != nullptr && a.store == StoreAction::kDontCare;
+        }
+        dual = dual || transient;
+    }
+    // Chained passes (render.hpp): a sysmem pass after one that ended with the light tail opens without the batch start
+    // -- unless its attachments are memory another of the CCU's caches (or a stage, through the UCHE) still holds
+    // written: then after the full tail, as every pass opened before. One whose first draw samples what the chain wrote
+    // stays chained and gets encodeBarrier before that draw, as a draw joining a pass does (turnip's barrier for colour
+    // written then sampled; the full tail and batch start there were 60% of CoreAnimation's passes, v15)
+    bool chained = false;
+    if (!joins && chainTable_ != 0) {
+        bool cross = false;
+        auto against = [&](const Texture* t, uint8_t others) {
+            if (t == nullptr) return;
+            const auto [lo, hi] = spanOf(*t);
+            cross = cross || overlaps(dirty_, lo, hi, others);
+        };
+        against(pass.color0, kDepth | kShader);
+        for (const ColorAttachment& a : pass.more) against(a.texture, kDepth | kShader);
+        against(pass.depth, kColour | kShader);
+        against(pass.stencil, kColour | kShader);
+        if (((gmem || dual) && raw) || cross || passWfi_) {
+            flushChain();
+            raw = false;
+        } else {
+            chained = true;
+        }
+    }
+    // v29i (P1): CoreAnimation's attachment_clear_frag quad, when the 2D engine's fill can write what it would have
+    // (render::clearQuadFillMask: the same pixels, the same (0,0,0,0)) -- 1.7 to 3 ms a full-screen clear saved
+    // (work/v29i/INVESTIGATION-anim-gpu-cost.md, IMPL-clearquad-fill.md). Only the pass's FIRST draw, in sysmem, nothing
+    // drawn before it that the fill would cover or leave; and only out of a pass that was not chained, so that the pass
+    // before it ended with a full tail and its colour left the CCU, which a later flush of that could not then write
+    // over the 2D engine's fill with. CLEAR_FILL is what the head fills; the draw itself is left out.
+    uint32_t clearFill = 0;
+    bool clearQuadFill = false;
+    if (!joins && !chained && !gmem && !dual && render::clearQuadFillMask(program, pass, d, *vsb, &clearFill, nullptr)) {
+        clearQuadFill = true;
+    }
     Piece passTable;
-    pm4::Stream head, body, headSys, bodySys;
+    // The four streams the draw is encoded into, reused from the last draw (CommandBuffer's: a fresh `body` allocated
+    // and freed its way up to 350-600 words a draw). Cleared here; the room they grew into stays.
+    pm4::Stream& head = drawHead_;
+    pm4::Stream& body = drawBody_;
+    pm4::Stream& headSys = drawHeadSys_;
+    pm4::Stream& bodySys = drawBodySys_;
+    head.clear();
+    body.clear();
+    headSys.clear();
+    bodySys.clear();
+    if (head.capacity() < 384) head.reserve(384);
+    if (body.capacity() < 768) body.reserve(768);
     if (!joins) {
         if (!piece(render::kTableBytes, &passTable, &why)) {
             return fail(std::string("no memory for the pass's table: ") + why);
@@ -2913,12 +3564,28 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
                 const double* cc = i == 0 ? pass.clearColor : pass.more[i - 1].clearColor;
                 if (t != nullptr && la == LoadAction::kClear && render::gmemClearWords(t->info(), cc, gmemClearWords_[i])) gmemClears_ |= 1u << i;
             }
+            // (gmemPlan took the depth and the stencil only cleared or undefined: a Clear is the tile's)
+            if (pass.depth != nullptr && pass.depthLoad == LoadAction::kClear) {
+                const double d = std::min(1.0, std::max(0.0, pass.clearDepth));
+                gmemZsWords_[0] = pass.depth->format() == PixelFormat::kDepth16Unorm ? uint32_t(std::lround(d * 65535.0)) : a6xx::fui(float(pass.clearDepth));
+                gmemClears_ |= render::kSkipDepthClear;
+            }
+            if (pass.stencil != nullptr && pass.stencilLoad == LoadAction::kClear) {
+                gmemZsWords_[1] = pass.clearStencil & 0xffu;
+                gmemClears_ |= render::kSkipStencilClear;
+            }
         }
-        if (!render::encodeBegin(head, pass, passTable.gpuAddress(), passTable.contents(), &why, options, gmemClears_) ||
-            (dual && !render::encodeBegin(headSys, pass, passTable.gpuAddress(), passTable.contents(), &why, options))) {
+        // (a clear quad's fill takes the place of the pass's own Clear on the attachments it covers too: the two would
+        // otherwise share a flush word, and the second wait would find the first one's value already there -- the reason
+        // kTableMoreClearFlushAt gives each attachment a word of its own)
+        if (!render::encodeBegin(head, pass, passTable.gpuAddress(), passTable.contents(), &why, chained ? render::lightHeadOptions(options) : options,
+                                 gmemClears_ | (clearQuadFill ? clearFill : 0u)) ||
+            (dual && !render::encodeBegin(headSys, pass, passTable.gpuAddress(), passTable.contents(), &why, chained ? render::lightHeadOptions(options) : options))) {
             gmemClears_ = 0;
             return refuseWork(why);
         }
+        // the clear quad's fill: after the pass begin's words, before any draw's state, as a Clear's own fill goes
+        if (clearQuadFill && clearFill != 0) render::encodeClearFill(head, pass, clearFill, passTable.gpuAddress());
     }
     render::Options encodeOptions = options;
     // The state a draw's program and pass alone decide (render::Options' zsNone, mrt, msaaOff, renderCntl, lrzOff, vpc,
@@ -2926,30 +3593,104 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
     // sample count and options are the last draw's in this pass: deduplication dropped every word of it anyway, and
     // making the words was most of a draw's encoding (some 190 of its 350). Not after a packet that made the
     // deduplication forget what the registers hold (staticKey emptied then).
-    std::vector<uint8_t> staticKey;
+    // ...and the key itself, fixed size (command.hpp: StaticKey): no std::string, no malloc, no 320-byte hash a draw.
+    static_assert(StaticKey::kMax >= 2 * sizeof(const void*) + 3 * sizeof(uint32_t) + 2 * sizeof(uint64_t) +
+                                           sizeof program.blend + sizeof program.moreBlend + sizeof(encodeOptions) +
+                                           2 * (sizeof(uint64_t) + 3 * sizeof(uint32_t)),
+                  "StaticKey::kMax holds the fields a draw keys its pipeline by");
+    StaticKey staticKey;
     if (options.dedupRegs) {
+        auto add = [&](const void* p, size_t n) { memcpy(staticKey.bytes + staticKey.size, p, n); staticKey.size += uint32_t(n); };
         const void* ptrs[2] = {program.vs.k.words, program.fs.k.words};
         const uint32_t sizes[3] = {program.vs.k.numWords, program.fs.k.numWords, program.samples};
-        auto add = [&](const void* p, size_t n) { staticKey.insert(staticKey.end(), static_cast<const uint8_t*>(p), static_cast<const uint8_t*>(p) + n); };
         add(ptrs, sizeof ptrs);
         add(sizes, sizeof sizes);
+        add(&vsProgram, sizeof vsProgram); add(&fsProgram, sizeof fsProgram);
         add(&program.blend, sizeof program.blend);
         add(program.moreBlend, sizeof program.moreBlend);
         add(&encodeOptions, sizeof encodeOptions);
-        if (joins && !open_->staticKey.empty() && open_->staticKey == staticKey) {
+        for (const Bindings* b : {vsb, fsb}) {
+            add(&b->privateMemory.address, sizeof b->privateMemory.address);
+            add(&b->privateMemory.perFiber, sizeof b->privateMemory.perFiber);
+            add(&b->privateMemory.perSp, sizeof b->privateMemory.perSp);
+            add(&b->privateMemory.perWave, sizeof b->privateMemory.perWave);
+        }
+        if (joins && open_->staticKey.size != 0 && open_->staticKey == staticKey) {
             encodeOptions.zsNone = encodeOptions.mrt = encodeOptions.msaaOff = encodeOptions.renderCntl = encodeOptions.lrzOff = false;
             encodeOptions.vpc = encodeOptions.fsInputs = encodeOptions.fsOutputs = false;
+            // IBO descriptors still point into this draw's table, and need their configuration/load.
+            if (program.vs.k.numSsbos == 0 && program.fs.k.numSsbos == 0 &&
+                program.vs.k.numIbos == 0 && program.fs.k.numIbos == 0) {
+                encodeOptions.programConfig = false;
+                encodeOptions.shaderState = false;
+            }
         }
     }
     if (gmemOff_ & kGmemFetchBarrier) encodeOptions.fbReadOrdered = false;
     // (a binned pass's draws are skipped by the tiles they miss: USE_VISIBILITY, which an override of 1 ignores)
     if (gmem && (options.gmemBinning || gmemBinning_) && queue_.binningOk() && options.gmemBinningStage < 3) encodeOptions.visCullUse = true;
-    if (!render::encodeInPass(body, program, pass, d, *vsb, *fsb, vsProgram, fsProgram, table.gpuAddress(), table.contents(), &why, encodeOptions,
-                              gmem ? &plan : nullptr, joins && open_->lastFetched)) {
+    // --- v29i P1: is this fetch draw owed the sysmem CCU flush? -------------------------------------------------
+    // A fragment stage's [[color(n)]] fetch lowers to a sampled slot naming target n (compiler.cpp). The v29h
+    // WRITTEN/BARRIERED masks say which targets have been written since the last barrier that put them out of the
+    // CCU; a Clear in this pass's head is not in WRITTEN (a Clear is no draw), and a chained pass before this one
+    // left its colour in the CCU (DIRTY_, the promise its light tail made), so both are tracked beside them. A fetch
+    // with none of those reads memory the last barrier already filled; a fetch after a write by an earlier draw in
+    // this pass still pays (and the barrier's flush-before-invalidate order is unchanged). Off (the /var file):
+    // every fetch pays, as it did.
+    uint32_t fetchMask = 0;
+    for (uint32_t i = 0; i < program.fs.k.numTextureSlots && i < kMaxTextureSlots; i++) {
+        if (program.fs.k.textures[i].fbTarget != 0) fetchMask |= 1u << (program.fs.k.textures[i].fbTarget - 1u);
+    }
+    // (a fetch whose slot the kernel does not name a target for -- a hand-built stage -- is taken to read every target)
+    if (program.fs.fbRead && fetchMask == 0) fetchMask = ~0u;
+    uint32_t fbCleared = 0;
+    bool fbCrossDirty = false;
+    // a stage of this pass may have written the fetched target's memory (a storage image or a device buffer): a hazard a
+    // CCU flush does not clean, so the barrier is kept when one may have (with a tail a pass, its draws' writes are not
+    // kept at all: kept there too)
+    bool fbShaderDirty = passWfi_;
+    if (joins) {
+        fbCleared = open_->fbCleared;
+        fbCrossDirty = open_->fbCrossDirty;
+        for (uint32_t i = 0; i < kMaxColorOutputs && !fbShaderDirty; i++) {
+            if (((fetchMask >> i) & 1) == 0) continue;
+            const render::Attachment a = render::attachmentOf(pass, i);
+            if (a.texture == nullptr) continue;
+            const auto [lo, hi] = spanOf(*a.texture);
+            for (const auto& [wlo, whi] : open_->shaderWrites) {
+                if (lo < whi && wlo < hi) {
+                    fbShaderDirty = true;
+                    break;
+                }
+            }
+        }
+    } else {
+        for (uint32_t i = 0; i < kMaxColorOutputs; i++) {
+            const render::Attachment a = render::attachmentOf(pass, i);
+            if (a.texture == nullptr) continue;
+            if (a.load == LoadAction::kClear) fbCleared |= 1u << i;
+            const auto [lo, hi] = spanOf(*a.texture);
+            fbCrossDirty = fbCrossDirty || overlaps(dirty_, lo, hi, kColour | kDepth | kShader);
+        }
+    }
+    const bool fbBarrierOwed = !fbReadDedupeOn() || !program.fs.fbRead || fbCrossDirty || fbShaderDirty ||
+        ((joins ? open_->written & ~open_->barriered : 0u) & fetchMask) != 0 || (fbCleared & fetchMask) != 0;
+    // a sysmem recording's barrier (a dual pass's sysmem body too) puts every write before it out of the CCU; a pure
+    // GMEM pass's only drops the texture caches, so it leaves this tracking alone
+    const bool sysFetchBarrier = program.fs.fbRead && encodeOptions.fbReadBarrier && fbBarrierOwed && (!gmem || dual);
+    render::PipelineState* pipeline = options.dedupRegs ? &pipelineStates_[staticKey] : nullptr;
+    render::DrawState firstState, firstSysState;
+    render::DrawState* state = options.dedupRegs ? (joins ? &open_->state : &firstState) : nullptr;
+    render::DrawState* sysState = options.dedupRegs ? (joins ? &open_->sysState : &firstSysState) : nullptr;
+    // (a clear quad the fill stands in for is not encoded at all: its state is neither written into the pass nor kept in
+    // the pipeline and deduplication shadows, which then say what the head wrote -- nothing of this draw -- so the next
+    // draw emits its own full state)
+    if (!clearQuadFill && !render::encodeInPass(body, program, pass, d, *vsb, *fsb, vsProgram, fsProgram, table.gpuAddress(), table.contents(), &why, encodeOptions,
+                              gmem ? &plan : nullptr, joins && open_->lastFetched, pipeline, state, fbBarrierOwed)) {
         gmemClears_ = 0;
         return refuseWork(why);
     }
-    if (dual) {
+    if (dual && !clearQuadFill) {
         // the same draw for sysmem: its table the same words but for a fetch's descriptor, which reads memory there
         Piece sysTable = table;
         if (program.fs.fbRead && !piece(render::kTableBytes, &sysTable, &why)) {
@@ -2959,18 +3700,48 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
         render::Options sysOptions = encodeOptions;
         sysOptions.visCullUse = options.visCullUse;
         if (!render::encodeInPass(bodySys, program, pass, d, *vsb, *fsb, vsProgram, fsProgram, sysTable.gpuAddress(), sysTable.contents(), &why,
-                                  sysOptions, nullptr, joins && open_->lastFetched)) {
+                                  sysOptions, nullptr, joins && open_->lastFetched, pipeline, sysState, fbBarrierOwed)) {
             gmemClears_ = 0;
             return refuseWork(why);
         }
     }
     if (!joins) {
+        if (chained) {
+            counts_.chained++;
+            // write after read: a pass that writes what a draw since the last wait for idle sampled waits for those reads
+            bool war = false;
+            for (const Texture* t : {pass.color0, pass.depth, pass.stencil}) {
+                if (t != nullptr) war = war || overlaps(reads_, spanOf(*t).first, spanOf(*t).second, 0xff);
+            }
+            for (const ColorAttachment& a : pass.more) {
+                if (a.texture != nullptr) war = war || overlaps(reads_, spanOf(*a.texture).first, spanOf(*a.texture).second, 0xff);
+            }
+            if (war) {
+                stream_.waitForIdle();
+                reads_.clear();
+                counts_.waits++;
+            }
+        }
         {
             const Texture* first = pass.color0 != nullptr ? pass.color0 : pass.depth;
             const size_t stamped = profiled_.size();
             stampStart(kPassDraw, first ? first->width() : 0, first ? first->height() : 0);
             if (profiled_.size() > stamped) {
-                profiled_.back().tuneKey = tuneKey;
+                auto& timing = profiled_.back();
+                timing.tuneKey = tuneKey;
+                timing.attachedFmt = render::attachedFormats(pass, &timing.attached);
+                for (uint32_t i = 0; i < kMaxColorOutputs; i++) {
+                    const auto a = render::attachmentOf(pass, i);
+                    if (a.texture == nullptr) continue;
+                    if (a.load == LoadAction::kLoad) timing.loads |= 1u << i;
+                    if (a.load == LoadAction::kClear) {
+                        timing.clears |= 1u << i;
+                        a.texture->markWritten();   // (v29i D1: the pass's own Clear is a write)
+                    }
+                    if (a.store != StoreAction::kDontCare) timing.stores |= 1u << i;
+                }
+                // (v29i D1: which surface the pass draws into -- CoreAnimation's two frame surfaces are 3 and 4 in the log)
+                timing.targetSurface = pass.color0 != nullptr ? pass.color0->surface() : 0;
                 // (why not GMEM, pass by pass: the last reason alone named whichever pass came last, and the heavy
                 // full-screen pass of SpringBoard's "home" stayed in sysmem without its reason ever being seen)
                 if (!gmem) {
@@ -2983,6 +3754,8 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
         }
         open_ = std::make_unique<OpenPass>();
         open_->pass = pass;
+        open_->state = std::move(firstState);
+        open_->sysState = std::move(firstSysState);
         open_->options = options;
         open_->table = passTable.gpuAddress();
         if (dual) {
@@ -2998,29 +3771,91 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
         open_->plan = plan;
         open_->clears = gmemClears_;
         memcpy(open_->clearWords, gmemClearWords_, sizeof open_->clearWords);
+        memcpy(open_->zsWords, gmemZsWords_, sizeof open_->zsWords);
         gmemClears_ = 0;
         open_->kind = kind;
         open_->ordinal = ordinal;
+        // (a head's Clear and a chained predecessor's colour still in the CCU: what this pass's first fetch draw owes a
+        //  flush for, unless this very draw's barrier above already put them out)
+        open_->fbCleared = sysFetchBarrier ? 0u : fbCleared;
+        open_->fbCrossDirty = sysFetchBarrier ? false : fbCrossDirty;
         useAttachments(pass);
         counts_.passes++;
     }
     if (open_->gmem) {
         uint32_t a[4];
         if (render::drawArea(pass, d, a)) {
+            open_->coveredPixels += uint64_t(a[2] - a[0] + 1) * (a[3] - a[1] + 1);
             open_->area[0] = std::min(open_->area[0], a[0]);
             open_->area[1] = std::min(open_->area[1], a[1]);
             open_->area[2] = std::max(open_->area[2], a[2]);
             open_->area[3] = std::max(open_->area[3], a[3]);
         }
-        open_->written |= render::drawnAttachments(program, pass);
         for (uint32_t i = 0; i < kMaxTextureSlots && i < program.fs.k.numTextureSlots; i++) {
             if (program.fs.k.textures[i].fbTarget != 0) open_->read |= 1u << (program.fs.k.textures[i].fbTarget - 1u);
         }
     }
+    // (the attachments this pass has drawn into, for each of them a sysmem pass yields to a texture sampling its BO:
+    // the hazard above. A GMEM pass keeps it too, for the tiles' loads and stores)
+    // ...and what a barrier emitted below (before this draw's own PM4) has flushed: only what was written BEFORE it.
+    const uint32_t hadWritten = open_->written;
+    const uint32_t drawn = render::drawnAttachments(program, pass);
+    // (v29i D1: what this draw writes is written from here on, whether or not a later one samples it)
+    for (uint32_t i = 0; drawn != 0 && i < kMaxColorOutputs; i++) {
+        if ((drawn >> i) & 1) {
+            const render::Attachment a = render::attachmentOf(pass, i);
+            if (a.texture != nullptr) a.texture->markWritten();
+        }
+    }
+    open_->written |= drawn;
     open_->lastFetched = program.fs.fbRead != 0;
     open_->draws++;
+    // the fetch barrier encoded above (in the draw's own body, before its PM4) flushed the whole colour CCU: what the
+    // pass wrote before this draw is out of it, and neither a head's Clear nor a chained predecessor's colour is left
+    if (sysFetchBarrier) {
+        open_->barriered = hadWritten;
+        open_->fbCleared = 0;
+        open_->fbCrossDirty = false;
+        counts_.fetchBarriers++;
+    }
+    if (raw) {
+        // it samples what a chained pass before this one (or before this pass) wrote: that memory out of the CCU and the
+        // texture cache dropped
+        Piece words;
+        if (!piece(render::kBarrierBytes, &words, &why)) {
+            return fail(std::string("no memory for a barrier's words: ") + why);
+        }
+        std::memset(words.contents(), 0, render::kBarrierBytes);
+        render::encodeBarrier(stream_, words.gpuAddress(), chainDepth_);
+        dirty_.clear();
+        reads_.clear();
+        counts_.barriers++;
+        // what the barrier put out is in memory now: the attachments written before it, not this draw's (its PM4 comes
+        // after the barrier, so its pixels are still in the CCU)
+        open_->barriered = hadWritten;
+        open_->fbCleared = 0;
+        open_->fbCrossDirty = false;
+        if (inPassRaw && (profile_ || tuning_) && !profiled_.empty()) profiled_.back().inPassBarriers++;
+    }
+    // this draw's outputs are in the CCU whatever a barrier above has flushed (it sampled what was there, then wrote
+    // over it): owed a barrier again until the next one
+    open_->barriered &= ~drawn;
+    if (!passWfi_) {
+        for (uint32_t i = 0; i < numReads; i++) addSpan(&reads_, reads[i].first, reads[i].second, kColour);
+        // what its stages may write (device buffers, storage images, a visibility result): dirty once the pass ends, as
+        // its attachments -- every buffer bound to a stage with device buffers, every texture bound as an image
+        for (const auto& [b, k] : {std::pair<const Bindings*, const Kernel*>{vsb, &program.vs.k}, {fsb, &program.fs.k}}) {
+            for (const Binding& x : b->buffers) {
+                if (x.buffer != nullptr && k->numSsbos != 0) open_->shaderWrites.push_back(spanOf(*x.buffer));
+            }
+            for (uint32_t i = 0; i < b->textures.size() && i < kMaxTextureSlots && i < k->numTextureSlots; i++) {
+                if (b->textures[i] != nullptr && k->textures[i].kind == kTexImage) open_->shaderWrites.push_back(spanOf(*b->textures[i]));
+            }
+        }
+        if (d.visibilityMode != 0 && d.visibility != nullptr) open_->shaderWrites.push_back(spanOf(*d.visibility));
+    }
     pm4::Stream& into = open_->gmem ? open_->bodies : stream_;
-    const bool timed = profileDraws_ && !open_->gmem && drawsProfiled_.size() < kMaxProfiledDraws;
+    const bool timed = profileDraws_ && !open_->gmem && !clearQuadFill && drawsProfiled_.size() < kMaxProfiledDraws;
     if (timed) {
         DrawTime dt{program.name != nullptr ? program.name : "?", 0};
         dt.name += " fs:" + std::to_string(program.fs.k.numWords) + "w v:" + std::to_string(d.vertexCount) + (program.blend.enabled ? " blend" : "");   // (which variant: one function's pipelines differ by their constants)
@@ -3042,19 +3877,79 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
         dt.pass = profiled_.empty() ? 0 : uint32_t(profiled_.size() - 1);
         render::drawArea(pass, d, dt.area);
         drawsProfiled_.push_back(dt);
-        drawStamp(uint32_t(2 * (drawsProfiled_.size() - 1)));
+        {
+            const uint32_t slot = uint32_t(2 * (drawsProfiled_.size() - 1));
+            drawsProfiled_.back().stampSlot = slot;
+            drawsProfiled_.back().stampBuffer = drawStamp(slot);
+        }
     }
-    if (options.dedupRegs && open_->options.dedupRegs) {
+    if (clearQuadFill) {
+        // (the draw the head's fill stands in for: no body goes into the pass. The pipeline and deduplication shadows are
+        // the head's alone, so the pass's next draw emits its own full state)
+    } else if (options.dedupRegs && open_->options.dedupRegs) {
         bool forgot = appendDeduped(into, body, open_->gmem ? open_->bodyRegs : open_->regs);
         if (open_->dual) forgot = appendDeduped(open_->sysStream, bodySys, open_->regs) || forgot;
-        open_->staticKey = forgot ? std::vector<uint8_t>() : std::move(staticKey);
+        open_->staticKey = forgot ? StaticKey{} : staticKey;
+        if (forgot) { open_->state = {}; open_->sysState = {}; }
     } else {
         appendStream(into, body);
         if (open_->dual) appendStream(open_->sysStream, bodySys);
     }
     if (timed) drawStamp(uint32_t(2 * (drawsProfiled_.size() - 1) + 1));
     counts_.draws++;
-    if ((profile_ || tuning_) && !profiled_.empty()) profiled_.back().draws++;
+    if ((profile_ || tuning_) && !profiled_.empty()) {
+        auto& t = profiled_.back();
+        t.draws++;
+        const std::string name = program.name != nullptr ? program.name : "?";
+        if (std::find(t.shaders.begin(), t.shaders.end(), name) == t.shaders.end()) t.shaders.push_back(name);
+        t.samples = program.samples;
+        t.fetchDraws += program.fs.fbRead != 0 ? 1u : 0u;
+        // v29i (P4): CoreAnimation's attachment_clear_frag -- the full-target clear quad drawn once a pass is open and
+        // LoadAction::kClear is no longer available. Counted here (no line of its own), summed into pass-v29d, so the
+        // next run says whether the heavy pass family's cost is those whole-target writes.
+        const bool clearQuad = name.find("attachment_clear_frag") != std::string::npos;
+        if (clearQuad) {
+            uint32_t a[4];
+            const uint64_t px = render::drawArea(pass, d, a) ? uint64_t(a[2] - a[0] + 1) * (a[3] - a[1] + 1) : 0;
+            const auto [w, h] = render::windowOf(pass);
+            t.clearQuadDraws++;
+            t.clearQuadPixels += px;
+            if (px != 0 && px >= uint64_t(w) * h) t.clearQuadFull++;
+            // (v29i P1: of those, the ones the 2D engine's fill wrote instead, and the ones it did not take -- a quad after
+            // an earlier draw of its pass, a target the fill cannot pack, a rectangle that does not cover it)
+            if (clearQuadFill) {
+                t.clearQuadFills++;
+            } else {
+                t.clearQuadFallbacks++;
+            }
+        }
+        // v29i (D1): the row bands this draw covers (its viewport and scissor within the pass's window), and what it
+        // samples that no write has reached. Bit tests and counters only: no readback, no per-frame line.
+        {
+            uint32_t a[4];
+            const auto [w, h] = render::windowOf(pass);
+            if (h != 0 && render::drawArea(pass, d, a)) {
+                const uint32_t b0 = uint32_t(uint64_t(a[1]) * 16 / h), b1 = std::min(15u, uint32_t(uint64_t(a[3]) * 16 / h));
+                uint16_t mask = 0;
+                for (uint32_t b = b0; b <= b1; b++) mask |= uint16_t(1u << b);
+                t.bands |= mask;
+                if (!clearQuad) t.bandsNoClear |= mask;   // (drawArea reads a clear quad's area as the whole target)
+            }
+            bool never = false;
+            for (const Bindings* b : {vsb, fsb}) {
+                for (size_t i = 0; i < b->textures.size(); i++) {
+                    const Texture* tex = b->textures[i];
+                    if (tex == nullptr || ((b->nullMask >> i) & 1) || tex->everWritten()) continue;
+                    never = true;
+                    if (t.neverWrittenCount < 3) {
+                        PassTime::Sampled& e = t.neverWritten[t.neverWrittenCount++];
+                        e.width = tex->width(), e.height = tex->height(), e.surface = tex->surface(), e.id = tex->resourceId();
+                    }
+                }
+            }
+            if (never) t.neverWrittenDraws++;
+        }
+    }
     // a stage with device buffers may write them (ldib's table is stib's): its whole table is used for writing
     for (const auto& [b, writes] : {std::pair<const Bindings*, bool>{vsb, program.vs.k.numSsbos != 0}, {fsb, program.fs.k.numSsbos != 0}}) {
         for (const Binding& x : b->buffers) {
@@ -3081,6 +3976,7 @@ bool CommandBuffer::draw(const Program& program, const RenderPass& pass, const D
             }
         }
     }
+    if (encodeStart) counts_.encodeNs += hm_perf_clock(CLOCK_MONOTONIC) - encodeStart;
     return true;
 }
 
@@ -3115,6 +4011,23 @@ bool CommandBuffer::blitInto(const Texture& src, uint32_t srcLevel, render::Blit
                              const render::Options& options) {
     if (status_ > kEnqueued) {
         return fail("blit after commit");
+    }
+    // A multisample attachment's resolve right after its pass's draws (Metal's MultisampleResolve, HakiosMetalCA.m's
+    // -endEncoding): handed to the pass, which does it from its tiles when it is drawn in GMEM -- the samples then never
+    // reach memory -- and by this same blit after it otherwise (closePass)
+    if (open_ != nullptr && (open_->gmem || open_->dual) && src.samples() > 1 && srcLevel == 0 && !linear && s.x == 0 && s.y == 0 && d.x == 0 &&
+        d.y == 0 && s.w == src.width() && s.h == src.height() && d.w == s.w && d.h == s.h) {
+        for (uint32_t i = 0; i < kMaxColorOutputs; i++) {
+            const render::Attachment a = render::attachmentOf(open_->pass, i);
+            std::string no;
+            if (a.texture != &src || a.level != 0 || open_->resolve[i] != nullptr || !render::gmemResolveOk(src, dst, dstLevel, &no)) continue;
+            open_->resolve[i] = &dst;
+            open_->resolveLevel[i] = dstLevel;
+            dst.markWritten();   // (v29i D1)
+            use(*dst.buffer(), true);
+            keep(dst.buffer());
+            return true;
+        }
     }
     closePass();   // the copy reads what the draws before it wrote: their pass's tail first
     std::string why;
@@ -3155,6 +4068,7 @@ bool CommandBuffer::blitInto(const Texture& src, uint32_t srcLevel, render::Blit
     stampEnd();
     use(*src.buffer(), false);
     use(*dst.buffer(), true);
+    dst.markWritten();   // (v29i D1: a copy's destination is written)
     keep(src.buffer());
     keep(dst.buffer());
     return true;
@@ -3193,7 +4107,7 @@ bool CommandBuffer::generateMipmaps(const Texture& t, const render::Options& opt
 
 // every attachment of a pass, used for writing and kept until completion
 void CommandBuffer::useAttachments(const RenderPass& pass) {
-    for (const Texture* t : {pass.color0, pass.depth}) {
+    for (const Texture* t : {pass.color0, pass.depth, pass.stencil}) {
         if (t == nullptr) continue;
         use(*t->buffer(), true);
         keep(t->buffer());
@@ -3217,11 +4131,17 @@ bool CommandBuffer::append(CommandBuffer& other) {
     other.closePass();
     appendStream(stream_, other.stream_);
     other.stream_ = pm4::Stream{};
-    uses_.insert(uses_.end(), other.uses_.begin(), other.uses_.end());
-    kept_.insert(kept_.end(), other.kept_.begin(), other.kept_.end());
+    for (const BoUse& u : other.uses_) {
+        const uint8_t bit = u.write ? 2 : 1;
+        uint8_t& seen = usedBos_[u.bo];
+        if (!(seen & bit)) { seen |= bit; uses_.push_back(u); }
+    }
+    for (const auto& b : other.kept_) keep(b);
     keptAny_.insert(keptAny_.end(), other.keptAny_.begin(), other.keptAny_.end());
     other.uses_.clear();
+    other.usedBos_.clear();
     other.kept_.clear();
+    other.keptBuffers_.clear();
     other.keptAny_.clear();
     counts_.passes += other.counts_.passes;
     counts_.draws += other.counts_.draws;
@@ -3231,24 +4151,107 @@ bool CommandBuffer::append(CommandBuffer& other) {
     counts_.gmemPasses += other.counts_.gmemPasses;
     counts_.binnedPasses += other.counts_.binnedPasses;
     counts_.tiles += other.counts_.tiles;
+    counts_.flushes += other.counts_.flushes;
+    counts_.barriers += other.counts_.barriers;
+    counts_.waits += other.counts_.waits;
+    counts_.fetchBarriers += other.counts_.fetchBarriers;
+    counts_.chained += other.counts_.chained;
+    counts_.sysmemPasses += other.counts_.sysmemPasses;
+    counts_.encodeNs += other.counts_.encodeNs;
+    // What OTHER timed is this buffer's work too, stamps and all: its stamp buffers' addresses went into the stream that
+    // just came over, so each entry keeps its own buffer (a parallel render encoder's sub-encoders are the buffers Maps
+    // records its passes into; without this a parent's summary named no pass at all). The child's passes come after this
+    // buffer's own, so its local pass numbers move by the count this buffer has recorded so far: a draw of a sub-encoder
+    // then names its place in the merged passTimes() (and a child that timed no pass names none, rather than this
+    // buffer's first).
+    const uint32_t passBase = uint32_t(profiled_.size());
+    const bool childPasses = !other.profiled_.empty();
+    for (PassTime& t : other.profiled_) profiled_.push_back(std::move(t));
+    for (auto& b : other.ownProfileStamps_) profileStamps_.push_back(std::move(b));
+    for (auto& b : other.profileStamps_) profileStamps_.push_back(std::move(b));
+    for (DrawTime& d : other.drawsProfiled_) {
+        if (d.pass != ~0u) d.pass = childPasses ? d.pass + passBase : ~0u;   // (a nested merge's "no pass" stays one)
+        drawsProfiled_.push_back(std::move(d));
+    }
+    for (auto& b : other.drawStampBuffers_) drawStampBuffers_.push_back(std::move(b));
+    other.drawStamps_.reset();   // (the buffer it names is in drawStampBuffers_, moved above)
+    other.profiled_.clear();
+    other.ownProfileStamps_.clear();
+    other.profileStamps_.clear();
+    other.drawsProfiled_.clear();
+    other.drawStampBuffers_.clear();
+    // the refused work too: its count is the frame's (the plug-in's refusal summary reads it), and a reason this buffer
+    // has none of its own
+    skipped_ += other.skipped_;
+    if (lastSkipped_.empty()) lastSkipped_ = std::move(other.lastSkipped_);
+    other.skipped_ = 0;
+    other.lastSkipped_.clear();
     other.counts_ = Counts{};
     return true;
 }
 
-void CommandBuffer::closePass() {
+void CommandBuffer::addSpan(std::vector<Span>* v, uint64_t lo, uint64_t hi, uint8_t kind) {
+    for (Span& s : *v) {
+        if (s.lo == lo && s.hi == hi) {
+            s.kind |= kind;
+            return;
+        }
+    }
+    v->push_back(Span{lo, hi, kind});
+}
+
+bool CommandBuffer::overlaps(const std::vector<Span>& v, uint64_t lo, uint64_t hi, uint8_t kinds) {
+    for (const Span& s : v) {
+        if ((s.kind & kinds) != 0 && lo < s.hi && s.lo < hi) return true;
+    }
+    return false;
+}
+
+void CommandBuffer::flushChain() {
+    if (chainTable_ == 0) {
+        return;
+    }
+    pm4::Stream tail;
+    render::encodeTail(tail, chainTable_, chainOptions_, chainDepth_);
+    appendStream(stream_, tail);
+    chainTable_ = 0;
+    chainDepth_ = false;
+    dirty_.clear();
+    reads_.clear();
+    counts_.flushes++;
+}
+
+void CommandBuffer::closePass(bool chain) {
+    closeOpenPass(chain);
+    // the resolves a pass that ended in sysmem was handed (blitInto): the 2D engine's, after its tail, as they always were
+    std::vector<PendingResolve> after;
+    after.swap(pendingResolves_);
+    for (const PendingResolve& r : after) {
+        const render::BlitRect all{0, 0, r.src->width(), r.src->height()};
+        if (!blitInto(*r.src, 0, all, *r.dst, r.level, all, false, r.options)) return;
+    }
+}
+
+void CommandBuffer::closeOpenPass(bool chain) {
     if (open_ == nullptr) {
+        if (!chain) flushChain();
         return;
     }
     if (open_->kind != 0) queue_.noteDraws(open_->kind, open_->ordinal, open_->draws);
     if (open_->dual) {
         // recorded both ways: tiles for a pass of enough draws, else the sysmem words, head and all
-        if (open_->draws >= gmemMinDraws_) {
+        const auto [w, h] = render::windowOf(open_->pass);
+        const bool useGmem = adaptive_ ? open_->plan.samples > 1 ||
+            (open_->draws >= gmemMinDraws_ && open_->coveredPixels >= 2ull * w * h)
+            : open_->draws >= gmemMinDraws_;
+        if (useGmem) {
             appendStream(stream_, open_->headGmem);
         } else {
             appendStream(stream_, open_->sysStream);
             open_->gmem = false;
             if ((profile_ || tuning_) && !profiled_.empty()) {
-                profiled_.back().sysmemWhy = std::to_string(open_->draws) + " draws, fewer than metal_gmem_draws=" + std::to_string(gmemMinDraws_);
+                profiled_.back().sysmemWhy = adaptive_ ? "adaptive: " + std::to_string(open_->draws) + " draws, " + std::to_string(open_->coveredPixels) + " covered pixels"
+                    : std::to_string(open_->draws) + " draws, fewer than metal_gmem_draws=" + std::to_string(gmemMinDraws_);
             }
         }
         open_->dual = false;
@@ -3270,11 +4273,15 @@ void CommandBuffer::closePass() {
         // rows of the next layer or level; CoreAnimation's second screen, DontCare, is 2436 rows, a multiple of 4).
         render::GmemPlan plan = open_->plan;
         const auto [W, H] = render::windowOf(open_->pass);
+        const bool binned = (open_->options.gmemBinning || gmemBinning_) && queue_.binningOk();
         // (a Clear in the tiles clears what they cover: a pass that clears so is tiled over the whole window, as the
         // fill it stands in for covers it -- over the draws' area alone the rest kept its old pixels, probe "a Clear in
         // the tiles": 1224468 of them)
+        // Binned, the grid starts at the window's corner, as both of Mesa's a6xx drivers always start it (turnip's tile
+        // tx at tile0.width * tx; freedreno_gmem.c: "on a6xx" minx = miny = 0): the VSC numbers its bins from there
         if (open_->area[0] <= open_->area[2] && open_->area[1] <= open_->area[3] && !(gmemOff_ & kGmemWholeArea) && open_->clears == 0) {
-            render::gmemTiles(&plan, open_->area);
+            const uint32_t area[4] = {binned ? 0u : open_->area[0], binned ? 0u : open_->area[1], open_->area[2], open_->area[3]};
+            render::gmemTiles(&plan, area);
         }
         // (past the right edge the granules land in the row's own padding, which gmemPlan saw the pitch hold; only the
         // rows past the bottom may be another layer's or level's)
@@ -3288,11 +4295,13 @@ void CommandBuffer::closePass() {
             if (t == nullptr || (!every && !cleared && (((open_->written | open_->read) >> i) & 1) == 0)) continue;
             const LoadAction la = i == 0 ? open_->pass.load : open_->pass.more[i - 1].load;
             const StoreAction sa = i == 0 ? open_->pass.store : open_->pass.more[i - 1].store;
+            // (a multisample attachment's samples are the tile's alone: gmemPlan took it neither loaded nor stored)
+            if (t->samples() != 1) continue;
             if (!cleared && (every || !(la == LoadAction::kDontCare && inside))) load |= 1u << i;
             if ((every || cleared || ((open_->written >> i) & 1)) && sa != StoreAction::kDontCare) store |= 1u << i;
         }
         uint64_t vsc = 0;
-        if ((open_->options.gmemBinning || gmemBinning_) && queue_.binningOk()) {
+        if (binned) {
             std::shared_ptr<Buffer> v = queue_.vscBuffer(&why);
             if (v == nullptr) {
                 open_.reset();
@@ -3303,26 +4312,100 @@ void CommandBuffer::closePass() {
             keep(v);
             vsc = v->gpuAddress();
         }
+        render::GmemTileWork work;
+        work.fetchBarrierInBody = open_->options.fbReadBarrier;
+        work.zsClear = (open_->clears & render::kSkipDepthClear ? 1u : 0u) | (open_->clears & render::kSkipStencilClear ? 2u : 0u);
+        work.depthWord = open_->zsWords[0];
+        work.stencilWord = open_->zsWords[1];
+        for (uint32_t i = 0; i < kMaxColorOutputs; i++) {
+            work.resolve[i] = open_->resolve[i];
+            work.resolveLevel[i] = open_->resolveLevel[i];
+        }
+        if (std::shared_ptr<Buffer> t = queue_.gmemTrace(&why)) {
+            use(*t, true);
+            keep(t);
+            work.trace = t->gpuAddress();
+            work.traceTag = ++gmemTraceTag_;
+        }
         pm4::Stream tiles;
         render::encodeGmem(tiles, open_->pass, plan, ib.gpuAddress(), uint32_t(w.size()), open_->table, open_->options, load, store, open_->read != 0,
-                           open_->clears, open_->clearWords, vsc);
+                           open_->clears, open_->clearWords, vsc, &work);
+        for (uint32_t i = 0; i < kMaxColorOutputs; i++) {
+            if (open_->resolve[i] != nullptr && !passWfi_) {
+                const auto [lo, hi] = spanOf(*open_->resolve[i]);
+                addSpan(&dirty_, lo, hi, kColour);
+            }
+            open_->resolve[i] = nullptr;
+        }   // (done: none is left for a blit after the pass)
         appendStream(stream_, tiles);
         counts_.gmemPasses++;
         if (vsc != 0) counts_.binnedPasses++;
         counts_.tiles += plan.tiles();
         if ((profile_ || tuning_) && !profiled_.empty()) {
-            profiled_.back().tiles = plan.tiles();
+            auto& timing = profiled_.back();
+            timing.tiles = plan.tiles();
+            timing.loads = load; timing.stores = store; timing.clears = open_->clears;
+            for (const Texture* resolve : work.resolve) if (resolve != nullptr) timing.resolves += plan.tiles();
             uint8_t attached = 0;
             for (uint32_t i = 0; i < kMaxColorOutputs; i++) attached |= (i == 0 ? open_->pass.color0 : open_->pass.more[i - 1].texture) != nullptr ? 1u << i : 0u;
             profiled_.back().attached = attached;
             profiled_.back().touched = uint8_t(open_->written | open_->read);
         }
     }
+    for (uint32_t i = 0; i < kMaxColorOutputs; i++) {
+        if (open_->resolve[i] != nullptr) {
+            if ((profile_ || tuning_) && !profiled_.empty()) profiled_.back().resolves++;
+            pendingResolves_.push_back(PendingResolve{render::attachmentOf(open_->pass, i).texture, open_->resolve[i], open_->resolveLevel[i], open_->options});
+        }
+    }
+    if (!open_->gmem) {
+        counts_.sysmemPasses++;
+        // (the passive summary's touched mask for a sysmem pass: what its draws wrote and fetched, as a tile's is)
+        if ((profile_ || tuning_) && !profiled_.empty()) profiled_.back().touched = uint8_t(open_->written | open_->read);
+    }
+    // encodeGmem already resolves stores, invalidates both CCUs and waits before returning to
+    // sysmem mode. Its tail can join the same hazard chain; tile/fetch/bin-end waits stay intact.
+    if (chain && !passWfi_) {
+        // Chained (render.hpp): the light tail, what the pass wrote kept as dirty until a barrier or the full tail. The
+        // pass's table keeps its tail words unused, so the full tail can be written on it later.
+        pm4::Stream tail;
+        render::encodeLightTail(tail, open_->options);
+        appendStream(stream_, tail);
+        // CP_REG_TO_MEM is top-of-pipe. A chained sysmem pass has no full tail;
+        // profile its completed GPU work (tu_CmdWriteTimestamp2), not CP enqueue time.
+        if (profile_ && !open_->gmem) {
+            stream_.waitForIdle();
+            if (!profiled_.empty()) profiled_.back().profileWfis++;
+        }
+        stampEnd();
+        for (const Texture* t : {open_->pass.color0, open_->pass.depth, open_->pass.stencil}) {
+            if (t == nullptr) continue;
+            const auto [lo, hi] = spanOf(*t);
+            addSpan(&dirty_, lo, hi, t == open_->pass.color0 ? kColour : kDepth);
+        }
+        for (const ColorAttachment& a : open_->pass.more) {
+            if (a.texture == nullptr) continue;
+            const auto [lo, hi] = spanOf(*a.texture);
+            addSpan(&dirty_, lo, hi, kColour);
+        }
+        for (const auto& [lo, hi] : open_->shaderWrites) addSpan(&dirty_, lo, hi, kShader);
+        chainTable_ = open_->table;
+        chainDepth_ = chainDepth_ || open_->pass.depth != nullptr || open_->pass.stencil != nullptr;
+        chainOptions_ = open_->options;
+        open_.reset();
+        return;
+    }
+    // the full tail: the CCU flushes are of the whole cache, so they put out what the chained passes before it left there
     pm4::Stream tail;
-    render::encodeEnd(tail, open_->pass, open_->table, open_->options);
+    render::encodeTail(tail, open_->table, open_->options, open_->pass.depth != nullptr || open_->pass.stencil != nullptr || chainDepth_);
     appendStream(stream_, tail);
     stampEnd();
     open_.reset();
+    chainTable_ = 0;
+    chainDepth_ = false;
+    dirty_.clear();
+    reads_.clear();
+    counts_.flushes++;
 }
 
 bool CommandBuffer::clear(const RenderPass& pass, const render::Options& options) {

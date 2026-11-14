@@ -588,6 +588,16 @@ math_op(struct air_ctx *c, const struct air_inst *in, const struct air_name *n, 
       else
          r = lo ? nir_umin(&c->b, nir_umin(&c->b, a[0], a[1]), a[2])
                 : nir_umax(&c->b, nir_umax(&c->b, a[0], a[1]), a[2]);
+   } else if (is_float && (!strcmp(op, "fmedian3") || !strcmp(op, "fast_fmedian3"))) {
+      /* Metal median3: the middle value, componentwise at the input precision.
+       * Metal leaves the result undefined if any input is NaN; do not add an
+       * invented NaN-propagation rule. NIR's numeric min/max composition is a
+       * permitted answer there and selects an input exactly for ordered values.
+       * In particular this is not clamp(a,b,c): b and c need not be ordered.
+       */
+      nir_def *lo = nir_fmin(&c->b, a[0], a[1]);
+      nir_def *hi = nir_fmax(&c->b, a[0], a[1]);
+      r = nir_fmax(&c->b, lo, nir_fmin(&c->b, hi, a[2]));
    } else if (!strcmp(op, "fast_clamp") || !strcmp(op, "clamp")) {
       if (is_float)
          r = nir_fmin(&c->b, nir_fmax(&c->b, a[0], a[1]), a[2]);

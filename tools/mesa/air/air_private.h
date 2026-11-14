@@ -258,6 +258,10 @@ struct air_ctx {
       unsigned location;      /* gl_varying_slot or gl_frag_result */
       unsigned index;         /* dual-source index */
       nir_variable *var;
+      /* the output's air.function_constant predicate (a __metal_implicit_fc_pred_N
+       * global), or NULL: emit_return leaves the output unwritten when the
+       * pipeline's constants make it false */
+      const struct air_value *predicate;
    } *outputs;
 
    unsigned scratch_size;

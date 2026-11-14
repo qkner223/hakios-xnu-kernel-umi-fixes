@@ -2537,7 +2537,7 @@ int main(int argc, char** argv) {
         // 9j2h. ASTC HDR, sampled: the same four void-extent blocks with the HDR bit (bit 9) set, their colours FP16 --
         // 0.25, 0.5, 0.75 and 1.0 -- read as ASTC_4x4_HDR into an RGBA8 target. A texture unit that decodes HDR gives
         // 40 80 bf ff; one that decodes only LDR gives the error colour the specification prescribes for an HDR block in
-        // an LDR context, magenta ff 00 ff ff. Which of the two the A635 does decides whether HDR textures are served
+        // an LDR context, magenta ff 00 ff ff. Which of the two the A650 does decides whether HDR textures are served
         // by the hardware or have to be decoded by the processor.
         {
             uint8_t blocks[64];

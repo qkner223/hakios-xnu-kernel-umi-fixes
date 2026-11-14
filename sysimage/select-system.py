@@ -83,7 +83,7 @@ BIG_CATALOGS = ('System/Library/PrivateFrameworks/SFSymbols.framework/',)
 # (/Library is the wallpapers and a few tables of regional settings, apart from the sounds)
 HEALTH = 'System/Library/Health/'
 SKIP_PREFIX = ('usr/share/tokenizer/', 'usr/share/firmware/', 'usr/share/mecabra/',
-               'usr/standalone/', 'Library/Audio/', 'Library/Ringtones/',
+               'usr/standalone/', 'Library/Audio/',
                HEALTH + 'Assets/FitnessUIAssets.bundle/') + \
     tuple(f'System/Library/{name}/' for name in SKIP_SYSTEM_LIBRARY)
 BIG_PROGRAM = 10 << 20           # daemons bigger than this (locationd, lskdd, ...) are not on the way to the screen
@@ -93,6 +93,9 @@ BIG_PROGRAM = 10 << 20           # daemons bigger than this (locationd, lskdd, .
 AUDIO = ('Library/Audio/Plug-Ins/', 'Library/Audio/Tunings/D22/', 'Library/Audio/Tunings/Generic/',
          'System/Library/Audio/UISounds/')
 SKIP_AUDIO = ('System/Library/Audio/UISounds/nano/',)
+# The notification source metadata for Clock is small, but UserNotifications is
+# otherwise pruned above. Keep its bundle so SpringBoard can identify the source.
+NOTIFICATION_BUNDLES = ('System/Library/UserNotifications/Bundles/com.apple.mobiletimer.bundle/',)
 KEEP_LANG = ('en', 'Base', 'English', 'en_US', 'en_GB')
 
 
@@ -138,6 +141,8 @@ def wanted_file(path, size):
         return False
     if path.startswith(AUDIO):
         return not path.startswith(SKIP_AUDIO) and '.espresso.' not in path
+    if path.startswith(NOTIFICATION_BUNDLES):
+        return True
     if path.startswith(SKIP_PREFIX):
         return False
     if path.startswith('System/Library/Fonts/'):
@@ -193,7 +198,8 @@ def main():
                                                'private/xarts', 'private') or \
                 bool(lproj) and lproj.group(1) in KEEP_LANG and \
                 (path.startswith(WHOLE) and not path.startswith(SKIP_PREFIX) or
-                 path.startswith(AUDIO) and not path.startswith(SKIP_AUDIO))
+                 path.startswith(AUDIO) and not path.startswith(SKIP_AUDIO) or
+                 path.startswith(NOTIFICATION_BUNDLES))
         if keep:
             chosen.add(path)
     # every directory on the way to something chosen

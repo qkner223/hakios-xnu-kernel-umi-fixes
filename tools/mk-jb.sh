@@ -235,5 +235,54 @@ PREP
 chmod 755 "$OUT/root/var/jb/prep.sh"
 rm -f "$OUT/root/var/jb/prep_bootstrap.sh"
 
-echo "mk-jb.sh: $OUT/root/var/jb ($(du -sh "$OUT/root/var/jb" | cut -f1), $(find "$OUT/root/var/jb" | wc -l) entries)"
+# What dpkg does to the prefix, kept across boots on the phone's HFS /var. The prefix is grafted into
+# memory at every boot (src/init.c): grafted straight onto the HFS volume, its 6900 entries reset the
+# phone at boot (v11). So what dpkg did is kept apart, as one archive on the volume -- every directory,
+# every file and link that is not a link into the shipped prefix (what packages installed or changed,
+# dpkg's database, apt's and Sileo's settings), and which shipped entries are gone -- saved by dpkg's
+# post-invoke hook and put back by init right after the graft.
+mkdir -p "$OUT/root/var/jb/usr/libexec" "$OUT/root/var/jb/etc/dpkg/dpkg.cfg.d"
+cat > "$OUT/root/var/jb/usr/libexec/hakios-jb-keep" <<'KEEP'
+#!/var/jb/bin/sh
+# hakios-jb-keep save      dpkg's post-invoke hook (etc/dpkg/dpkg.cfg.d/hakios-keep)
+# hakios-jb-keep restore   init, right after the graft
+# The archive is named by the shipped prefix's stamp: another bootstrap starts from the shipped prefix.
+set -e
+PATH=/var/jb/usr/bin:/var/jb/bin:/usr/bin:/bin
+link=$(readlink /var/jb/.hakios-jb-stamp)
+shipped=${link%/.hakios-jb-stamp}
+keep=/private/var/db/hakios-jb-$(cat "$link").tar
+cd /var/jb/
+case $1 in
+save)
+	(cd "$shipped" && find . -mindepth 1) | while IFS= read -r p; do
+		[ -e "$p" ] || [ -L "$p" ] || printf '%s\n' "$p"
+	done > .hakios-jb-removed
+	find . \( -path ./tmp -o -path ./var/tmp -o -path ./var/cache -o -path ./var/mobile/Library/Caches \) -prune -o \
+	    \( -type d -o ! -lname "$shipped/*" \) -print0 |
+	    tar -cf "$keep.new" --ignore-failed-read --null --no-recursion -T - || [ $? -eq 1 ]    # 1: changed while read
+	rm .hakios-jb-removed
+	mv -f "$keep.new" "$keep"
+	;;
+restore)
+	[ -f "$keep" ] || { echo "hakios-jb-keep: nothing kept yet ($keep)"; exit 0; }
+	# GNU tar's default unlinks an existing non-directory before extracting, so a kept file replaces the graft's
+	# link instead of being written through it; directories are kept (-U would try to rmdir the graft's, and fail)
+	tar -xpf "$keep"
+	while IFS= read -r p; do rm -rf "$p"; done < .hakios-jb-removed
+	rm .hakios-jb-removed
+	echo "hakios-jb-keep: restored $keep"
+	;;
+esac
+KEEP
+chmod 755 "$OUT/root/var/jb/usr/libexec/hakios-jb-keep"
+printf '%s\n' 'post-invoke="/var/jb/usr/libexec/hakios-jb-keep save"' > "$OUT/root/var/jb/etc/dpkg/dpkg.cfg.d/hakios-keep"
+
+# A stamp of what this prefix is made of (the bootstrap, Sileo and ElleKit debs). What dpkg did is kept
+# under its name (usr/libexec/hakios-jb-keep): changing the suite, Sileo or ElleKit above changes the
+# stamp, and the next boot starts from the shipped prefix again.
+stamp=$(cat "$OUT/debs/bootstrap.tar.zst" "$OUT/debs/sileo.deb" "$OUT/debs/$EK" 2>/dev/null | shasum -a 256 | cut -c1-32)
+printf '%s\n' "$stamp" > "$OUT/root/var/jb/.hakios-jb-stamp"
+
+echo "mk-jb.sh: $OUT/root/var/jb ($(du -sh "$OUT/root/var/jb" | cut -f1), $(find "$OUT/root/var/jb" | wc -l) entries), stamp $stamp"
 echo "          Sileo $(grep -m1 '^Version:' "$TMP/control/control" | cut -d' ' -f2), $(grep -c '^Package:' "$OUT/root/var/jb/Library/dpkg/status") packages in dpkg's database"

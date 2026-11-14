@@ -27,6 +27,22 @@ Header decode(uint32_t word) {
     return h;
 }
 
+std::vector<std::pair<uint32_t, uint32_t>> pieces(const std::vector<uint32_t>& words, uint32_t max) {
+    std::vector<std::pair<uint32_t, uint32_t>> out;
+    uint32_t start = 0, at = 0;
+    const uint32_t n = uint32_t(words.size());
+    while (at < n) {
+        const uint32_t next = at + 1 + decode(words[at]).count;   // (the stream is this file's own packets: each header counts)
+        if (next - start > max) {
+            out.emplace_back(start, at - start);
+            start = at;
+        }
+        at = next;
+    }
+    if (n > start) out.emplace_back(start, n - start);
+    return out;
+}
+
 void Stream::command(uint32_t opcode, uint32_t count) {
     assert(count <= kMaxType7Count);
     words_.push_back(type7(opcode, count));

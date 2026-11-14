@@ -51,11 +51,11 @@
 // way is again the phone's to say.
 //
 // What it answers is what hakios's kernel driver answers (bsd/dev/hakios.adreno.c, hakios_gpu_parameter): GPU_ID 0,
-// the chip id 0x06030500 with a speed bin above it, 512 KiB of GMEM, 550 MHz. And it fails as that kernel fails. A
+// the chip id 0x06050002 with a speed bin above it, 1,179,648 bytes of GMEM, 587 MHz. And it fails as that kernel fails. A
 // submission the GPU never finishes is a hang there, found by the wait's timeout alone (the GPU raises no fault for
-// it, and none of the measured hangs set a fault register); then either the kernel resets the GPU and gives up what it
-// had (boot-arg gpu_recover=1: the fence word is set to the last submission's number, so every wait ends, and FAULTS
-// counts one more), or, without that, nothing is waited for again in that run. Both are here, RECOVERS choosing.
+// it, and none of the measured hangs set a fault register); then either the kernel resets the GPU, gives up the
+// submission it hung on and runs the ones behind it again (boot-arg gpu_recover=1: FAULTS counts one more, GIVEN_UP
+// names the one given up), or, without that, nothing is waited for again in that run. Both are here, RECOVERS choosing.
 #pragma once
 
 #include <condition_variable>
@@ -140,6 +140,7 @@ public:
     };
     struct Stats {
         uint32_t submits = 0;
+        uint32_t maxSubmitWords = 0;   // the longest command buffer handed to the kernel, in words (one CP_INDIRECT_BUFFER)
         uint32_t packets = 0;
         uint32_t faults = 0;        // submissions that stopped on a bad packet (each one a hang on the phone)
         uint32_t recoveries = 0;    // ... of which the GPU was reset after (what FAULTS answers)
@@ -187,11 +188,10 @@ public:
     void resume();
 
     // what the kernel says about this GPU, for the fake to say the same and for a test to check it does
-    static constexpr uint64_t kChipId = 0x06030500;      // dt qcom,chipid: an A635-family part, "Adreno 7c+ Gen 3" to Mesa
-    static constexpr uint64_t kSpeedBin = 0x75;          // the phone's fuse value above the chip id, as the probe read it
-                                                         // (0x7506030500 on 28 October); Mesa's named row for this part
-    static constexpr uint64_t kGmemBytes = 512 * 1024;
-    static constexpr uint64_t kMaxFrequencyHz = 550000000;
+    static constexpr uint64_t kChipId = 0x06050002;      // dt qcom,chipid: FD650 / Adreno 650
+    static constexpr uint64_t kSpeedBin = 0;             // UMI speed-bin fuse is board-specific; lower chip ID is authoritative
+    static constexpr uint64_t kGmemBytes = 1179648;      // UMI KGSL GMEM_SIZE (0x120000)
+    static constexpr uint64_t kMaxFrequencyHz = 587000000;
 
 private:
     struct UboDescriptor {
@@ -204,8 +204,7 @@ private:
     };
     struct Job {
         uint32_t fence;
-        uint64_t address;
-        uint32_t words;
+        std::vector<std::pair<uint64_t, uint32_t>> ibs;   // each command buffer of the submission: its address and words
     };
     // what a dispatch has loaded so far, for CP_EXEC_CS to be checked against
     struct CsState {
@@ -275,7 +274,7 @@ private:
     std::set<uint32_t> queues_;
     // one counter for every queue, as the kernel keeps it (it reads no queue id): the last fence handed out, the last done
     uint32_t submitted_ = 0, completed_ = 0;
-    std::set<uint32_t> hungFences_;             // the submissions that stopped: their own waits fail, later ones pass
+    std::set<uint32_t> hungFences_;             // the submissions that stopped, given up: their own waits fail, later ones run
     bool wedged_ = false;                       // (RECOVERS false) after a hang: every wait fails at once
     std::deque<Job> jobs_;
     std::map<uint32_t, uint32_t> regs_;         // every register written, as written (type-4 packets)
@@ -300,6 +299,15 @@ private:
     bool eventBlit();
     uint64_t alwaysOn_ = 0;     // CP_ALWAYS_ON_COUNTER as the fake keeps it: one more at each CP_REG_TO_MEM of it
     uint32_t drawsInSubmission_ = 0, drawsWithoutCcuFlush_ = 0, drawsWithoutCacheFlush_ = 0, drawsWithoutDepthFlush_ = 0;
+    // What the RB wrote in this submission (a draw's targets, a fill's or a copy's destination: the buffer each lies in,
+    // whole) and the texture unit may not read yet: it sits in the colour or the depth CCU until that CCU's 4-word
+    // flush, and the texture cache may hold the memory's old lines until a CACHE_INVALIDATE after the flush (turnip's
+    // FD_CCU_CLEAN_COLOR then FD_CACHE_INVALIDATE for a write that is sampled). A sampled texture over such memory is a
+    // fault: what holds the chained passes' barriers (render.hpp) to account.
+    struct Unflushed { uint64_t lo, hi; bool depth, flushed; };
+    std::vector<Unflushed> unflushed_;
+    void wroteThroughCcu(uint64_t iova, bool depth);
+    bool unflushedAt(uint64_t lo, uint64_t hi) const;
     // the running sample count ZPASS_DONE copies out (an occlusion query's snapshots). The model has no rasterizer, so
     // a draw counts one sample per index it submits, times its instances: enough to tell begin from end and the
     // query's arithmetic from a wrong one; how many samples a real draw passes is the phone's (probe 9q)

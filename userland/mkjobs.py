@@ -219,6 +219,14 @@ DENY = ('watchdog', 'CommCenter', 'wifi', 'WiFi', 'bluetooth', 'BTServer', 'loca
         'osanalytics', 'lockdown', 'audio', 'jetsamproperties',
         'purplebuddy', 'restore', 'usb', 'accessoryd',
         'mobileassetd', 'bird',
+        # fairplayd.H2 returns from main at once (no FairPlayIOKit user client in this kernel), so its registered
+        # Mach service is a black hole: every request stays queued and the caller waits in mach_msg for ever --
+        # lockdownd's main thread in create_cesm_context (no 62078 or lockdown.sock checkin), AMS's
+        # _AMSFairPlayGetDeviceType. Without the job the lookup fails and both go on.
+        'com.apple.fairplayd.',
+        # vmd (Visual Voicemail) spins at 100% CPU asking for CoreTelephony while CommCenter is not running
+        # (1079 failed lookups of com.apple.commcenter.coretelephony.xpc in 12 min, v11b): the phone got hot.
+        'com.apple.voicemail.vmd',
         # these start, crash and are asked for again, over and over. (aggregated, which was among them, is where
         # Darwin userland 16 keeps its power log -- com.apple.powerlog.plxpclogger.xpc and the rest -- that Settings > Battery
         # waits for; it now runs through a session.)

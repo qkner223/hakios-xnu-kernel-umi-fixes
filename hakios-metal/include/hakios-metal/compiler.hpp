@@ -90,7 +90,20 @@ struct CompiledStage {
     bool writesMemory = true;                // the NIR stores to or does atomics on a device buffer (or global memory); false only when it was looked at and does not
     std::string name;
     std::string listing;
+    // The bytes of each constant buffer the NIR loads at constant offsets, as translate leaves it (the generic stage:
+    // no KnownBuffer) -- the only bytes a specialisation of it can fold (foldKnownLoad), so the only ones its key needs.
+    // BINDING ~0u: a load of a buffer not constant, which may be any. ANY: a load at an offset not constant.
+    struct ConstantReads {
+        uint32_t binding;
+        bool any;
+        std::vector<uint8_t> bytes;   // 1 for each byte loaded, from byte 0; past the end: not loaded
+    };
+    std::vector<ConstantReads> constantReads;
 };
+
+// MASK[0..LENGTH) of the constant buffer at [[buffer(BINDING)]]: 0xff for a byte STAGE may load (constantReads), 0 for
+// one it never does
+void constantReadMask(const CompiledStage& stage, uint32_t binding, uint8_t* mask, size_t length);
 
 // a VS and an FS linked for one colour format (render.hpp's Program), owning both stages
 struct CompiledProgram {
@@ -126,11 +139,19 @@ using FunctionConstants = std::vector<FunctionConstant>;
 // here, rather than in every fragment. CoreAnimation's uber shader (fixed_frag_lph_cpf) picks its path through 15 000
 // instructions by the 52 bytes of its FragmentShaderConfig: compiled for one configuration it is 16 to 48 instructions.
 struct KnownBuffer {
+    uint32_t colorOutputs = ~0u;  // selected MRTs when reconstructing a specialized CA stage
     uint32_t binding = 0;
     std::vector<uint8_t> bytes;
+    // per byte of BYTES, nonzero where it is known (empty: all are): a load touching a byte not known stays a load, so
+    // the stage depends on the known bytes alone and is filed under them (CA's padding is not part of its key)
+    std::vector<uint8_t> mask;
 };
+// CACHED_ONLY: the stage from the cache (HAKIOS_METAL_CACHE, HAKIOS_METAL_CACHE_SEED) or nullptr, never compiled and
+// never waiting for the compiler -- what a draw can afford to ask before it hands the compile to another thread
 std::unique_ptr<CompiledStage> compileStage(const void* bitcode, size_t size, std::string* why, const FunctionConstants& constants = {},
-                                           uint32_t iboBase = 0, const KnownBuffer* known = nullptr);
+                                           uint32_t iboBase = 0, const KnownBuffer* known = nullptr, bool cachedOnly = false, uint32_t framebufferSamples = 1);
+// FRAMEBUFFER_SAMPLES is the pipeline raster sample count (1, 2 or 4): framebuffer fetch
+// in an MSAA pipeline reads the current sample and runs per sample. It is part of the cache key.
 // compileStage's choice for a stage that spilled with ir3's preamble (WITH) and was compiled again without it (WITHOUT):
 // the one that spills less, then the one with fewer registers; WITH on a tie. (CoreAnimation's fixed_frag_lph_cpf: 48
 // registers and 512 bytes of spills with the preamble, 21 and none without; its draws 6.6 ms each so, 2.6 without.)
@@ -138,8 +159,8 @@ bool preferWithoutPreamble(const Kernel& with, const Kernel& without);
 
 // VS and FS linked (render::link, and with Mesa present cross-checked against ir3_link_shaders) for a colour target of
 // COLOR0's format. nullptr with *why: the refusals render.hpp names for a stage (attributes, several colour outputs,
-// depth/stencil/sample-mask writes, framebuffer fetch, buffers/textures/samplers in either stage, a varying the VS does
-// not write, a colour output class the format does not take, the pipeline constlen budget).
+// depth/stencil/sample-mask writes, framebuffer fetch, buffers/textures/samplers in either stage,
+// a colour output class the format does not take, the pipeline constlen budget).
 std::unique_ptr<CompiledProgram> linkProgram(std::shared_ptr<CompiledStage> vs, std::shared_ptr<CompiledStage> fs, PixelFormat color0,
                                              std::string* why);
 
@@ -147,5 +168,10 @@ std::unique_ptr<CompiledProgram> linkProgram(std::shared_ptr<CompiledStage> vs, 
 // nullptr with *why: the front end's refusal, named by stage ("intrinsic: air.simd_sum not handled"), or ir3's, or
 // "not a compute kernel", or that no compiler is in this build.
 std::unique_ptr<CompiledKernel> compileAir(const void* bitcode, size_t size, std::string* why, const FunctionConstants& constants = {});
+
+// The [[function_constant(n)]] indices one AIR module declares, in declaration order (empty: it declares none, or no
+// compiler in this build). A function Metal has already specialised declares none; CoreAnimation's generic uber
+// shaders declare 58 (fragment) and 4 or 5 (vertex), which the plug-in checks its read-back values against.
+std::vector<uint32_t> functionConstantIndices(const void* bitcode, size_t size);
 
 }  // namespace hakios::metal

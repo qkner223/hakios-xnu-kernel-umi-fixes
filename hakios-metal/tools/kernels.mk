@@ -16,9 +16,8 @@ MESA_HOST  ?= $(abspath $(HAKIOS))/xnu-deps/build/mesa-host
 MESA_SRC   ?= $(MESA_HOST)/mesa-25.0.7
 MESA_BUILD ?= $(MESA_HOST)/build
 
-# The chip id the fixtures are assembled for: the phone's Adreno 7c+ Gen 3
-# (A635). Mesa's table matches it through its 0xffff06030500 wildcard row.
-CHIP_ID    ?= 0x06030500
+# The chip id the fixtures are assembled for: the phone's Adreno 650 (FD650).
+CHIP_ID    ?= 0x06050002
 
 # Mesa's headers want the same -D flags its own objects were compiled with
 # (HAVE_* for what the host has, _GNU_SOURCE, and so on): a header compiled
@@ -75,8 +74,14 @@ out/host/ir3-kernel: tools/ir3-kernel.cc include/hakios-metal/kernel.hpp tools/k
 	@mkdir -p $(dir $@)
 	$(CXX) -std=c++17 -Wall -Wextra -Werror -O1 -g -Iinclude $(MESA_DEFS) $(MESA_INC) -o $@ tools/ir3-kernel.cc $(MESA_LIBS)
 
+# The fixtures are checked in. Their rules exist only when a goal names them (make fixtures, make air-fixtures, make
+# tests/fixtures/X.hpp): `make test` depends on every fixture, and with the rules always there it remade them from the
+# llvm-as and the host Mesa build of the day -- or stopped, with no host Mesa build to make ir3_compiler from.
+FIXTURE_GOALS = $(filter fixtures air-fixtures tests/fixtures/%,$(MAKECMDGOALS))
+ifneq ($(FIXTURE_GOALS),)
 tests/fixtures/%.hpp: tools/kernels/%.asm out/host/ir3-kernel
 	out/host/ir3-kernel --chip-id $(CHIP_ID) -o $@ $<
+endif
 
 fixtures: $(KERNEL_FIXTURES)
 
@@ -120,7 +125,9 @@ out/host/kernels/%.bc: tools/kernels/%.ll
 	@mkdir -p $(dir $@)
 	$(LLVM_AS) -o $@ $<
 
+ifneq ($(FIXTURE_GOALS),)
 tests/fixtures/%_air.hpp: out/host/kernels/%.bc tools/kernels/%.ll $(IR3_COMPILER)
 	$(IR3_COMPILER) --chip-id $(CHIP_ID) -o $@ -s tools/kernels/$*.ll -n $*_air $< > out/host/kernels/$*.listing
+endif
 
 air-fixtures: $(KERNEL_AIR_FIXTURES)

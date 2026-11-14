@@ -646,6 +646,7 @@ bool CommandBuffer::dispatchAny(const Kernel& k, const uint32_t* groups, const B
     const std::vector<uint32_t>& w = added.words();
     closePass();   // a dispatch reads what the draws before it wrote: their pass's tail first
     stampStart(kPassDispatch, groups ? groups[0] : 0, groups ? groups[1] : 0);
+    if ((profile_ || tuning_) && !profiled_.empty()) profiled_.back().shaders.emplace_back(k.name != nullptr ? k.name : "?");
     stream_.packet(pm4::kNop, nullptr, 0);   // (a marker between encoders in the stream, for whoever reads it back)
     for (size_t i = 0; i < w.size();) {
         pm4::Header h = pm4::decode(w[i]);
@@ -671,6 +672,7 @@ bool CommandBuffer::dispatchAny(const Kernel& k, const uint32_t* groups, const B
         const Texture* t = bindings.textures[i];
         if (t == nullptr) continue;
         bool writes = i < kMaxTextureSlots && k.textures[i].kind == kTexImage && k.textures[i].write;
+        if (writes) t->markWritten();   // (v29i D1: a kernel that stores through it writes it)
         use(*t->buffer(), writes);
         keep(t->buffer());
     }

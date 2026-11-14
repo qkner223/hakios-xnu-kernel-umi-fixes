@@ -69,7 +69,7 @@ struct Bindings {
 namespace compute {
 
 constexpr uint32_t kMaxLocalThreads = 1024;     // the hardware's threadgroup limit, and the NDRANGE fields' (10 bits)
-constexpr uint32_t kMaxSharedBytes = 32 * 1024; // threadgroup memory a group can have (freedreno_devices.py: the A635's cs_shared_mem_size)
+constexpr uint32_t kMaxSharedBytes = 32 * 1024; // threadgroup memory a group can have (freedreno_devices.py: the A650's cs_shared_mem_size)
 // What a dispatch owns in GPU memory besides the program, one 16 KiB page on the phone whatever the size (gpu.cpp rounds
 // to it): the IBO descriptors (64 bytes each; NIBO is 7 bits and SSBO slots go up to Metal's 31 buffers plus 16 images),
 // the texture table (TEX_CONST, 64 bytes each, 64-aligned: SP_CS_TEX_CONST's alignment), the sampler table (TEX_SAMP,
@@ -106,7 +106,7 @@ static_assert(kTableIbosAt + kMaxIbos * 64 <= kTableTexConstAt && kTableTexConst
 struct Options {
     bool prelude = true;        // SP_MODE_CONTROL, SP_PERFCTR_ENABLE, SP_FLOAT_CNTL, as computerator opens with
     bool invalidateCmd = true;  // HLSQ_INVALIDATE_CMD before the program
-    bool hlsqCopies = true;     // the gen4 (has_lpac) copies: HLSQ_CS_CTRL_REG1, SP_CS_CNTL_0/1
+    bool hlsqCopies = true;     // FD650 command path keeps the HLSQ/SP control copies
     bool pvtmemZero = true;     // the private-memory registers written as zero (Gallium does; computerator leaves them)
     bool invalidate = true;     // CP_EVENT_WRITE CACHE_INVALIDATE before the dispatch (Gallium's barrier)
     bool marker = true;         // CP_SET_MARKER RM6_COMPUTE

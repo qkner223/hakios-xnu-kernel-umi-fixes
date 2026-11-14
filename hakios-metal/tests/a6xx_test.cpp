@@ -284,7 +284,7 @@ TEST(a6xx_private_memory_fields_are_scaled) {
     CHECK_EQ(A6XX_SP_CS_PVT_MEM_HW_STACK_OFFSET_OFFSET(0x10000), 0x20u);
     // this chip: 4096 fibers per SP, 2 SPs; a 512-byte private memory per fiber is 2 MiB per SP, 4 MiB in all
     CHECK_EQ(kFibersPerSp, 4096u);
-    CHECK_EQ(kNumSpCores, 2u);
+    CHECK_EQ(kNumSpCores, 3u);
     CHECK_EQ(A6XX_SP_CS_PVT_MEM_SIZE_TOTALPVTMEMSIZE(512 * kFibersPerSp), 512u);
 }
 
@@ -333,8 +333,8 @@ TEST(a6xx_batch_start_words) {
     // RB_CCU_CNTL for rendering to memory on this chip: depth cache at 0, color cache after it at
     // num_ccu (2) * 64 KiB = 0x20000 bytes, in 4 KiB units: 0x20 << 23 = 0x10000000; both cache sizes FULL (0);
     // the chip has fast clear (bit 0 clear) and no concurrent resolve (bit 2 clear)
-    CHECK_EQ(rbCcuCntlSysmem(), 0x10000000u);
-    CHECK_EQ(A6XX_RB_CCU_CNTL_COLOR_OFFSET(0x20000), 0x10000000u);
+    CHECK_EQ(rbCcuCntlSysmem(), 0x18000000u);
+    CHECK_EQ(A6XX_RB_CCU_CNTL_COLOR_OFFSET(0x30000), 0x18000000u);
     CHECK_EQ(A6XX_RB_CCU_CNTL_DEPTH_OFFSET(0x1000), 0x1000u);
     CHECK_EQ(A6XX_RB_CCU_CNTL_COLOR_OFFSET_HI(1), 0x200u);
     CHECK_EQ(A6XX_RB_CCU_CNTL_DEPTH_CACHE_SIZE(CCU_CACHE_SIZE_QUARTER), 0x800u);
@@ -365,7 +365,7 @@ TEST(a6xx_batch_start_words) {
     CHECK_EQ(kStaticState[1].reg, REG_A6XX_SP_FLOAT_CNTL);
     CHECK_EQ(kStaticState[1].value, 0x8u);
     CHECK_EQ(kStaticState[5].reg, REG_A6XX_TPL1_DBG_ECO_CNTL);
-    CHECK_EQ(kStaticState[5].value, 0x05008000u);
+    CHECK_EQ(kStaticState[5].value, 0x01008000u);
     CHECK_EQ(kStaticState[19].reg, REG_A6XX_SP_MODE_CONTROL);
     CHECK_EQ(kStaticState[19].value, 0x5u);
     CHECK_EQ(kStaticState[23].reg, REG_A6XX_PC_MODE_CNTL);
@@ -386,11 +386,11 @@ TEST(a6xx_batch_start_words) {
     for (const RegWrite& w : kStaticState) {
         CHECK(w.reg >= 0x0e12 && w.reg <= 0xbe04);
     }
-    CHECK_EQ(kMagicTpl1DbgEcoCntl, 83918848u);
+    CHECK_EQ(kMagicTpl1DbgEcoCntl, 16809984u);
     CHECK_EQ(kMagicRbDbgEcoCntl, 68157440u);
     CHECK_EQ(kMagicVpcDbgEcoCntl, 33554432u);
     CHECK_EQ(kMagicSpChickenBits, 5120u);
-    CHECK_EQ(kMagicUcheClientPf, 132u);
+    CHECK_EQ(kMagicUcheClientPf, 4u);
     CHECK_EQ(kBorderColorBytes, 32768u);
 }
 
@@ -680,6 +680,15 @@ TEST(a6xx_first_draw_pass_and_viewport_words) {
     CHECK_EQ(half.yscale, 0xc2000000u);
     CHECK_EQ(half.zoffset, 0x3e800000u);
     CHECK_EQ(half.zscale, 0x3f000000u);
+    // an upside-down viewport, height -64 from y 64 (AppleMetalGLRenderer's GL framebuffer): YOFFSET 64 - 32 = 32.0 and YSCALE
+    // +32.0, so NDC y -1 lands on row 0; the twin is the same rectangle the right way up, YSCALE -32.0
+    ViewportWords turned = viewportWords(0, 64, 64, -64, 0, 1);
+    CHECK_EQ(turned.yoffset, 0x42000000u);
+    CHECK_EQ(turned.yscale, 0x42000000u);
+    CHECK_EQ(turned.xscale, vp.xscale);
+    CHECK(turned.yscale != vp.yscale);
+    CHECK_EQ(uint32_t(DI_PT_LINELOOP), 7u);
+    CHECK_EQ(uint32_t(DI_PT_TRIFAN), 5u);
     // the guardband of the 64x64 viewport: gb_adj = min(1025, 1022.97) needs exponent 10 > 8, so MAX_GB in both axes:
     // HORZ(0x1ff) | VERT(0x1ff) << 10 = 0x0007fdff
     CHECK_EQ(calcGuardband(32, 32), 0x1ffu);

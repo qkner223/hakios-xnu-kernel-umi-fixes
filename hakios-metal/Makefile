@@ -58,14 +58,17 @@ TESTS     = $(wildcard tests/*_test.cpp) tests/main.cpp
 .PHONY: test tsan asan check ios darwin clean sweep
 
 # (and the front end's archive: a test binary linked before the front end changed passed or failed for the old one)
-$(HOSTOUT)/tests: $(HOST) $(TESTS) $(wildcard include/hakios-metal/*.hpp) $(wildcard tests/fixtures/*.hpp) tests/test.hpp \
+$(HOSTOUT)/tests: $(HOST) $(TESTS) $(wildcard include/hakios-metal/*.hpp) include/hakios-metal/perf.h $(wildcard tests/fixtures/*.hpp) tests/test.hpp \
+		../userland/src/HakiosMetalBootArgs.h \
+		../userland/src/HakiosMetalYCbCr.h \
+		../devices/xiaomi-mi-10/overlays/xnu/files/iokit/Kernel/umi_frame_sample.h \
 		$(if $(strip $(MESA)),$(MESA_BUILD)/src/compiler/air/libair.a)
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -pthread -o $@ $(HOST) $(TESTS) $(HOSTLIBS)
 
 # the metallib sweep (tools/sweep.cpp): every function of the libraries given through the compiler, the refusals counted;
 # `make sweep MESA=1` builds $(HOSTOUT)/sweep, then run it on the libraries where they lie
-$(HOSTOUT)/sweep: tools/sweep.cpp $(HOST) $(wildcard include/hakios-metal/*.hpp)
+$(HOSTOUT)/sweep: tools/sweep.cpp $(HOST) $(wildcard include/hakios-metal/*.hpp) include/hakios-metal/perf.h
 	@mkdir -p $(dir $@)
 	$(CXX) $(CXXFLAGS) -pthread -o $@ tools/sweep.cpp $(HOST) $(HOSTLIBS)
 
@@ -98,16 +101,20 @@ ifneq ($(strip $(MESA)),)
 IOS_CXXFLAGS += -DHAKIOS_METAL_MESA $(HAKIOS_METAL_IOS_MESA_CXXFLAGS)
 IOS_LIBS     += $(HAKIOS_METAL_IOS_MESA_LIBS)
 # the compiled-stage cache's key (src/compiler.cpp: kCacheBuild): what the compiler is made of -- its source, the
-# driver's headers and the Mesa archives linked in -- and not when it was built, so that a cache kept on the phone
-# across boots (var_store) outlives a rebuild of the plug-in that changed nothing of the compiler
-IOS_CACHE_BUILD := $(shell cat src/compiler.cpp include/hakios-metal/*.hpp $(wildcard $(filter %.a,$(HAKIOS_METAL_IOS_MESA_LIBS))) 2>/dev/null \
+# headers of what it writes into a cached stage, and the Mesa archives linked in -- and not when it was built, so that
+# the cache in /var/db outlives a rebuild of the plug-in that changed nothing of the compiler. Not every header: the
+# draw and GMEM work edits render.hpp, command.hpp and a6xx.hpp almost every build, and each edit threw the phone's
+# whole cache away (v18..v22a: four keys in one day, 21 to 29 compiles, 9.2 s, at the first animations of each boot).
+# A change elsewhere that alters what compileStage produces bumps kStageCacheVersion in compiler.cpp.
+IOS_CACHE_BUILD := $(shell cat src/compiler.cpp include/hakios-metal/compiler.hpp include/hakios-metal/kernel.hpp \
+	$(wildcard $(filter %.a,$(HAKIOS_METAL_IOS_MESA_LIBS))) 2>/dev/null \
 	| (sha256sum 2>/dev/null || shasum -a 256) | cut -c1-24)
 ifneq ($(strip $(IOS_CACHE_BUILD)),)
 IOS_CXXFLAGS += -DHAKIOS_METAL_CACHE_BUILD='"$(IOS_CACHE_BUILD)"'
 endif
 endif
 
-out/ios/libhakios-metal.a: $(CORE) src/fake_gpu.cpp src/iokit_transport.cpp $(wildcard include/hakios-metal/*.hpp)
+out/ios/libhakios-metal.a: $(CORE) src/fake_gpu.cpp src/iokit_transport.cpp $(wildcard include/hakios-metal/*.hpp) include/hakios-metal/perf.h
 	@mkdir -p out/ios/obj
 	cd out/ios/obj && for f in $(CORE) src/fake_gpu.cpp src/iokit_transport.cpp; do \
 		$(IOS_CXX) $(IOS_CXXFLAGS) -I../../../include -c ../../../$$f || exit 1; done
@@ -120,9 +127,20 @@ out/ios/hakios-metal-probe: tools/probe.cpp out/ios/libhakios-metal.a $(wildcard
 		-framework IOKit -framework CoreFoundation -framework IOSurface
 
 
-# a kernel's bitcode as a header, for a probe that compiles it on the phone (our own kernels only: tools/kernels/*.ll)
+# a kernel's bitcode as a header, for a probe that compiles it on the phone (our own kernels only: tools/kernels/*.ll).
+# Like every fixture rule (tools/kernels.mk), only when a fixture is asked for by name: the fixtures are checked in, and
+# `make test` would otherwise remake them from whatever llvm-as and host Mesa build happen to be about (FIXTURE_GOALS)
+ifneq ($(FIXTURE_GOALS),)
 tests/fixtures/%_bc.hpp: out/host/kernels/%.bc tools/bc-header.py
 	python3 -I tools/bc-header.py $< $* > $@
+endif
 
 clean:
 	rm -rf out
+
+# macOS + MESA=1: exact CA fallback against iOS's own precompiled shader interfaces.
+$(HOSTOUT)/ca-exact: tests/ca_exact.mm $(HOST) include/hakios-metal/perf.h ../userland/src/HakiosMetalCAExact.h
+	$(CXX) $(CXXFLAGS) -fblocks -pthread -o $@ tests/ca_exact.mm $(HOST) $(HOSTLIBS) -framework Foundation -framework Metal
+.PHONY: ca-exact-test
+ca-exact-test: $(HOSTOUT)/ca-exact
+	python3 ../tools/test-ca-exact.py $(HOSTOUT)/ca-exact

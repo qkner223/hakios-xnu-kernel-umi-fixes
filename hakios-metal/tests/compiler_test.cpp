@@ -6,6 +6,7 @@
 #include <thread>
 #include <dirent.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 #include <algorithm>
 #include <cstdio>
@@ -786,6 +787,76 @@ TEST(compiler_matches_the_stage_fixtures) {
 }
 
 // a kernel through compileStage and a stage through compileAir: each refused by name, not compiled into the other shape
+TEST(median3_compiles_scalar_and_vector_half_and_float) {
+    if (!hasCompiler()) return;
+    auto bc = bitcodeOf("tri_median_fs");
+    CHECK(!bc.empty());
+    if (bc.empty()) return;
+    std::string why;
+    auto fs = compileStage(bc.data(), bc.size(), &why);
+    CHECK(fs != nullptr);
+    if (!fs) std::printf("       %s\n", why.c_str());
+    if (fs) CHECK_EQ(fs->stage.numColorOutputs, 1u);
+}
+
+TEST(failed_stage_compilation_is_cached_across_threads_by_specialization) {
+    if (!hasCompiler()) return;
+    auto bc = bitcodeOf("tri_unsupported_fs");
+    CHECK(!bc.empty());
+    if (bc.empty()) return;
+    hakios_metal_stage_cache_stats stats;
+    hakios_metal_stage_cache_take_stats(&stats);
+    std::string errors[8];
+    std::thread threads[8];
+    bool refused[8] = {};
+    for (unsigned i = 0; i < 8; i++) threads[i] = std::thread([&, i] {
+        refused[i] = compileStage(bc.data(), bc.size(), &errors[i]) == nullptr;
+    });
+    for (auto& t : threads) t.join();
+    for (unsigned i = 0; i < 8; i++) {
+        CHECK(refused[i]);
+        CHECK(errors[i] == errors[0]);
+        CHECK(errors[i].find("air.unsupported_regression") != std::string::npos);
+    }
+    hakios_metal_stage_cache_take_stats(&stats);
+    CHECK_EQ(stats.misses, 1u); CHECK_EQ(stats.failures, 1u);
+    std::string why;
+    CHECK(compileStage(bc.data(), bc.size(), &why, {}, 0, nullptr, true) == nullptr);
+    CHECK(why == errors[0]); // cached-only callers retain the actual error
+    // A different constant set or sample count must get its own attempt.
+    CHECK(compileStage(bc.data(), bc.size(), &why, {{99, 1}}) == nullptr);
+    CHECK(compileStage(bc.data(), bc.size(), &why, {}, 0, nullptr, false, 4) == nullptr);
+    hakios_metal_stage_cache_take_stats(&stats);
+    CHECK_EQ(stats.misses, 2u); CHECK_EQ(stats.failures, 2u);
+}
+
+TEST(multisample_framebuffer_fetch_compiles_for_the_current_sample) {
+    if (!hasCompiler()) return;
+    auto vsbc = bitcodeOf("tri_flat_vs"), fsbc = bitcodeOf("tri_fb_fs");
+    CHECK(!vsbc.empty() && !fsbc.empty());
+    if (vsbc.empty() || fsbc.empty()) return;
+    std::string why;
+    std::shared_ptr<CompiledStage> vs = compileStage(vsbc.data(), vsbc.size(), &why);
+    for (uint32_t samples : {2u, 4u}) {
+        std::shared_ptr<CompiledStage> fs = compileStage(fsbc.data(), fsbc.size(), &why, {}, 0, nullptr, false, samples);
+        CHECK(fs != nullptr);
+        if (!fs) { std::printf("       %s\n", why.c_str()); continue; }
+        CHECK(fs->stage.fbRead && fs->stage.perSamp);
+        CHECK(fs->stage.sampleIdRegid != a6xx::kRegidNone);
+        CHECK_EQ(fs->stage.k.textures[0].dim, uint8_t(kTexDimMS));
+        CHECK_EQ(fs->stage.k.textures[0].fbTarget, 1u);
+        CHECK(fs->listing.find("isamm") != std::string::npos);
+        auto linked = linkProgram(vs, fs, PixelFormat::kRGBA8Unorm, &why);
+        CHECK(linked != nullptr);
+        if (!linked) std::printf("       %s\n", why.c_str());
+        auto* p = hakios_metal_program_new_bitcode_samples(vsbc.data(), vsbc.size(), nullptr, 0,
+            fsbc.data(), fsbc.size(), nullptr, 0, unsigned(PixelFormat::kRGBA8Unorm), samples);
+        CHECK(p != nullptr && hakios_metal_program_framebuffer_fetch(p));
+        if (!p) std::printf("       %s\n", hakios_metal_error());
+        hakios_metal_program_free(p);
+    }
+}
+
 TEST(compiler_refuses_a_kernel_as_a_stage_and_a_stage_as_a_kernel) {
     if (!hasCompiler()) return;
     std::vector<uint8_t> kernel = bitcodeOf("fill_id"), vertex = bitcodeOf("tri_flat_vs"), fragment = bitcodeOf("tri_color_fs");
@@ -858,12 +929,13 @@ TEST(compiler_links_the_two_programs) {
         for (uint32_t i = 0; i < 8; i++) CHECK_EQ(l.psReplMode[i], 0u);
         CHECK_EQ(l.mrtComponents, 0xfu);
     }
-    // an unused varying is fine; a varying the VS does not write is not
+    // an unused varying is fine; a varying the VS does not write reads zero
     auto unused = linkProgram(stage("tri_color_vs"), stage("tri_flat_fs"), PixelFormat::kRGBA8Unorm, &why);
     CHECK(unused != nullptr);
     if (unused != nullptr) CHECK_EQ(unused->program.link.cnt, 1u);
-    CHECK(linkProgram(stage("tri_flat_vs"), stage("tri_color_fs"), PixelFormat::kRGBA8Unorm, &why) == nullptr);
-    expectRefusal(why, "the fragment stage reads varying slot 32 (VAR0), which the vertex stage does not write");
+    auto zero = linkProgram(stage("tri_flat_vs"), stage("tri_color_fs"), PixelFormat::kRGBA8Unorm, &why);
+    CHECK(zero != nullptr);
+    if (zero) CHECK_EQ(zero->program.link.interpMode[0] & 0xff, 0xaau);
     // the formats: a float4 into the float formats, not into the integer ones
     CHECK(linkProgram(stage("tri_flat_vs"), stage("tri_flat_fs"), PixelFormat::kRGBA16Float, &why) != nullptr);
     CHECK(linkProgram(stage("tri_flat_vs"), stage("tri_flat_fs"), PixelFormat::kRGBA32Float, &why) != nullptr);
@@ -1342,6 +1414,50 @@ TEST(a_stage_compiled_for_its_constant_buffer_reads_none_of_it) {
     known.binding = 1;
     auto other = compileStage(bc.data(), bc.size(), &why, {}, 0, &known);
     CHECK(other != nullptr && other->listing.find("c0.x") != std::string::npos);
+    // What it reads of the buffer (constantReads): bytes 0 to 15 of buffer 0, nothing of buffer 1. Bytes past them
+    // (a struct's padding) are no part of a specialisation: two contents that differ only there are one stage, filed
+    // once; a byte the mask does not keep is not folded, so the load stays.
+    uint8_t mask[20];
+    constantReadMask(*generic, 0, mask, sizeof(mask));
+    for (size_t i = 0; i < sizeof(mask); i++) CHECK_EQ(unsigned(mask[i]), i < 16 ? 0xffu : 0u);
+    constantReadMask(*generic, 1, mask, sizeof(mask));
+    for (uint8_t m : mask) CHECK_EQ(unsigned(m), 0u);
+    constantReadMask(*generic, 0, mask, sizeof(mask));
+    std::string dir = std::string(getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp/") + "/hakios-stage-mask-XXXXXX";
+    CHECK(mkdtemp(dir.data()) != nullptr);
+    setenv("HAKIOS_METAL_CACHE", dir.c_str(), 1);
+    unsetenv("HAKIOS_METAL_CACHE_SEED");
+    hakios_metal_stage_cache_stats stats;
+    hakios_metal_stage_cache_take_stats(&stats);
+    known.binding = 0;
+    known.bytes.assign(reinterpret_cast<const uint8_t*>(c), reinterpret_cast<const uint8_t*>(c) + 16);
+    known.bytes.insert(known.bytes.end(), {1, 2, 3, 4});
+    known.mask.assign(mask, mask + sizeof(mask));
+    auto padded = compileStage(bc.data(), bc.size(), &why, {}, 0, &known);
+    known.bytes[16] = 0x55;
+    auto repadded = compileStage(bc.data(), bc.size(), &why, {}, 0, &known);
+    CHECK(padded != nullptr && repadded != nullptr && padded->words == folded->words && repadded->words == folded->words);
+    hakios_metal_stage_cache_take_stats(&stats);
+    CHECK_EQ(stats.misses, 1u);
+    CHECK_EQ(stats.hits, 1u);
+    known.mask[0] = 0;
+    auto unknown = compileStage(bc.data(), bc.size(), &why, {}, 0, &known);
+    CHECK(unknown != nullptr && unknown->listing.find("c0.x") != std::string::npos);
+    hakios_metal_stage_cache_take_stats(&stats);
+    CHECK_EQ(stats.misses, 1u);
+    // (and what it reads comes back with a stage from the cache)
+    CHECK(compileStage(bc.data(), bc.size(), &why) != nullptr);
+    auto cached = compileStage(bc.data(), bc.size(), &why);
+    hakios_metal_stage_cache_take_stats(&stats);
+    CHECK_EQ(stats.hits, 1u);
+    CHECK(cached != nullptr && cached->constantReads.size() == 1 && cached->constantReads[0].binding == 0 && !cached->constantReads[0].any &&
+          cached->constantReads[0].bytes == std::vector<uint8_t>(16, 1));
+    unsetenv("HAKIOS_METAL_CACHE");
+    if (DIR* d = opendir(dir.c_str())) {
+        while (dirent* e = readdir(d)) if (e->d_name[0] != '.') remove((dir + "/" + e->d_name).c_str());
+        closedir(d);
+    }
+    rmdir(dir.c_str());
 }
 
 TEST(a_stage_compiled_without_the_preamble_is_taken_only_when_it_spills_less) {
@@ -1403,10 +1519,19 @@ TEST(a_compiled_stage_comes_back_from_the_cache_and_from_a_seed) {
     std::string why;
     setenv("HAKIOS_METAL_CACHE", writable.c_str(), 1);
     unsetenv("HAKIOS_METAL_CACHE_SEED");
+    // cached only (what a draw asks before it queues a specialisation): nothing filed yet, so nothing, and not compiled
+    hakios_metal_stage_cache_stats stats;
+    hakios_metal_stage_cache_take_stats(&stats);
+    CHECK(compileStage(bc.data(), bc.size(), &why, {}, 0, nullptr, true) == nullptr);
+    hakios_metal_stage_cache_take_stats(&stats);
+    CHECK_EQ(stats.misses, 0u);
+    CHECK(files(writable).empty());
     auto first = compileStage(bc.data(), bc.size(), &why);
     CHECK(first != nullptr);
     const std::vector<std::string> filed = files(writable);
     CHECK_EQ(filed.size(), size_t(1));
+    auto cachedOnly = compileStage(bc.data(), bc.size(), &why, {}, 0, nullptr, true);
+    CHECK(cachedOnly != nullptr && first != nullptr && cachedOnly->words == first->words);
     auto again = compileStage(bc.data(), bc.size(), &why);
     CHECK(again != nullptr && first != nullptr && again->words == first->words && again->stage.k.numWords == first->stage.k.numWords);
     if (filed.size() == 1) {
@@ -1441,4 +1566,217 @@ TEST(a_compiled_stage_comes_back_from_the_cache_and_from_a_seed) {
         rmdir(d.c_str());
     }
     rmdir(base);
+}
+
+TEST(stage_cache_keys_ignore_constant_order_and_parallel_hits_own_their_storage) {
+    if (!hasCompiler()) return;
+    auto bc = bitcodeOf("tri_fc_fs");
+    CHECK(!bc.empty());
+    if (bc.empty()) return;
+    std::string dir = std::string(getenv("TMPDIR") ? getenv("TMPDIR") : "/tmp/") + "/hakios-stage-cache-XXXXXX";
+    CHECK(mkdtemp(dir.data()) != nullptr);
+    setenv("HAKIOS_METAL_CACHE", dir.c_str(), 1);
+    unsetenv("HAKIOS_METAL_CACHE_SEED");
+    hakios_metal_stage_cache_stats stats;
+    hakios_metal_stage_cache_take_stats(&stats);
+    std::string why;
+    auto first = compileStage(bc.data(), bc.size(), &why, {{0, 7}, {1, 1}});
+    CHECK(first != nullptr);
+    hakios_metal_stage_cache_take_stats(&stats);
+    CHECK_EQ(stats.misses, 1u);
+    CHECK_EQ(stats.writes, 1u);
+    CHECK_EQ(stats.write_failures, 0u);
+    CHECK(stats.compile_ns > 0);
+    auto reordered = compileStage(bc.data(), bc.size(), &why, {{1, 1}, {0, 7}});
+    CHECK(first && reordered && first->words == reordered->words);
+    hakios_metal_stage_cache_take_stats(&stats);
+    CHECK_EQ(stats.hits, 1u);
+    CHECK_EQ(stats.misses, 0u);
+    CHECK_EQ(stats.wait_ns, 0u);  // a hit never takes the compiler lock
+    CHECK_EQ(stats.compile_ns, 0u);
+
+    std::atomic<unsigned> good{0};
+    std::vector<std::thread> readers;
+    for (unsigned i = 0; i < 8; ++i) readers.emplace_back([&] {
+        std::string error;
+        for (unsigned j = 0; j < 16; ++j) {
+            auto s = compileStage(bc.data(), bc.size(), &error, {{1, 1}, {0, 7}});
+            const auto indices = functionConstantIndices(bc.data(), bc.size());
+            if (first && s && s->words == first->words && s->stage.k.words == s->words.data() &&
+                s->stage.k.words != first->stage.k.words && s->stage.k.name == s->name.c_str() && !indices.empty()) ++good;
+        }
+    });
+    for (auto& t : readers) t.join();
+    CHECK_EQ(good.load(), 128u);
+    hakios_metal_stage_cache_take_stats(&stats);
+    CHECK_EQ(stats.hits, 128u);
+    CHECK_EQ(stats.misses, 0u);
+    CHECK_EQ(stats.wait_ns, 0u);
+
+    // A changed value, and undefined versus supplied zero, must still miss.
+    auto changed = compileStage(bc.data(), bc.size(), &why, {{0, 8}, {1, 1}});
+    auto missing = compileStage(bc.data(), bc.size(), &why, {});
+    auto zero = compileStage(bc.data(), bc.size(), &why, {{0, 0}});
+    CHECK(first && changed && changed->words != first->words);
+    CHECK(missing && zero && missing->words != zero->words);
+    hakios_metal_stage_cache_take_stats(&stats);
+    CHECK_EQ(stats.misses, 3u);
+    CHECK_EQ(stats.writes, 3u);
+    // A valid stage is still returned when its cache directory cannot be opened.
+    setenv("HAKIOS_METAL_CACHE", (dir + "/absent").c_str(), 1);
+    auto unsaved = compileStage(bc.data(), bc.size(), &why);
+    CHECK(unsaved != nullptr);
+    hakios_metal_stage_cache_take_stats(&stats);
+    CHECK_EQ(stats.write_failures, 1u);
+    CHECK_EQ(stats.failures, 0u);
+    unsetenv("HAKIOS_METAL_CACHE");
+    if (DIR* d = opendir(dir.c_str())) {
+        while (dirent* e = readdir(d)) if (e->d_name[0] != '.') remove((dir + "/" + e->d_name).c_str());
+        closedir(d);
+    }
+    rmdir(dir.c_str());
+}
+
+// The prewarm lane's recipes (HAKIOS_METAL_CACHE/prewarm-on, then warm-<uid>-<exe hash>/<hash>.warm: the compiler's
+// inputs, replayed at process start by hakios_metal_stage_cache_prewarm). A recipe's file name is the hash of its own
+// bytes, so a recipe already filed holds exactly these bytes: recording it again must not write. That write was on the
+// render thread inside pipeline creation and cost 35 to 45 ms a stage on the phone's HFS on UFS -- two of them were
+// v29q's 70.0 ms and 89.1 ms first-use pipelines (logs/v29-snap/v29q-user-1005.log:72100, :80518: 70 to 89 ms of wall
+// with 4 to 8 ms of CPU and nothing in the lookup or compile counters, because the record is neither). A recipe that
+// is not there is written, off the caller's thread.
+//
+// The device's order is the lane first, the render thread after: recipes are the boot before's. That is two processes
+// here -- a fork before this one has filed anything (or started its writer, which a child would not inherit) plays the
+// boot before, and this process replays what it left.
+TEST(a_recipe_is_filed_once_and_a_replayed_one_is_not_written_again) {
+    if (!hasCompiler()) {
+        std::printf("       (no compiler in this build: no recipe was recorded)\n");
+        return;
+    }
+    std::vector<uint8_t> vs = bitcodeOf("tri_flat_vs"), fs = bitcodeOf("tri_flat_fs"), later = bitcodeOf("tri_color_fs");
+    CHECK(!vs.empty() && !fs.empty() && !later.empty());
+    if (vs.empty() || fs.empty() || later.empty()) return;
+    char base[] = "/tmp/hakios-metal-recipes-XXXXXX";
+    CHECK(mkdtemp(base) != nullptr);
+    const std::string dir = base;
+    {
+        FILE* f = fopen((dir + "/prewarm-on").c_str(), "w");
+        CHECK(f != nullptr);
+        if (f != nullptr) fclose(f);
+    }
+    setenv("HAKIOS_METAL_CACHE", dir.c_str(), 1);
+    unsetenv("HAKIOS_METAL_CACHE_SEED");
+    // (the lane's directory is the cache's warm-<uid>-<exe hash>; setProcessCache's hash is of the string it is given,
+    // so both processes name it alike)
+    const char* lane = "hakios-metal-tests/recipes";
+    auto recipes = [&dir](std::vector<std::string>* out) {
+        std::string at;
+        if (out != nullptr) out->clear();
+        if (DIR* d = opendir(dir.c_str())) {
+            while (dirent* e = readdir(d)) {
+                const std::string n = e->d_name;
+                if (n.compare(0, 5, "warm-") == 0) at = dir + "/" + n;
+            }
+            closedir(d);
+        }
+        if (at.empty()) return;
+        if (DIR* d = opendir(at.c_str())) {
+            while (dirent* e = readdir(d)) {
+                const std::string n = e->d_name;
+                if (n.size() == 21 && n.substr(16) == ".warm" && out != nullptr) out->push_back(at + "/" + n);
+            }
+            closedir(d);
+        }
+    };
+    // the boot before: two stages compiled there, their recipes filed (on that process's writer, not its caller)
+    pid_t child = fork();
+    if (child == 0) {
+        std::string why;
+        const bool lane_ok = hakios_metal_stage_cache_set_process(lane);
+        auto a = lane_ok ? compileStage(vs.data(), vs.size(), &why) : nullptr;
+        auto b = lane_ok ? compileStage(fs.data(), fs.size(), &why) : nullptr;
+        std::vector<std::string> found;
+        for (unsigned i = 0; i < 10000 && found.size() < 2; i++) {
+            recipes(&found);
+            if (found.size() < 2) usleep(1000);
+        }
+        _exit(lane_ok && a != nullptr && b != nullptr && found.size() == 2 ? 0 : 1);
+    }
+    CHECK(child > 0);
+    if (child > 0) {
+        int status = 0;
+        CHECK(waitpid(child, &status, 0) == child);
+        CHECK(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    }
+    std::vector<std::string> filed;
+    recipes(&filed);
+    CHECK_EQ(filed.size(), size_t(2));
+    // this process: the lane reads them at start, as at every boot
+    CHECK(hakios_metal_stage_cache_set_process(lane));
+    hakios_metal_stage_cache_stats stats;
+    hakios_metal_stage_cache_take_stats(&stats);
+    hakios_metal_stage_cache_prewarm();
+    hakios_metal_stage_cache_take_stats(&stats);
+    CHECK_EQ(stats.prewarm_loaded, 2u);
+    CHECK_EQ(stats.prewarm_failures, 0u);
+    std::string why;
+    auto first = compileStage(vs.data(), vs.size(), &why);
+    CHECK(first != nullptr);
+    hakios_metal_stage_cache_take_stats(&stats);
+    CHECK_EQ(stats.prewarm_hits, 1u);      // from the lane's copy in RAM: no disk read, no compile
+    CHECK_EQ(stats.hits, 0u);
+    CHECK_EQ(stats.misses, 0u);
+    CHECK_EQ(stats.warm_writes, 0u);       // and its recipe, already filed, not written again
+    CHECK_EQ(stats.warm_write_skips, 1u);
+    auto second = compileStage(fs.data(), fs.size(), &why);
+    CHECK(second != nullptr);
+    hakios_metal_stage_cache_take_stats(&stats);
+    CHECK_EQ(stats.prewarm_hits, 1u);
+    CHECK_EQ(stats.warm_writes, 0u);
+    CHECK_EQ(stats.warm_write_skips, 1u);
+    // the same stage again: nothing to do at all (recorded, so no stat is even asked)
+    auto again = compileStage(vs.data(), vs.size(), &why);
+    CHECK(again != nullptr && first != nullptr && again->words == first->words);
+    hakios_metal_stage_cache_take_stats(&stats);
+    CHECK_EQ(stats.prewarm_hits, 1u);
+    CHECK_EQ(stats.warm_writes, 0u);
+    CHECK_EQ(stats.warm_write_skips, 0u);
+    // a recipe a write would replace is a new inode: neither file was touched
+    {
+        std::vector<std::string> now;
+        recipes(&now);
+        CHECK_EQ(now.size(), size_t(2));
+        CHECK(now == filed);
+    }
+    // a stage neither process filed: the writer files it, off this thread, and only once
+    auto third = compileStage(later.data(), later.size(), &why);
+    CHECK(third != nullptr);
+    for (unsigned i = 0; i < 10000; i++) {
+        hakios_metal_stage_cache_take_stats(&stats);
+        if (stats.warm_writes != 0) break;
+        usleep(1000);
+    }
+    CHECK_EQ(stats.warm_writes, 1u);
+    CHECK_EQ(stats.warm_write_failures, 0u);
+    recipes(&filed);
+    CHECK_EQ(filed.size(), size_t(3));
+    // the switch: with pipeline-prewarm-off there, nothing more is recorded (the recipes there are still replayed)
+    {
+        FILE* off = fopen((dir + "/pipeline-prewarm-off").c_str(), "w");
+        CHECK(off != nullptr);
+        if (off != nullptr) fclose(off);
+    }
+    std::vector<uint8_t> fourth = bitcodeOf("tri_color_vs");
+    CHECK(!fourth.empty());
+    if (!fourth.empty()) {
+        auto quiet = compileStage(fourth.data(), fourth.size(), &why);
+        CHECK(quiet != nullptr);
+        usleep(200000);   // any write would have been taken by the writer by now
+        hakios_metal_stage_cache_take_stats(&stats);
+        CHECK_EQ(stats.warm_writes, 0u);
+        CHECK_EQ(stats.warm_write_failures, 0u);
+        recipes(&filed);
+        CHECK_EQ(filed.size(), size_t(3));
+    }
+    unsetenv("HAKIOS_METAL_CACHE");
 }

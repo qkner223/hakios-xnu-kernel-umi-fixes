@@ -2,8 +2,15 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<!-- the first-boot setup assistant ("hello") has been gone through; nobody can do that here -->
+	<!-- the first-boot setup assistant ("hello") has been gone through; nobody can do that here.
+	     This file (cfprefs domain com.apple.purplebuddy, user mobile) is the one place the whole system reads
+	     "setup done" from: SetupAssistant.framework's BYSetupAssistantNeedsToRun / BYSetupAssistantHasCompletedInitialRun
+	     (ForceNoBuddy first, then SetupDone / SetupFinishedAllSteps), SpringBoard's own defaults (SetupDone, SetupState),
+	     and lockdownd, whose "buddy complete" test is SetupState != nil here (or -FirstPurpleBuddyCompletion in its
+	     data_ark): with it, pair records survive a reboot and pairing asks for Trust. Seeded once (init.c, var.skel). -->
 	<key>SetupDone</key>
+	<true/>
+	<key>SetupFinishedAllSteps</key>
 	<true/>
 	<key>SetupVersion</key>
 	<integer>11</integer>

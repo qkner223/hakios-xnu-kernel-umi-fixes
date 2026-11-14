@@ -1,5 +1,5 @@
-// The Adreno command processor's packets (PM4), as the A6xx family reads them (here the Adreno 7c+ Gen 3 of the
-// SM7325, chip id 0x06030500, an A635-family part to Mesa).
+// The Adreno command processor's packets (PM4), as the A6xx family reads them (here the Adreno 650 of the
+// SM8250, chip id 0x06050002, an A650-family part to Mesa).
 //
 // Two kinds are written here, the same two freedreno writes on these GPUs:
 //   type 4   "write COUNT registers from REG on":  0x4 << 28 | count | parity(count) << 7 | reg << 8 | parity(reg) << 27
@@ -13,6 +13,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <utility>
 #include <vector>
 
 namespace hakios::metal::pm4 {
@@ -41,6 +42,10 @@ constexpr uint32_t kType4 = 0x40000000u;
 constexpr uint32_t kType7 = 0x70000000u;
 constexpr uint32_t kMaxType4Count = 0x7e;     // a type-4 count has 7 bits, and Mesa keeps it below 0x7f
 constexpr uint32_t kMaxType7Count = 0x3fff;   // a type-7 count has 14 bits
+// The most words one CP_INDIRECT_BUFFER runs: its size word's 20 bits (0xfffff). Both of v22c's hangs were the one
+// command buffer of 0x10f964 and 0x1793bd words each, the command processor waiting with every block idle and both
+// IBs read to the end: a longer stream is handed to the kernel in pieces (pieces(), Gpu::submit)
+constexpr uint32_t kMaxIbWords = 0xfffff;
 
 constexpr uint32_t type4(uint32_t reg, uint32_t count) {
     return kType4 | count | oddParity(count) << 7 | (reg & 0x3ffffu) << 8 | oddParity(reg) << 27;
@@ -60,6 +65,10 @@ struct Header {
 
 Header decode(uint32_t word);
 
+// WORDS cut at packet boundaries into consecutive pieces of at most MAX words each, as (first word, words) pairs: one
+// piece for a stream that fits
+std::vector<std::pair<uint32_t, uint32_t>> pieces(const std::vector<uint32_t>& words, uint32_t max = kMaxIbWords);
+
 // A stream of packets being written. Addresses are the GPU's (the IOVA of a buffer plus an offset).
 class Stream {
 public:
@@ -76,7 +85,10 @@ public:
 
     const std::vector<uint32_t>& words() const { return words_; }
     size_t size() const { return words_.size(); }
+    size_t capacity() const { return words_.capacity(); }
     void clear() { words_.clear(); }
+    // room for N words without a reallocation: a stream reused draw after draw keeps the room its last use grew into
+    void reserve(size_t n) { words_.reserve(n); }
 
 private:
     void command(uint32_t opcode, uint32_t count);

@@ -1,6 +1,7 @@
 #include "hakios-metal/fake_gpu.hpp"
 
 #include <cerrno>
+#include <algorithm>
 #include <cmath>
 #include <chrono>
 #include <cstring>
@@ -264,6 +265,29 @@ uint8_t* FakeGpu::at(uint64_t iova, uint64_t length) {
         }
     }
     return nullptr;
+}
+
+void FakeGpu::wroteThroughCcu(uint64_t iova, bool depth) {
+    for (auto& [handle, b] : buffers_) {
+        if (iova >= b.iova && iova - b.iova < b.bytes.size()) {
+            const uint64_t lo = b.iova, hi = b.iova + b.bytes.size();
+            for (Unflushed& u : unflushed_) {
+                if (u.lo == lo && u.hi == hi && u.depth == depth) {
+                    u.flushed = false;
+                    return;
+                }
+            }
+            unflushed_.push_back(Unflushed{lo, hi, depth, false});
+            return;
+        }
+    }
+}
+
+bool FakeGpu::unflushedAt(uint64_t lo, uint64_t hi) const {
+    for (const Unflushed& u : unflushed_) {
+        if (lo < u.hi && u.lo < hi) return true;
+    }
+    return false;
 }
 
 void FakeGpu::fault(const std::string& why) {
@@ -561,6 +585,11 @@ bool FakeGpu::check2d(const uint32_t* d, const char* what, uint32_t i, bool samp
     if (base % 64 != 0 || at(base, reach) == nullptr) {
         fault(who + text(": %llu rows (%llu counted) of %llu bytes", height, rows, pitch) +
               text(" at %#llx: outside every buffer or not 64-byte aligned", base));
+        return false;
+    }
+    if (sampled && unflushedAt(base, base + reach)) {
+        fault(who + text(": sampled at %#llx while what a draw, fill or copy wrote there earlier in the submission is still in the CCU "
+                         "or behind a stale texture cache (no CCU flush and CACHE_INVALIDATE since)", base));
         return false;
     }
     if (sampled && fieldOf(d[0], A6XX_TEX_CONST_0_MIPLVLS__MASK, A6XX_TEX_CONST_0_MIPLVLS__SHIFT) != 0) {
@@ -886,7 +915,7 @@ bool FakeGpu::execBlit(const uint32_t* p, uint32_t count) {
     const uint32_t bpp = bytesPerPixel(fmt);
     // a linear image of a known format, or the one tiled image this driver makes: a depth texture (FMT6_32_FLOAT, TILE6_3)
     const uint32_t tile = fieldOf(info, A6XX_RB_2D_DST_INFO_TILE_MODE__MASK, A6XX_RB_2D_DST_INFO_TILE_MODE__SHIFT);
-    const bool tiled = tile == TILE6_3 && (fmt == FMT6_32_FLOAT || fmt == FMT6_8_UINT);
+    const bool tiled = tile == TILE6_3 && (fmt == FMT6_32_FLOAT || fmt == FMT6_16_UNORM || fmt == FMT6_8_UINT);
     // ...or a UBWC one (TILE6_3 with FLAGS, RGBA8-sized, WZYX): what a copy fills a compressed texture through
     const bool ubwc = copy && tile == TILE6_3 && (info & A6XX_RB_2D_DST_INFO_FLAGS) != 0 && fmt == FMT6_8_8_8_8_UNORM &&
                       fieldOf(info, A6XX_RB_2D_DST_INFO_COLOR_SWAP__MASK, A6XX_RB_2D_DST_INFO_COLOR_SWAP__SHIFT) == WZYX;
@@ -905,7 +934,7 @@ bool FakeGpu::execBlit(const uint32_t* p, uint32_t count) {
     case FMT6_16_FLOAT: case FMT6_16_16_FLOAT: case FMT6_16_16_16_16_FLOAT: case FMT6_11_11_10_FLOAT: case FMT6_10_10_10_2_UNORM_DEST:
         want = R2D_FLOAT16;
         break;
-    case FMT6_32_FLOAT: case FMT6_32_32_FLOAT: case FMT6_32_32_32_32_FLOAT: want = R2D_FLOAT32; break;
+    case FMT6_16_UNORM: case FMT6_32_FLOAT: case FMT6_32_32_FLOAT: case FMT6_32_32_32_32_FLOAT: want = R2D_FLOAT32; break;
     case FMT6_32_UINT: case FMT6_32_32_32_32_UINT: want = R2D_INT32; break;
     case FMT6_8_UINT: want = R2D_INT8; break;
     default: break;
@@ -992,6 +1021,13 @@ bool FakeGpu::execBlit(const uint32_t* p, uint32_t count) {
             pixel[0] = uint8_t(v);
             pixel[1] = uint8_t(v >> 8);
         }
+    } else if (ifmt == R2D_INT8) {
+        pixel[0] = uint8_t(c[0]);
+    } else if (fmt == FMT6_16_UNORM && ifmt == R2D_FLOAT32) {
+        float depth;
+        memcpy(&depth, &c[0], sizeof depth);
+        const uint16_t value = uint16_t(std::lround(std::clamp(depth, 0.0f, 1.0f) * 65535.0f));
+        memcpy(pixel, &value, sizeof value);
     } else if (ifmt == R2D_FLOAT16) {
         for (uint32_t i = 0; i < bpp / 2; i++) { uint16_t v = uint16_t(c[i]); memcpy(pixel + 2 * i, &v, 2); }
     } else {
@@ -1001,6 +1037,7 @@ bool FakeGpu::execBlit(const uint32_t* p, uint32_t count) {
         for (uint32_t x = x0; x <= x1; x++) memcpy(d + (y - y0) * pitch + uint64_t(x) * bpp, pixel, bpp);
     }
     stats_.fills++;
+    wroteThroughCcu(base, false);
     drawsInSubmission_++;   // the fill sits in the CCU as a draw's colour does: the same two flushes must follow it
     drawsWithoutCcuFlush_++;
     drawsWithoutCacheFlush_++;
@@ -1097,6 +1134,7 @@ bool FakeGpu::execCopy(uint32_t fmt, uint32_t bpp, uint32_t ifmt, uint32_t x0, u
         }
     }
     stats_.copies++;
+    wroteThroughCcu(base, false);
     drawsInSubmission_++;   // the copy sits in the CCU as a fill does: the same two flushes must follow it
     drawsWithoutCcuFlush_++;
     drawsWithoutCacheFlush_++;
@@ -1145,6 +1183,13 @@ bool FakeGpu::eventBlit() {
     uint32_t binW = 0, binH = 0, win[4] = {};
     if (!tileState(&binW, &binH, win)) return false;
     const uint32_t info = reg(REG_A6XX_RB_BLIT_INFO), type = info & A6XX_RB_BLIT_INFO_TYPE__MASK;
+    // the bin's samples a pixel (RB_BLIT_GMEM_MSAA_CNTL): side by side in GMEM, as the draws lay them there
+    const uint32_t msaa = fieldOf(reg(REG_A6XX_RB_BLIT_GMEM_MSAA_CNTL), A6XX_RB_BLIT_GMEM_MSAA_CNTL_SAMPLES__MASK, A6XX_RB_BLIT_GMEM_MSAA_CNTL_SAMPLES__SHIFT);
+    if (reg(REG_A6XX_RB_BLIT_GMEM_MSAA_CNTL) & ~A6XX_RB_BLIT_GMEM_MSAA_CNTL_SAMPLES__MASK || msaa > MSAA_FOUR) {
+        fault(text("RB_BLIT_GMEM_MSAA_CNTL %#llx: one, two or four samples", reg(REG_A6XX_RB_BLIT_GMEM_MSAA_CNTL)));
+        return false;
+    }
+    const uint32_t samples = 1u << msaa;
     if (type != BLIT_EVENT_LOAD && type != BLIT_EVENT_STORE && type != BLIT_EVENT_CLEAR) {
         fault(text("RB_BLIT_INFO %#llx: a load, a store or a clear is what this GPU model runs", info));
         return false;
@@ -1152,10 +1197,11 @@ bool FakeGpu::eventBlit() {
     if (type == BLIT_EVENT_CLEAR) {
         // the tile's part of the blit scissor in GMEM filled with RB_BLIT_CLEAR_COLOR as the base format packs it (all
         // four components: a partial mask is not what this driver writes)
-        const uint32_t cbpp = bytesPerPixel(fieldOf(reg(REG_A6XX_RB_BLIT_DST_INFO), A6XX_RB_BLIT_DST_INFO_COLOR_FORMAT__MASK, A6XX_RB_BLIT_DST_INFO_COLOR_FORMAT__SHIFT));
+        const uint32_t pbpp = bytesPerPixel(fieldOf(reg(REG_A6XX_RB_BLIT_DST_INFO), A6XX_RB_BLIT_DST_INFO_COLOR_FORMAT__MASK, A6XX_RB_BLIT_DST_INFO_COLOR_FORMAT__SHIFT));
+        const uint32_t cbpp = pbpp * samples;
         const uint32_t cbase = reg(REG_A6XX_RB_BLIT_BASE_GMEM), stl = reg(REG_A6XX_RB_BLIT_SCISSOR_TL), sbr = reg(REG_A6XX_RB_BLIT_SCISSOR_BR);
         if (cbpp == 0 || cbpp > 16 || fieldOf(info, A6XX_RB_BLIT_INFO_CLEAR_MASK__MASK, A6XX_RB_BLIT_INFO_CLEAR_MASK__SHIFT) != 0xf ||
-            uint64_t(cbase) + uint64_t(binW) * binH * cbpp > gmem_.size()) {
+            uint64_t(cbase) + uint64_t(binW) * binH * cbpp > gmem_.size() || cbase % a6xx::kGmemBaseAlign != 0) {
             fault(text("a GMEM clear of %llu-byte pixels at %#llx: a known format, mask 0xf, inside GMEM", cbpp, cbase));
             return false;
         }
@@ -1164,7 +1210,9 @@ bool FakeGpu::eventBlit() {
         const uint32_t x1 = std::max(win[0], stl & 0x3fff), y1 = std::max(win[1], stl >> 16 & 0x3fff);
         const uint32_t x2 = std::min(win[2], sbr & 0x3fff), y2 = std::min(win[3], sbr >> 16 & 0x3fff);
         for (uint32_t y = y1; x1 <= x2 && y <= y2; y++) {
-            for (uint32_t x = x1; x <= x2; x++) memcpy(gmem_.data() + cbase + (uint64_t(y - win[1]) * binW + (x - win[0])) * cbpp, words, cbpp);
+            for (uint32_t x = x1; x <= x2; x++) {
+                for (uint32_t k = 0; k < samples; k++) memcpy(gmem_.data() + cbase + (uint64_t(y - win[1]) * binW + (x - win[0])) * cbpp + k * pbpp, words, pbpp);
+            }
         }
         stats_.tileClears++;
         return true;
@@ -1174,8 +1222,10 @@ bool FakeGpu::eventBlit() {
     const uint64_t dst = reg64(REG_A6XX_RB_BLIT_DST), pitch = uint64_t(reg(REG_A6XX_RB_BLIT_DST_PITCH) & 0xffff) << 6;
     const uint32_t gbase = reg(REG_A6XX_RB_BLIT_BASE_GMEM);
     const uint32_t stl = reg(REG_A6XX_RB_BLIT_SCISSOR_TL), sbr = reg(REG_A6XX_RB_BLIT_SCISSOR_BR);
-    if (bpp == 0 || (dstInfo & A6XX_RB_BLIT_DST_INFO_TILE_MODE__MASK) != TILE6_LINEAR || reg(REG_A6XX_RB_BLIT_GMEM_MSAA_CNTL) != 0) {
-        fault(text("RB_BLIT_DST_INFO %#llx: a linear, single-sampled destination of a known format", dstInfo));
+    // (a multisample bin is stored only into a one-sample destination: the resolve, each pixel its samples' average)
+    if (bpp == 0 || (dstInfo & A6XX_RB_BLIT_DST_INFO_TILE_MODE__MASK) != TILE6_LINEAR || (dstInfo & A6XX_RB_BLIT_DST_INFO_SAMPLES__MASK) != 0 ||
+        (samples != 1 && (type != BLIT_EVENT_STORE || bpp != 4))) {
+        fault(text("RB_BLIT_DST_INFO %#llx: a linear, single-sampled destination of a known format (from %llu samples: a 4-byte resolve)", dstInfo, samples));
         return false;
     }
     const uint32_t x1 = std::max(win[0], stl & 0x3fff), y1 = std::max(win[1], stl >> 16 & 0x3fff);
@@ -1184,7 +1234,7 @@ bool FakeGpu::eventBlit() {
     const uint64_t rowBytes = uint64_t(x2 - x1 + 1) * bpp;
     const bool swapBR = bpp == 4 && fieldOf(dstInfo, A6XX_RB_BLIT_DST_INFO_COLOR_SWAP__MASK, A6XX_RB_BLIT_DST_INFO_COLOR_SWAP__SHIFT) == WXYZ &&
                         fieldOf(dstInfo, A6XX_RB_BLIT_DST_INFO_COLOR_FORMAT__MASK, A6XX_RB_BLIT_DST_INFO_COLOR_FORMAT__SHIFT) == FMT6_8_8_8_8_UNORM;
-    if (uint64_t(gbase) + uint64_t(binW) * binH * bpp > gmem_.size() || pitch < rowBytes) {
+    if (uint64_t(gbase) + uint64_t(binW) * binH * bpp * samples > gmem_.size() || pitch < rowBytes || gbase % a6xx::kGmemBaseAlign != 0) {
         fault("an event blit past GMEM's end, or a destination pitch shorter than its rows");
         return false;
     }
@@ -1194,11 +1244,21 @@ bool FakeGpu::eventBlit() {
             fault(text("an event blit's row %llu at %#llx: outside every buffer", y, dst + uint64_t(y) * pitch));
             return false;
         }
-        uint8_t* g = gmem_.data() + gbase + (uint64_t(y - win[1]) * binW + (x1 - win[0])) * bpp;
+        uint8_t* g = gmem_.data() + gbase + (uint64_t(y - win[1]) * binW + (x1 - win[0])) * bpp * samples;
         // (GMEM holds the components in the RB's order, RGBA: a BGRA target's swap is undone by the load and redone by
         // the store -- what a Clear in the tile, packed RGBA, needs to come out as the 2D engine's fill does)
         uint8_t* to = type == BLIT_EVENT_LOAD ? g : m;
-        memcpy(to, type == BLIT_EVENT_LOAD ? m : g, rowBytes);
+        if (samples == 1) {
+            memcpy(to, type == BLIT_EVENT_LOAD ? m : g, rowBytes);
+        } else {
+            for (uint64_t px = 0; px < rowBytes / 4; px++) {
+                for (uint32_t c = 0; c < 4; c++) {
+                    uint32_t sum = 0;
+                    for (uint32_t k = 0; k < samples; k++) sum += g[(px * samples + k) * 4 + c];
+                    m[px * 4 + c] = uint8_t((sum + samples / 2) / samples);
+                }
+            }
+        }
         for (uint64_t o = 0; swapBR && o < rowBytes; o += 4) std::swap(to[o], to[o + 2]);
     }
     if (type == BLIT_EVENT_LOAD) stats_.tileLoads++;
@@ -1224,8 +1284,10 @@ bool FakeGpu::execDraw(const uint32_t* p, uint32_t count) {
     d.visCull = fieldOf(p[0], CP_DRAW_INDX_OFFSET_0_VIS_CULL__MASK, CP_DRAW_INDX_OFFSET_0_VIS_CULL__SHIFT);
     d.numInstances = p[1];
     d.numIndices = p[2];
-    if (d.primType != DI_PT_TRILIST && d.primType != DI_PT_TRISTRIP && d.primType != DI_PT_LINELIST && d.primType != DI_PT_LINESTRIP) {
-        fault(text("a draw of primitive type %llu: triangle lists (4) and strips (6) and line lists (2) and strips (3) are what this GPU model runs", d.primType));
+    if (d.primType != DI_PT_TRILIST && d.primType != DI_PT_TRISTRIP && d.primType != DI_PT_TRIFAN && d.primType != DI_PT_LINELIST &&
+        d.primType != DI_PT_LINESTRIP && d.primType != DI_PT_LINELOOP && d.primType != DI_PT_POINTLIST) {
+        fault(text("a draw of primitive type %llu: triangle lists, strips and fans (4, 6, 5), lines, strips and loops (2, 3, 7) and points (9) run here",
+                   d.primType));
         return false;
     }
     if ((count == 3) != (d.sourceSelect == DI_SRC_SEL_AUTO_INDEX) || (count == 7 && d.sourceSelect != DI_SRC_SEL_DMA)) {
@@ -1284,6 +1346,11 @@ bool FakeGpu::execDraw(const uint32_t* p, uint32_t count) {
         if (fieldOf(reg(REG_A6XX_GRAS_BIN_CONTROL), A6XX_GRAS_BIN_CONTROL_RENDER_MODE__MASK, A6XX_GRAS_BIN_CONTROL_RENDER_MODE__SHIFT) != BINNING_PASS ||
             fieldOf(reg(REG_A6XX_VFD_MODE_CNTL), A6XX_VFD_MODE_CNTL_RENDER_MODE__MASK, A6XX_VFD_MODE_CNTL_RENDER_MODE__SHIFT) != BINNING_PASS) {
             fault("a draw of the binning pass without GRAS_BIN_CONTROL and VFD_MODE_CNTL in BINNING_PASS");
+            return false;
+        }
+        // (A650 tracks RB_RENDER_CNTL: the binning pass runs with BINNING set through CP_REG_WRITE, fd6 update_render_cntl)
+        if ((reg(REG_A6XX_RB_RENDER_CNTL) & A6XX_RB_RENDER_CNTL_BINNING) == 0) {
+            fault("a draw of the binning pass without RB_RENDER_CNTL.BINNING");
             return false;
         }
         stats_.binnedDraws++;
@@ -1402,7 +1469,12 @@ bool FakeGpu::execDraw(const uint32_t* p, uint32_t count) {
         // bins of the targets written apart -- gmemSpans, checked below; a sysmem draw has none)
         if (inTile_) {
             gmemSpans[t][0] = reg(regRbMrt(REG_A6XX_RB_MRT_BASE_GMEM, t));
-            gmemSpans[t][1] = gmemSpans[t][0] + uint64_t(binW) * binH * bpp;
+            gmemSpans[t][1] = gmemSpans[t][0] + uint64_t(binW) * binH * bpp * d.samples;
+            // (a bin starts on a multiple of 4 KiB per CCU: freedreno's gmem_page_align, turnip's gmem_align)
+            if (gmemSpans[t][0] % a6xx::kGmemBaseAlign != 0) {
+                fault("RB_MRT_BASE_GMEM[" + which + "] " + text("is %#llx: not a multiple of the CCUs' 4 KiB each", gmemSpans[t][0]));
+                return false;
+            }
         } else if (reg(regRbMrt(REG_A6XX_RB_MRT_BASE_GMEM, t)) != 0) {
             fault("RB_MRT_BASE_GMEM[" + which + "] " + text("is %#llx: a sysmem draw has no GMEM base", reg(regRbMrt(REG_A6XX_RB_MRT_BASE_GMEM, t))));
             return false;
@@ -1676,15 +1748,20 @@ bool FakeGpu::execDraw(const uint32_t* p, uint32_t count) {
             fault(text("RB_STENCIL_CONTROL %#llx and GRAS_SU_STENCIL_CNTL %#llx: the stencil enable must agree", stencilControl, reg(REG_A6XX_GRAS_SU_STENCIL_CNTL)));
             return false;
         }
-        if (stencilControl != 0 && ((stencilInfo & A6XX_RB_STENCIL_INFO_SEPARATE_STENCIL) == 0 || depthFormat == DEPTH6_NONE)) {
+        if (stencilControl != 0 && (stencilInfo & A6XX_RB_STENCIL_INFO_SEPARATE_STENCIL) == 0) {
             fault("stencil state with no separate stencil buffer beside a depth buffer: what this GPU model runs is the S8 plane of a Depth32Float_Stencil8 texture");
             return false;
         }
         if ((stencilInfo & A6XX_RB_STENCIL_INFO_SEPARATE_STENCIL) != 0) {
             const uint64_t spitch = uint64_t(reg(REG_A6XX_RB_STENCIL_INFO + 1) & 0xfff) << 6, sbase = reg64(REG_A6XX_RB_STENCIL_INFO + 3);
             const uint32_t br = reg(REG_A6XX_GRAS_SC_WINDOW_SCISSOR_BR);
-            const uint64_t width = (br & 0x3fff) + 1, rows = ((br >> 16 & 0x3fff) + 1 + 31) / 32 * 32;
-            if (sbase % 4096 != 0 || spitch % 128 != 0 || spitch < width || at(sbase, rows * spitch) == nullptr) {
+            const uint32_t rowAlign = d.samples == 1 ? 32 : 16;
+            const uint32_t pitchAlign = d.samples == 1 ? 128 : 256;
+            const uint64_t width = (br & 0x3fff) + 1, rows = ((br >> 16 & 0x3fff) + rowAlign) / rowAlign * rowAlign;
+            // (in a tile the stencil is its bin in GMEM, RB_STENCIL_BUFFER_BASE_GMEM, below the colour cache: memory is not touched)
+            const uint32_t sgmem = reg(REG_A6XX_RB_STENCIL_INFO + 5);
+            if (inTile_ ? uint64_t(sgmem) + uint64_t(binW) * binH * d.samples > a6xx::kGmemCcuColorOffset || sgmem % a6xx::kGmemBaseAlign != 0
+                        : sbase % 4096 != 0 || spitch % pitchAlign != 0 || spitch < width * d.samples || at(sbase, rows * spitch) == nullptr) {
                 fault(text("the stencil buffer at %#llx with a pitch of %llu bytes, ", sbase, spitch) +
                       text("%llu rows: not 4096-aligned, not a multiple of 128, narrower than the window, or outside every buffer", rows));
                 return false;
@@ -1697,7 +1774,7 @@ bool FakeGpu::execDraw(const uint32_t* p, uint32_t count) {
                 return false;
             }
         } else {
-            if (depthFormat != DEPTH6_32 || fieldOf(reg(REG_A6XX_GRAS_SU_DEPTH_BUFFER_INFO), A6XX_RB_DEPTH_BUFFER_INFO_DEPTH_FORMAT__MASK, 0) != depthFormat) {
+            if ((depthFormat != DEPTH6_32 && depthFormat != DEPTH6_16) || fieldOf(reg(REG_A6XX_GRAS_SU_DEPTH_BUFFER_INFO), A6XX_RB_DEPTH_BUFFER_INFO_DEPTH_FORMAT__MASK, 0) != depthFormat) {
                 fault(text("depth format %llu in RB_DEPTH_BUFFER_INFO and %llu in GRAS_SU_DEPTH_BUFFER_INFO: DEPTH6_32 in both is what this GPU model runs", depthFormat,
                            fieldOf(reg(REG_A6XX_GRAS_SU_DEPTH_BUFFER_INFO), A6XX_RB_DEPTH_BUFFER_INFO_DEPTH_FORMAT__MASK, 0)));
                 return false;
@@ -1715,7 +1792,10 @@ bool FakeGpu::execDraw(const uint32_t* p, uint32_t count) {
             const uint64_t width = (br & 0x3fff) + 1, rows = ((br >> 16 & 0x3fff) + 1 + 15) / 16 * 16;
             // (a multisample one holds the draw's sample count of 4-byte depths a texel: fdl6's cpp 4 * samples, its pitch a
             // multiple of 64 such texels)
-            if (base % 4096 != 0 || pitch % (256 * d.samples) != 0 || pitch < width * 4 * d.samples || at(base, rows * pitch) == nullptr) {
+            const uint32_t cpp = (depthFormat == DEPTH6_16 ? 2 : 4) * d.samples;
+            const uint32_t dgmem = reg(REG_A6XX_RB_DEPTH_BUFFER_INFO + 5);   // RB_DEPTH_BUFFER_BASE_GMEM: the bin in a tile
+            if (inTile_ ? uint64_t(dgmem) + uint64_t(binW) * binH * cpp > a6xx::kGmemCcuColorOffset || dgmem % a6xx::kGmemBaseAlign != 0
+                        : base % 4096 != 0 || pitch % (64 * std::max(4u, cpp)) != 0 || pitch < width * cpp || at(base, rows * pitch) == nullptr) {
                 fault(text("the depth buffer at %#llx with a pitch of %llu bytes, ", base, pitch) + text("%llu rows, ", rows) +
                       text("%llu sample(s): not 4096-aligned, not a multiple of 256 a sample, narrower than the window, or outside every buffer", d.samples));
                 return false;
@@ -1904,6 +1984,12 @@ bool FakeGpu::execDraw(const uint32_t* p, uint32_t count) {
     drawsInSubmission_++;
     drawsWithoutCcuFlush_++;
     drawsWithoutCacheFlush_++;
+    if (!inTile_ && !binning_) {
+        for (uint32_t t = 0; t < d.mrtCount && t < 8; t++) {
+            if (d.mrtBases[t] != 0) wroteThroughCcu(d.mrtBases[t], false);
+        }
+        if (d.depthBase != 0) wroteThroughCcu(d.depthBase, true);
+    }
     samples_ += uint64_t(d.numIndices) * d.numInstances;
     d.vsConsts = vs_.consts;
     d.fsConsts = fs_.consts;
@@ -2078,6 +2164,14 @@ bool FakeGpu::execute(uint64_t address, uint32_t words, int depth) {
                 }
                 break;
             }
+            case CP_REG_WRITE:
+                // a register written through a tracker of the command processor's (A650: TRACK_RENDER_CNTL, RB_RENDER_CNTL alone here)
+                if (h.count != 3 || p[0] != TRACK_RENDER_CNTL || p[1] != REG_A6XX_RB_RENDER_CNTL) {
+                    fault("CP_REG_WRITE other than RB_RENDER_CNTL through TRACK_RENDER_CNTL");
+                    return false;
+                }
+                regs_[p[1]] = p[2];
+                break;
             case CP_SET_MODE:
             case CP_SKIP_IB2_ENABLE_GLOBAL:
             case CP_SKIP_IB2_ENABLE_LOCAL:
@@ -2155,6 +2249,10 @@ bool FakeGpu::execute(uint64_t address, uint32_t words, int depth) {
                 if (h.count == 1 && fieldOf(p[0], CP_EVENT_WRITE_0_EVENT__MASK, CP_EVENT_WRITE_0_EVENT__SHIFT) == BLIT && !eventBlit()) {
                     return false;
                 }
+                if (h.count == 1 && fieldOf(p[0], CP_EVENT_WRITE_0_EVENT__MASK, CP_EVENT_WRITE_0_EVENT__SHIFT) == CACHE_INVALIDATE) {
+                    // (what a CCU flush put out is read afresh from now on)
+                    unflushed_.erase(std::remove_if(unflushed_.begin(), unflushed_.end(), [](const Unflushed& u) { return u.flushed; }), unflushed_.end());
+                }
                 if (h.count == 1 && fieldOf(p[0], CP_EVENT_WRITE_0_EVENT__MASK, CP_EVENT_WRITE_0_EVENT__SHIFT) == ZPASS_DONE) {
                     if ((reg(REG_A6XX_RB_SAMPLE_COUNT_CONTROL) & A6XX_RB_SAMPLE_COUNT_CONTROL_COPY) == 0) {
                         fault("ZPASS_DONE without RB_SAMPLE_COUNT_CONTROL.COPY: no count is written");
@@ -2190,6 +2288,9 @@ bool FakeGpu::execute(uint64_t address, uint32_t words, int depth) {
                     uint32_t ev = fieldOf(p[0], CP_EVENT_WRITE_0_EVENT__MASK, CP_EVENT_WRITE_0_EVENT__SHIFT);
                     if (ev == PC_CCU_FLUSH_COLOR_TS) drawsWithoutCcuFlush_ = 0;
                     if (ev == PC_CCU_FLUSH_DEPTH_TS) drawsWithoutDepthFlush_ = 0;
+                    for (Unflushed& u : unflushed_) {
+                        if (ev == (u.depth ? PC_CCU_FLUSH_DEPTH_TS : PC_CCU_FLUSH_COLOR_TS)) u.flushed = true;
+                    }
                     if (ev == CACHE_FLUSH_TS) drawsWithoutCacheFlush_ = 0;
                 }
                 break;
@@ -2353,16 +2454,20 @@ bool FakeGpu::execute(uint64_t address, uint32_t words, int depth) {
     return true;
 }
 
-// A submission the GPU never finishes, as the kernel treats it. With recovery, the GPU is reset and everything it
-// had been given is given up as done: the fence word is set to the last submission's number (hakios_gpu_recover),
-// so every wait ends, the hung submission's own with the timeout it was found by, and FAULTS says it happened.
+// A submission the GPU never finishes, as the kernel treats it. With recovery, the GPU is reset and the submission it
+// hung on -- the first not done -- is given up: its fence is passed, its own wait ends with the timeout it was found
+// by, GIVEN_UP names it and FAULTS counts the reset; the ones behind it run as they would have (hakios_gpu_recover).
 // Without recovery nothing is waited for again in this run.
 void FakeGpu::hung() {
-    jobs_.clear();
     if (recovers_) {
         stats_.recoveries++;
-        completed_ = submitted_;
+        if (completed_ < submitted_) {
+            hungFences_.insert(completed_ + 1);
+            if (!jobs_.empty() && jobs_.front().fence == completed_ + 1) jobs_.pop_front();
+            completed_++;
+        }
     } else {
+        jobs_.clear();
         wedged_ = true;
     }
 }
@@ -2379,8 +2484,18 @@ void FakeGpu::run(const Job& job) {
     gfxIboUnits_ = 0;
     passBegun_ = ccuCntlWritten_ = ccuCntlAfterWfi_ = lastWasWfi_ = inTile_ = binning_ = false;
     drawsInSubmission_ = drawsWithoutCcuFlush_ = drawsWithoutCacheFlush_ = drawsWithoutDepthFlush_ = 0;
+    unflushed_.clear();   // (the last submission ended with both flushes, which the fake holds it to, and the kernel invalidates)
     written_.clear();
-    bool ok = execute(job.address, job.words, 0);
+    bool ok = true;
+    for (const auto& [address, words] : job.ibs) {
+        // (CP_INDIRECT_BUFFER's size word: 20 bits. The two hangs of v22c were each one IB of more)
+        if (words > pm4::kMaxIbWords) {
+            fault(text("a command buffer of %#llx words: one CP_INDIRECT_BUFFER runs 0xfffff at most", words));
+            ok = false;
+            break;
+        }
+        if (!(ok = execute(address, words, 0))) break;
+    }
     if (ok && drawsInSubmission_ != 0) {
         // the colour a draw wrote sits in the CCU until PC_CCU_FLUSH_COLOR_TS (the kernel's own end-of-submit fence
         // flushes the UCHE, not the CCU: hakios.adreno.c:3496-3516), and what the CCU flushed sits in the UCHE until
@@ -2445,8 +2560,9 @@ int FakeGpu::call(uint32_t request, void* data, size_t size) {
         case kParamPriorities: p->value = 1; return 0;
         case kParamPpPgtable: p->value = 0; return 0;
         case kParamFaults: p->value = stats_.recoveries; return 0;
+        case kParamGivenUp: p->value = hungFences_.count(uint32_t(p->value)); return 0;
         case kParamSuspends: p->value = 0; return 0;
-        case kParamHighestBankBit: p->value = 14; return 0;
+        case kParamHighestBankBit: p->value = 16; return 0;
         case kParamRaytracing: p->value = 0; return 0;
         case kParamUbwcSwizzle: p->value = 6; return 0;
         case kParamMacrotileMode: p->value = 1; return 0;
@@ -2528,16 +2644,23 @@ int FakeGpu::call(uint32_t request, void* data, size_t size) {
     case kGemSubmit: {
         if (size != sizeof(MsmGemSubmit)) return EINVAL;
         auto* s = static_cast<MsmGemSubmit*>(data);
-        if (s->nr_cmds != 1 || s->nr_bos == 0 || (s->queueid != 0 && queues_.count(s->queueid) == 0)) return EINVAL;
+        // (the kernel takes up to 128 command buffers a submission, hakios.gpu.cpp GPU_SUBMIT_CMDS: run in order)
+        if (s->nr_cmds == 0 || s->nr_cmds > 128 || s->nr_bos == 0 || (s->queueid != 0 && queues_.count(s->queueid) == 0)) return EINVAL;
         auto* bos = reinterpret_cast<const MsmSubmitBo*>(uintptr_t(s->bos));
-        auto* cmd = reinterpret_cast<const MsmSubmitCmd*>(uintptr_t(s->cmds));
-        if (cmd->submit_idx >= s->nr_bos || cmd->type != kSubmitCmdBuf || cmd->size % 4 != 0) return EINVAL;
+        auto* cmds = reinterpret_cast<const MsmSubmitCmd*>(uintptr_t(s->cmds));
         for (uint32_t i = 0; i < s->nr_bos; i++) {
             if (buffers_.count(bos[i].handle) == 0) return ENOENT;   // a buffer the GPU would not know: refused
         }
-        Buffer& c = buffers_.at(bos[cmd->submit_idx].handle);
-        if (uint64_t(cmd->submit_offset) + cmd->size > c.bytes.size()) return EINVAL;
-        Job job{++submitted_, c.iova + cmd->submit_offset, cmd->size / 4};
+        Job job{0, {}};
+        for (uint32_t k = 0; k < s->nr_cmds; k++) {
+            const MsmSubmitCmd* cmd = &cmds[k];
+            if (cmd->submit_idx >= s->nr_bos || cmd->type != kSubmitCmdBuf || cmd->size % 4 != 0) return EINVAL;
+            Buffer& c = buffers_.at(bos[cmd->submit_idx].handle);
+            if (uint64_t(cmd->submit_offset) + cmd->size > c.bytes.size()) return EINVAL;
+            stats_.maxSubmitWords = std::max<uint32_t>(stats_.maxSubmitWords, cmd->size / 4);
+            job.ibs.emplace_back(c.iova + cmd->submit_offset, cmd->size / 4);
+        }
+        job.fence = ++submitted_;
         s->fence = job.fence;
         // (a wedged GPU still takes submissions, as the kernel's ring does until it is full: they are never run)
         if (wedged_) {

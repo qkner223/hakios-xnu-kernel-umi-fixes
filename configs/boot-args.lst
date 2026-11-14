@@ -20,6 +20,7 @@ adsp_pause	k
 adsp_return	k
 adsp_step	k
 adsp_wait	k
+anim_max	u
 apfs_cheap	k
 apfs_check	k
 apfs_chunk	k
@@ -93,12 +94,14 @@ fb_beam	k
 fb_beat	k
 fb_ca_hz	k
 fb_diff	k
+fb_dpu	k
 fb_filter	k
 fb_hz	k
 fb_intf	k
 fb_measure	k
 fb_pri	k
 fb_queue	k
+fb_stats	k
 fb_threads	k
 fbheight	k
 fbscale	k
@@ -143,6 +146,7 @@ gltrace_uniforms	u
 glwait	u
 glyes	u
 gpu	k
+gpu_fc	k
 gpu_cached	k
 gpu_exact	k
 gpu_keep	k
@@ -165,6 +169,9 @@ metal_gmem_draws	u
 metal_gmem_off	u
 metal_luma_boost	u
 metal_m2v	u
+metal_big	u
+metal_pass_wfi	u
+metal_rs	u
 metal_skip	u
 metal_trace	u
 metal_watch	u
@@ -348,3 +355,13 @@ wifi_wait	k
 wifi_watch	k
 wifi_wide	k
 xpcproxy_idversion	k
+usb	k
+
+# UMI CA diagnostics: completion, IOSurface seeds and borrowed CPU upload data
+metal_sync	u
+metal_shadow_refresh	u
+metal_nocopy_refresh	u
+
+# UMI: experimental panel brightness and fade bridge
+bl	k
+al	u

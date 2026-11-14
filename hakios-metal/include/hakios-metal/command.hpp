@@ -12,9 +12,11 @@
 //                       the reason, and the command buffer ends in the error state, as Metal's does on a bad blit.
 #pragma once
 
+#include <array>
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
+#include <cstring>
 #include <deque>
 #include <functional>
 #include <memory>
@@ -23,6 +25,7 @@
 #include <thread>
 #include <algorithm>
 #include <unordered_map>
+#include <unordered_set>
 #include <vector>
 
 #include "hakios-metal/compute.hpp"
@@ -38,7 +41,9 @@ class Texture;
 // a buffer a program sees: a GEM object with its length (MTLBuffer's -length may be less than the object's size)
 class Buffer {
 public:
-    Buffer(std::unique_ptr<Bo> bo, uint64_t length) : bo_(std::move(bo)), length_(length) {}
+    Buffer(std::unique_ptr<Bo> bo, uint64_t length, uint32_t surface = 0)
+        : bo_(std::move(bo)), length_(length), surface_(surface) {}
+    uint32_t surface() const { return surface_; }
     uint64_t length() const { return length_; }
     void* contents() const { return bo_->cpu(); }
     uint64_t gpuAddress() const { return bo_->gpuAddress(); }
@@ -47,9 +52,10 @@ public:
 private:
     std::unique_ptr<Bo> bo_;
     uint64_t length_;
+    uint32_t surface_;
 };
 
-std::shared_ptr<Buffer> newBuffer(Gpu& gpu, uint64_t length, std::string* why);
+std::shared_ptr<Buffer> newBuffer(Gpu& gpu, uint64_t length, std::string* why, uint32_t flags = kBoWriteCombined);
 // the live Buffer whose memory holds GPU address ADDRESS, and *OFFSET its offset in it; nullptr when none does. An
 // argument buffer names a buffer member by the address it was encoded with (setBuffer:offset:atIndex:, or the
 // gpuAddress an application writes itself), and this is how the draw finds the Buffer to bind and keep.
@@ -58,6 +64,31 @@ std::shared_ptr<Buffer> bufferAt(uint64_t address, uint64_t* offset);
 // lives: a second ask for the same surface gets the same Buffer (the kernel's handle for it is one), so that the
 // handle is closed once, by the last owner. nullptr with *why.
 std::shared_ptr<Buffer> surfaceBuffer(Gpu& gpu, uint32_t surfaceId, SurfaceInfo* info, std::string* why);
+// CPU access to an imported surface: drain its users and wait for real GPU completion.
+int synchronizeSurface(uint32_t surfaceId);
+
+// The bytes a draw's program-and-pass state is keyed by (CommandBuffer::draw's staticKey, and what decides whether the
+// next draw of a pass shares its pipeline's words): the two stages' programs, the draw's blending and options and the
+// stages' private memory. Fixed size, so that a draw makes no string of them -- the 320-byte std::string a draw was a
+// malloc, a 320-byte copy and a 320-byte hash, and the map's node a second copy. Equality is the bytes; the hash is
+// FNV-1a over them.
+struct StaticKey {
+    static constexpr size_t kMax = 512;   // (render.cpp static_asserts what the fields add up to)
+    uint8_t bytes[kMax] = {};
+    uint32_t size = 0;
+    bool operator==(const StaticKey& o) const { return size == o.size && std::memcmp(bytes, o.bytes, size) == 0; }
+    bool operator!=(const StaticKey& o) const { return !(*this == o); }
+};
+struct StaticKeyHash {
+    size_t operator()(const StaticKey& k) const {
+        uint64_t h = 1469598103934665603ull;   // FNV-1a, 64-bit
+        for (uint32_t i = 0; i < k.size; i++) {
+            h ^= k.bytes[i];
+            h *= 1099511628211ull;
+        }
+        return size_t(h ^ (h >> 32));
+    }
+};
 
 class CommandBuffer : public std::enable_shared_from_this<CommandBuffer> {
 public:
@@ -68,6 +99,7 @@ public:
 
     // run after completion (or error), on the queue's thread, in the order of commit; only before commit
     void addCompletedHandler(std::function<void(CommandBuffer&)> handler);
+    void setScheduledHandler(std::function<void()> handler) { scheduledHandler_ = std::move(handler); }
     void enqueue();
     void commit();
     void waitUntilCompleted();
@@ -111,7 +143,9 @@ public:
     // a blit the caller could not record (a buffer not in the GPU's memory, say): the buffer ends in the error state
     void refuse(const std::string& why) { fail(why); }
     // a buffer it uses, kept alive until it completes (the owner may let go of it before that)
-    void keep(std::shared_ptr<const Buffer> b) { kept_.push_back(std::move(b)); }
+    void keep(std::shared_ptr<const Buffer> b) {
+        if (keptBuffers_.insert(b.get()).second) kept_.push_back(std::move(b));
+    }
     // anything else it uses (a compiled kernel's words), the same way
     void keepAlive(std::shared_ptr<const void> p) { keptAny_.push_back(std::move(p)); }
     // OTHER's recorded work after this one's, as if it had been recorded here: its packets, what it names and what it
@@ -133,28 +167,85 @@ public:
     // What the buffer holds, counted as it is recorded: passes opened (each a pass start, its flushes and the wait for
     // idle at its tail, which is a fixed cost whatever is drawn), the draws in them, and dispatches, copies and clears
     // (each a pass of its own). What a frame's GPU time goes to is read off these beside the time (metal_fps).
-    struct Counts { uint32_t passes = 0, draws = 0, dispatches = 0, copies = 0, clears = 0, gmemPasses = 0, tiles = 0, binnedPasses = 0; };   // (gmemPasses of the passes drawn in tiles, binnedPasses of those binned)
+    struct Counts { uint32_t passes = 0, draws = 0, dispatches = 0, copies = 0, clears = 0, gmemPasses = 0, tiles = 0, binnedPasses = 0;   // (gmemPasses of the passes drawn in tiles, binnedPasses of those binned)
+                    // what the passes cost in synchronization (render.hpp: chained passes): the full tails written (each a WFI and
+                    // two flushes waited for; a pass apiece with setPassWfi(true)), the barriers inside a pass (a draw sampling
+                    // what an earlier pass of the chain wrote), the WFIs before a pass that writes what an earlier one sampled,
+                    // and the passes opened without the batch start
+                    uint32_t flushes = 0, barriers = 0, waits = 0, chained = 0;
+                    uint32_t sysmemPasses = 0, wfis = 0, merged = 0;
+                    // v29i: sysmem framebuffer-fetch barriers paid -- one per spell of writes to the fetched targets, not
+                    // one per fetch draw (a dual pass's sysmem body counts, whether or not the pass ends in tiles)
+                    uint32_t fetchBarriers = 0;
+                    uint64_t encodeNs = 0; };
     const Counts& counts() const { return counts_; }
     // With profiling on, the command processor writes its always-on counter (CP_ALWAYS_ON_COUNTER, 19.2 MHz) at the start
-    // of each pass and after its tail -- whose wait for idle makes the end the end -- for the first kMaxProfiled passes:
+    // of each pass and after its tail -- whose wait for idle makes the end the end:
     // what each costs, beside what it was (a draw pass with its target's size and its draws, a copy, a clear, a
     // dispatch). Read once the buffer has completed. metal_fps names a frame's slowest passes with it.
     enum PassKind : uint32_t { kPassDraw = 0, kPassCopy = 1, kPassClear = 2, kPassDispatch = 3 };
-    struct PassTime { PassKind kind; uint32_t width, height, draws; double us; uint32_t tiles = 0; uint64_t tuneKey = 0; uint8_t attached = 0, touched = 0; std::string sysmemWhy; };   // ATTACHED / TOUCHED: the colour attachments set, and those its draws wrote or read (a GMEM pass's)   // tiles 0: in sysmem; tuneKey: CommandQueue::preferGmem's
-    static constexpr uint32_t kMaxProfiled = 64;
+    struct PassTime { PassKind kind; uint32_t width, height, draws; double us; uint32_t tiles = 0; uint64_t tuneKey = 0; uint8_t attached = 0, touched = 0; std::string sysmemWhy;
+        std::vector<std::string> shaders;
+        uint32_t wfis = 0, resolves = 0, loads = 0, stores = 0, clears = 0, samples = 1, profileWfis = 0;
+        // the attachments' formats by name (render::attachedFormats), the draws that read their target through
+        // framebuffer fetch, and the read-after-write hazards inside this pass that a barrier was put before
+        std::string attachedFmt;
+        uint32_t fetchDraws = 0, inPassBarriers = 0;
+        // v29i (P4): draws of CoreAnimation's attachment_clear_frag -- the full-target clear quads that the
+        // investigation (work/v29i/INVESTIGATION-ca-gpu-perf.md) reads the heavy pass family's cost from -- and the
+        // target pixels they cover together (FULL: those covering the whole render area)
+        uint32_t clearQuadDraws = 0, clearQuadFull = 0;
+        uint64_t clearQuadPixels = 0;
+        // v29i (P1): of those draws, the ones the 2D engine's fill wrote in their place (render::clearQuadFillMask:
+        // IMPL-clearquad-fill.md) and the ones it left to the 3D pipe, summed into pass-v29d as clearQuadFill /
+        // clearQuadFallback -- how much of the family the fill took, and how much of it is still there to take
+        uint32_t clearQuadFills = 0, clearQuadFallbacks = 0;
+        // v29i (D1), one line a 2 s window (command.cpp: reportPasses): which rows of the target the pass's draws
+        // covered at all -- 16 bands, bit i the rows from i * height / 16 (0 the top) -- and which of those were
+        // covered by a draw other than CoreAnimation's attachment_clear_frag quad, whose area drawArea() reads as the
+        // whole target whenever its viewport and scissor are (the geometry itself is not looked at: render.cpp's
+        // drawArea). TARGETSURFACE: colour attachment 0's IOSurface (0: a texture of its own memory). The rest names
+        // what the pass sampled that no write had reached since it was made (texture.hpp's everWritten): a count of
+        // such draws and up to three of those textures, by size, surface and resource id.
+        uint16_t bands = 0, bandsNoClear = 0;
+        uint32_t targetSurface = 0, neverWrittenDraws = 0;
+        struct Sampled { uint32_t width = 0, height = 0, surface = 0; uint64_t id = 0; };
+        Sampled neverWritten[3];
+        uint8_t neverWrittenCount = 0;
+        size_t wordBegin = 0;
+        // Where this pass's two stamps (start, end) were written, and which pair of slots they are: append() moves a
+        // sub-encoder's stamp buffers into the parent, and each entry keeps its own buffer rather than an index that a
+        // merge would renumber (a parallel render encoder's sub-command buffers are where Maps' passes are recorded).
+        const Buffer* stampBuffer = nullptr;
+        uint32_t stampSlot = 0;
+    };   // ATTACHED / TOUCHED: the colour attachments set, and those its draws wrote or read (a GMEM pass's)   // tiles 0: in sysmem; tuneKey: CommandQueue::preferGmem's
+    static constexpr uint32_t kProfilePassesPerBlock = 64;
     void setProfile(bool on) { profile_ = on; }
     // ...and each draw of a sysmem pass on its own, the first kMaxProfiledDraws: a wait for idle before it and after it,
     // the counter at both (so the draws no longer overlap: what each costs alone), with its program's name. Which
     // draws of a heavy frame are heavy is read off these (metal_fps=draws).
-    struct DrawTime { std::string name; double us; uint32_t pass = 0, area[4] = {}; };   // PASS: its pass among passTimes'; AREA render::drawArea's
+    // STAMPBUFFER/STAMPSLOT: the buffer and slot pair its two stamps are in (as PassTime's: append keeps each entry's
+    // own buffer). AREA render::drawArea's.
+    struct DrawTime { std::string name; double us; uint32_t pass = 0, area[4] = {}; const Buffer* stampBuffer = nullptr; uint32_t stampSlot = 0; };   // PASS: its pass among passTimes'
     static constexpr uint32_t kMaxProfiledDraws = 512;
     void setProfileDraws(bool on) { profileDraws_ = on; }
     std::vector<DrawTime> drawTimes() const;
+    // Take PARENT's switches as this buffer's own (what the plug-in gives a parallel render encoder's sub-encoder
+    // command buffers at their creation): gmem/pass-wfi/profile/skip-refused and GMEM's refinements. A new buffer is
+    // GMEM-eligible by default, so without this metal_gmem=0 did not reach the passes Maps records in a sub-encoder.
+    void inheritSettings(const CommandBuffer& parent);
     // render::Options::gmem for this buffer's draws besides each draw's own (both must allow it): the C API's switch
     void setGmem(bool on) { gmem_ = on; }
+    // Every pass with its own tail and batch start, each a wait for idle (true: what every pass had before 9 November,
+    // boot-arg metal_pass_wfi=1), or draw passes chained with the barriers their hazards ask for (false, the default:
+    // render.hpp, chained passes). Before the first draw.
+    void setPassWfi(bool on) { passWfi_ = on; }
     // GMEM's refinements off, for a bisect on the phone: kGmemWholeArea tiles the whole window whatever the draws touch,
     // kGmemEveryAttachment loads and stores every attachment, kGmemFetchBarrier orders a fetch by the barrier
     enum : uint32_t { kGmemWholeArea = 1, kGmemEveryAttachment = 2, kGmemFetchBarrier = 4 };
+    // a multisample pass, and one with depth or stencil, tiled too when it qualifies (render::gmemPlan's MSAA_ZS); off:
+    // those stay in sysmem, as before
+    void setGmemMsaaZs(bool on) { gmemMsaaZs_ = on; }
     void setGmemOff(uint32_t bits) { gmemOff_ = bits; }
     // GMEM or sysmem for each pass by CommandQueue::preferGmem (each pass stamped for it) rather than GMEM whenever a
     // pass can have it: what the plug-in asks; off by default, so that a test gets the mode it asks for
@@ -162,8 +253,13 @@ public:
     // GMEM for a pass of at least DRAWS draws, sysmem for one of fewer; 0: not by the draws. The draws are counted as
     // they come, so the pass is recorded both ways until it closes. SpringBoard's passes of 63 to 161 draws took 13 to
     // 22 ms in GMEM against 17 to 31 in sysmem, its passes of 45 to 49 draws 8 to 10 against 6 to 8, its light ones 5
-    // against 0.13.
-    void setGmemMinDraws(uint32_t draws) { gmemMinDraws_ = draws; }
+    // against 0.13. kGmemAdaptive (metal_gmem_draws=999999) also considers target size,
+    // viewport/scissor coverage and MSAA, retaining the original-load sysmem replay.
+    static constexpr uint32_t kGmemAdaptive = 999999;
+    void setGmemMinDraws(uint32_t draws) {
+        adaptive_ = draws == kGmemAdaptive;
+        gmemMinDraws_ = adaptive_ ? 64 : draws;
+    }
     // render::Options::gmemBinning for this buffer's draws besides each draw's own (either asks for it)
     void setGmemBinning(bool on) { gmemBinning_ = on; }
     // every fragment texture the null texture (1x1, always in the texture cache): wrong pictures, but a draw's time then
@@ -190,22 +286,33 @@ private:
     bool tuning_ = false;     // setGmemTuned's (cleared by a failed stamp buffer too)
     bool profileDraws_ = false;
     std::vector<DrawTime> drawsProfiled_;
-    std::shared_ptr<Buffer> drawStamps_;
-    void drawStamp(uint32_t slot);
+    std::shared_ptr<Buffer> drawStamps_;                      // this buffer's own draw stamps (the first of the list below)
+    std::vector<std::shared_ptr<Buffer>> drawStampBuffers_;   // every set it owns: its own, and each append()ed buffer's
+    const Buffer* drawStamp(uint32_t slot);
     bool gmem_ = true;
     uint32_t gmemOff_ = 0;
     uint32_t gmemMinDraws_ = 0;
+    bool adaptive_ = false;
     bool gmemBinning_ = false;
+    bool gmemMsaaZs_ = false;
     bool nullFsTextures_ = false;
     uint32_t gmemClears_ = 0, gmemClearWords_[kMaxColorOutputs][4] = {};   // (draw's, for the pass it opens)
+    uint32_t gmemZsWords_[2] = {};   // ...and the depth's and the stencil's Clear words (render::GmemTileWork)
     std::string gmemWhy_;
     std::unordered_map<uint64_t, uint32_t> ordinals_;   // passes opened so far into each kind of target
     std::vector<PassTime> profiled_;   // as recorded; us filled in by passTimes from the stamps
-    std::shared_ptr<Buffer> profileStamps_;
-    // the counter into stamp slot SLOT (two a pass: start, end), when profiling and there is room
+    // The stamps are numbered by THIS buffer's own passes (ownPasses_), not by profiled_.size(): append() merges a
+    // sub-buffer's passes into profiled_, and a pass recorded after the append must not be numbered from a count that
+    // now includes another buffer's slots (it would write into the sub-buffer's own stamp, at a slot its entry names).
+    std::vector<std::shared_ptr<Buffer>> ownProfileStamps_;   // this buffer's own stamp sets: what stamp() grows/indexes
+    std::vector<std::shared_ptr<Buffer>> profileStamps_;      // lifetime of the sets append() took over (not this buffer's)
+    uint32_t ownPasses_ = 0;   // the passes this buffer itself started (not the merged ones)
+    // the counter into stamp slot SLOT (two a pass: start, end), growing in blocks
     void stamp(uint32_t slot);
     void stampStart(PassKind kind, uint32_t width, uint32_t height);
     void stampEnd();
+    uint32_t countWfis(const uint32_t* words, size_t size) const;
+    void reportPasses() const;
     uint32_t skipped_ = 0;
     std::string lastSkipped_;
     // dispatch and dispatchIndirect: GROUPS, or (GROUPS null) the counts at OFFSET of ARGS
@@ -213,7 +320,8 @@ private:
                      const uint32_t* immediates, const compute::Options& options);
     // the end of it, however it ends: the status, the handlers (which see that status), and only then the waiters
     void finish(Status s);
-    void use(const Buffer& b, bool write) { uses_.push_back(BoUse{&b.bo(), write}); }
+    void use(const Buffer& b, bool write);
+    void prepareSubmission();
 public:
     // What each register written in a pass holds, for appendDeduped: a draw writes some 500 of them and almost all
     // hold their value already, so each is looked up once, in an open-addressed table of its own (std::unordered_map's
@@ -264,7 +372,9 @@ private:
         render::Options options;
         uint64_t table;   // the GPU address of the pass's table: a piece (below), kept by the command buffer
         RegShadow regs;   // what each register written in the pass holds (render.cpp: appendDeduped)
-        std::vector<uint8_t> staticKey;   // what decided the last draw's program-and-pass state (render.cpp: draw)
+        StaticKey staticKey;   // what decided the last draw's program-and-pass state (render.cpp: draw)
+        render::DrawState state, sysState;
+        uint64_t coveredPixels = 0;
         // A pass drawn in GMEM (gmemPlan and every draw gmemDrawOk) is recorded rather than streamed: its draws gather
         // in BODIES, deduplicated among themselves from nothing (BODY_REGS) since each tile replays them after the
         // tile's own register writes, and closePass puts them in the tiles.
@@ -276,6 +386,16 @@ private:
         // write and read (a framebuffer fetch), as masks -- what closePass tiles, loads and stores
         uint32_t area[4] = {~0u, ~0u, 0, 0};
         uint32_t written = 0, read = 0;
+        // ...and those a barrier has already put out of the CCU since they were last written (a draw that writes one
+        // clears it again): a draw sampling an attachment's memory again is owed nothing until then
+        // (render.cpp: draw's in-pass read after write)
+        uint32_t barriered = 0;
+        // v29i, sysmem fetch barriers: a colour flush is the whole CCU's, so one covers every fetch after it until a
+        // draw writes a fetched target again. Fetched attachments cleared by this pass's head (not in written: a Clear
+        // is no draw), and whether a chained pass before this one left colour in the CCU (from DIRTY_ at the open) --
+        // both put out by a flush, so both cleared by one.
+        uint32_t fbCleared = 0;
+        bool fbCrossDirty = false;
         // Both ways at once (setGmemMinDraws): the draws gathered for tiles in BODIES and, beside them, as a sysmem pass in
         // SYS_STREAM (its head included, deduplicated through REGS), the GMEM head held in HEAD_GMEM; closePass takes the
         // one the pass's draws call for, now that they are known
@@ -283,11 +403,42 @@ private:
         pm4::Stream sysStream, headGmem;
         uint32_t clears = 0;        // the attachments a GMEM pass clears in its tiles (render::gmemClearWords), and their words
         uint32_t clearWords[kMaxColorOutputs][4] = {};
+        uint32_t zsWords[2] = {};   // the depth's and the stencil's, when clears has render::kSkipDepthClear / kSkipStencilClear
+        // Each multisample colour attachment's resolve, handed over by the blit that follows the pass (blitInto): done
+        // from the tiles when the pass is drawn in GMEM, by that blit after the pass when it ends in sysmem
+        const Texture* resolve[kMaxColorOutputs] = {};
+        uint32_t resolveLevel[kMaxColorOutputs] = {};
         uint64_t kind = 0;          // render::tuneKeyOf the pass and its ordinal in the buffer among passes of that kind
         uint32_t ordinal = 0, draws = 0;
         bool lastFetched = false;   // the last draw read its attachments (render::encodeInPass's AFTER_FETCH for the next)
+        std::vector<std::pair<uint64_t, uint64_t>> shaderWrites;   // memory its draws' stages may write (device buffers), [lo, hi)
     };
-    void closePass();
+    // The open pass's end. CHAIN: the next thing is a draw pass, so it ends with the light tail and the full one
+    // waits (flushChain); otherwise the full tail, which flushes what every chained pass before it left in the caches too.
+    void closePass(bool chain = false);
+    void closeOpenPass(bool chain);   // (closePass but for the resolves left for after the pass)
+    struct PendingResolve {
+        const Texture* src;
+        const Texture* dst;
+        uint32_t level;
+        render::Options options;
+    };
+    std::vector<PendingResolve> pendingResolves_;
+    uint32_t gmemTraceTag_ = 0;   // GMEM passes numbered for render::GmemTileWork::traceTag
+    // the full tail for the chained passes that ended with the light one, if any: before anything else is recorded
+    void flushChain();
+    // Chained passes' hazards: memory spans [lo, hi) written by the passes closed with the light tail since the last full
+    // flush (KIND: kColour through the colour CCU, kDepth through the depth CCU, kShader by a stage through the UCHE),
+    // and memory the draws read since the last wait for idle
+    enum : uint8_t { kColour = 1, kDepth = 2, kShader = 4 };
+    struct Span { uint64_t lo, hi; uint8_t kind; };
+    std::vector<Span> dirty_, reads_;
+    static void addSpan(std::vector<Span>* v, uint64_t lo, uint64_t hi, uint8_t kind);
+    static bool overlaps(const std::vector<Span>& v, uint64_t lo, uint64_t hi, uint8_t kinds);
+    bool passWfi_ = false;
+    uint64_t chainTable_ = 0;          // the last light-tailed pass's table (its tail words unused): flushChain's, 0 when none
+    bool chainDepth_ = false;          // ...a pass of the chain had a depth attachment: the depth CCU flushed too
+    render::Options chainOptions_;
     void useAttachments(const RenderPass& pass);
     std::unique_ptr<OpenPass> open_;
     // A piece of a larger buffer, for a draw's or a dispatch's table and a program's words. A buffer of its own for each
@@ -320,13 +471,23 @@ private:
     std::atomic<Status> status_{kNotEnqueued};
     std::string error_;
     pm4::Stream stream_;
+    // The four streams a draw is encoded into before it goes through deduplication onto STREAM_ (render.cpp: draw):
+    // reusing them keeps the room they grew into, where four fresh vectors a draw allocated and freed their way up to
+    // 350-600 words (some twenty reallocations and copies a draw). Cleared at the start of every draw.
+    pm4::Stream drawHead_, drawBody_, drawHeadSys_, drawBodySys_;
     std::vector<BoUse> uses_;
+    std::unordered_map<const Bo*, uint8_t> usedBos_;
+    std::unordered_set<const Buffer*> keptBuffers_;
+    std::unordered_map<StaticKey, render::PipelineState, StaticKeyHash> pipelineStates_;
     std::vector<std::shared_ptr<const Buffer>> kept_;   // the buffers it uses stay alive until it completes
     std::vector<std::shared_ptr<const void>> keptAny_;
     std::vector<std::function<void(CommandBuffer&)>> handlers_;
+    std::function<void()> scheduledHandler_;
+    bool submissionPrepared_ = false;
     std::mutex lock_;
     std::condition_variable done_;
     bool finished_ = false;                             // (under lock_) the handlers have run: waitUntilCompleted returns
+    std::atomic<bool> submissionResolved_{false};
     uint32_t fence_ = 0;
     uint64_t faultsAtCommit_ = 0;                       // the GPU's reset count then: one more by completion = given up, not run
     std::unique_ptr<Bo> commands_;
@@ -341,6 +502,16 @@ public:
 
     std::shared_ptr<CommandBuffer> commandBuffer();
     Gpu& gpu() { return gpu_; }
+    // Same queue, unique uncommitted buffers, in submission order. Publishes all real fences before returning.
+    void commitBatch(const std::vector<std::shared_ptr<CommandBuffer>>& buffers);
+    enum DrainReason { kSurface, kCpuSync, kCrossQueue, kLimit, kIdle, kDrainReasonCount };
+    // Private work stays retained here until a dependency, explicit sync, limit or runloop idle drain.
+    void stageBatch(const std::vector<std::shared_ptr<CommandBuffer>>& buffers, DrainReason reason = kIdle);
+    void drain(DrainReason reason);
+    static void drainAll(DrainReason reason);
+    static int synchronize(const Bo& bo, bool write = true);
+    static bool isComplete(const Bo& bo);
+    const std::array<uint32_t, kDrainReasonCount>& drainCounts() const { return drainCounts_; }
     // the buffers kept for command streams, idle (to see that they are given back and used again)
     size_t idleCommandBuffers();
     // What a draw binds at the slot the front end reserves for Metal's null texture (Kernel: KernelTexture::isNull): a
@@ -363,6 +534,9 @@ public:
     // the visibility streams' memory binned GMEM passes share (render::vscBytes): one is enough, the GPU running one
     // submission at a time and each pass's binning before its tiles; nullptr with *why
     std::shared_ptr<Buffer> vscBuffer(std::string* why);
+    // one word the command processor writes a GMEM pass's progress into (render::GmemTileWork::trace), read back into the
+    // error of a command buffer the GPU never finished: where in which tile it stopped
+    std::shared_ptr<Buffer> gmemTrace(std::string* why);
     // K's words in a buffer of their own, made the first time a command buffer of this queue draws with them and kept
     // for the next: copying them into each command buffer was most of a draw's first cost (CoreAnimation's uber shader is
     // 124 KB, into write-combined memory). Found by the words' pointer and taken only when every word is the same -- a
@@ -398,11 +572,20 @@ private:
     CommandQueue(Gpu& gpu, uint32_t id) : gpu_(gpu), id_(id) {}
     void submit(std::shared_ptr<CommandBuffer> cb);
     void waiter();
+    void submitBatch(const std::vector<std::shared_ptr<CommandBuffer>>& buffers, DrainReason reason,
+                     std::unique_lock<std::mutex>* submissionGuard = nullptr);
+    void drainLocked(DrainReason reason);
+    int resolveUse(const Bo& bo, bool write);
+    static int synchronizeLocked(const Bo& bo, bool write, CommandQueue* consumer);
+    std::vector<std::shared_ptr<CommandBuffer>> staged_;
+    size_t stagedWords_ = 0;
+    std::array<uint32_t, kDrainReasonCount> drainCounts_{}, encodeDrainReasons_{};
     std::unique_ptr<Bo> takeCommandBo(size_t bytes, int* error);
 
     Gpu& gpu_;
     std::shared_ptr<Texture> null_;   // (under lock_) nullTexture's
     std::shared_ptr<Buffer> vsc_;     // (under lock_) vscBuffer's
+    std::shared_ptr<Buffer> gmemTrace_;   // (under lock_) gmemTrace's
     // (under poolLock_, a lock of its own: a command buffer gives its stamps back as it is destroyed, which can be under
     // lock_ -- the queue letting go of the last one in flight -- and lock_ there was the window server hung at boot)
     std::mutex poolLock_;
@@ -423,6 +606,12 @@ private:
     std::unordered_map<uint64_t, Peak> peakDraws_;        // (under lock_) noteDraws' too: peakDraws'
     std::condition_variable changed_;
     std::deque<std::shared_ptr<CommandBuffer>> inFlight_;
+    std::deque<std::shared_ptr<CommandBuffer>> ready_;
+    std::mutex submitLock_;   // publishes a ready batch's fences before any commit in it returns
+    CommandBuffer::Counts encodeCounts_;
+    uint32_t encodeCbs_ = 0, encodeSubmits_ = 0;
+    uint32_t encodeDrains_ = 0, encodeDrainCbs_ = 0, encodeBatchedCommits_ = 0;
+    uint64_t encodeWindow_ = 0;
     std::vector<std::unique_ptr<Bo>> idle_;
     bool quit_ = false;
     std::thread thread_;

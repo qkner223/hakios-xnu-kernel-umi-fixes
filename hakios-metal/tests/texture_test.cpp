@@ -46,6 +46,76 @@ std::string refusedSampler(const SamplerDesc& d) {
 bool has(const std::string& text, const char* part) { return text.find(part) != std::string::npos; }
 }  // namespace
 
+TEST(iosurface_raw_planes_share_bytes_with_packed_views) {
+    for (uint32_t fourcc : {0x34323066u, 0x34323076u}) {
+        auto driver = std::make_unique<FakeGpu>();
+        auto* fake = driver.get();
+        Gpu gpu(std::move(driver));
+        // Odd sizes, nonzero luma offset, and independently padded chroma pitch.
+        fake->addSurface(91, 65, 33, 128, fourcc, 128, 2);
+        const Texture::SurfacePlane y{128, 128, 65, 33}, uv{128 + 128 * 33, 192, 33, 17};
+        TextureDesc d;
+        d.format = PixelFormat::kR8Unorm;
+        d.width = 65; d.height = 33; d.usage = kTextureUsageRead | kTextureUsageWrite;
+        std::string why;
+        auto luma = Texture::wrapSurface(gpu, 91, d, &why, nullptr, 0, &y);
+        d.format = PixelFormat::kRG8Unorm; d.width = 33; d.height = 17;
+        auto chroma = Texture::wrapSurface(gpu, 91, d, &why, nullptr, 1, &uv);
+        CHECK(luma != nullptr && chroma != nullptr);
+        if (!luma || !chroma) return;
+        CHECK_EQ(luma->buffer().get(), chroma->buffer().get());
+        CHECK_EQ(chroma->gpuAddress() - luma->gpuAddress(), uv.offset - y.offset);
+        CHECK_EQ(chroma->bytesPerRow(), 192u);
+        CHECK_EQ(chroma->surface(), 91u);
+        const uint8_t cbcr[] = {27, 219};
+        CHECK(chroma->replace(32, 16, 1, 1, cbcr, 2, &why));
+        auto memory = fake->surfaceBytes(91);
+        CHECK_EQ(memory[uv.offset + 16 * uv.rowBytes + 64], 27u);
+        CHECK_EQ(memory[uv.offset + 16 * uv.rowBytes + 65], 219u);
+        CHECK_EQ(memory[y.offset], 0u);
+        // RGBA8 packs raw bytes; it never converts colour or touches the other plane.
+        for (unsigned plane = 0; plane < 2; ++plane) {
+            const auto& p = plane == 0 ? y : uv;
+            d.format = PixelFormat::kRGBA8Unorm; d.width = 16; d.height = p.height;
+            auto packed = Texture::wrapSurface(gpu, 91, d, &why, nullptr, plane, &p);
+            CHECK(packed != nullptr);
+            if (!packed) return;
+            const uint8_t bytes[] = {19, 43, 127, 239};
+            CHECK(packed->replace(1, 1, 1, 1, bytes, 4, &why));
+            memory = fake->surfaceBytes(91);
+            CHECK(std::memcmp(memory.data() + p.offset + p.rowBytes + 4, bytes, 4) == 0);
+        }
+    }
+}
+
+TEST(iosurface_raw_plane_rejects_wrong_shape_and_unsafe_ranges) {
+    auto driver = std::make_unique<FakeGpu>();
+    auto* fake = driver.get();
+    Gpu gpu(std::move(driver));
+    fake->addSurface(92, 788, 1706, 800, 0x34323066u, 0, 2);
+    TextureDesc d;
+    d.format = PixelFormat::kRGBA8Unorm; d.width = 197; d.height = 1706; d.usage = kTextureUsageWrite;
+    const Texture::SurfacePlane y{0, 800, 788, 1706};
+    std::string why;
+    CHECK(Texture::wrapSurface(gpu, 92, d, &why, nullptr, 0, &y) == nullptr);
+    CHECK(has(why, "multiples of 64")); // actual log geometry must use the plane shadow
+    auto p = y; p.rowBytes = 832;
+    // Fits the fake allocation and is aligned: 197 RGBA texels represent 788 Y bytes.
+    CHECK(Texture::wrapSurface(gpu, 92, d, &why, nullptr, 0, &p) != nullptr);
+    d.width = 198;
+    CHECK(Texture::wrapSurface(gpu, 92, d, &why, nullptr, 0, &p) == nullptr); // cannot write padding as pixels
+    d.width = 197; d.height = 1707;
+    CHECK(Texture::wrapSurface(gpu, 92, d, &why, nullptr, 0, &p) == nullptr);
+    d.height = 1706;
+    CHECK(Texture::wrapSurface(gpu, 92, d, &why, nullptr, 2, &p) == nullptr);
+    p.offset = UINT64_MAX - 63;
+    CHECK(Texture::wrapSurface(gpu, 92, d, &why, nullptr, 0, &p) == nullptr);
+    p = y; p.rowBytes = 786;
+    CHECK(Texture::wrapSurface(gpu, 92, d, &why, nullptr, 0, &p) == nullptr);
+    p = y; p.height = UINT32_MAX;
+    CHECK(Texture::wrapSurface(gpu, 92, d, &why, nullptr, 0, &p) == nullptr);
+}
+
 TEST(texture_pitch_is_mesas_layout_rule) {
     // pitch = align(width * cpp, 64 * cpp) (fd6_layout.c:181-201 with pitchalign = cpp_shift): a row is a whole number
     // of 64 pixels, whatever the pixel's size
@@ -748,7 +818,7 @@ TEST(a_multisample_texture_is_its_samples_side_by_side) {
     CHECK(has(refusedMake(r, bad), "a texture of type 2 with 4 samples"));
     bad = four;
     bad.usage = kTextureUsageRead;
-    CHECK(has(refusedMake(r, bad), "a render target (4) alone, is served"));
+    CHECK(has(refusedMake(r, bad), "uncompressed colour or depth/stencil render target (4)"));
 }
 
 // A multisample Depth32Float is fdl6's tiled layout at cpp 4 * samples: its pitch aligned to 64 such texels and its rows
@@ -774,11 +844,8 @@ TEST(a_multisample_depth_is_tiled_at_its_samples_cpp) {
     CHECK_EQ(a->bytesPerRow(), 512u);    // 100 * 4 to 256
     CHECK_EQ(m->bytesPerRow(), 2048u);   // 100 * 16 to 1024
     CHECK_EQ(m->buffer()->length(), 32u * 2048);   // 20 rows to 32, 64 KiB
-    // a stencil plane is not served multisampled, nor a multisample depth that is stored into
+    // GPU shader stores to a depth attachment remain unsupported.
     TextureDesc bad = four;
-    bad.format = PixelFormat::kDepth32FloatStencil8;
-    CHECK(has(refusedMake(r, bad), "a multisample Depth32Float_Stencil8 texture"));
-    bad = four;
     bad.usage = kTextureUsageRenderTarget | kTextureUsageWrite;   // (read beside render target is taken, as sokol asks)
     CHECK(has(refusedMake(r, bad), "sampled too (5), not stored"));
     TextureDesc readToo = four;
@@ -1281,4 +1348,48 @@ TEST(a_stencil_view_reads_the_s8_plane) {
     z.format = PixelFormat::kDepth32Float;
     auto depthOnly = Texture::make(r.gpu, z, &why);
     CHECK(depthOnly != nullptr && Texture::view(depthOnly, PixelFormat::kX32Stencil8, TextureType::k2D, 0, 1, 0, 1, &why) == nullptr);
+}
+
+TEST(depth_stencil_planes_use_fdl_alignment_and_sample_count) {
+    Rig r;
+    std::string why;
+    for (uint32_t samples : {1u, 2u, 4u}) {
+        TextureDesc d;
+        d.width = 1125; d.height = 2436;
+        d.usage = kTextureUsageRenderTarget | kTextureUsageRead;
+        d.samples = samples;
+        d.type = samples == 1 ? TextureType::k2D : TextureType::k2DMultisample;
+        d.format = PixelFormat::kDepth32FloatStencil8;
+        auto ds = Texture::make(r.gpu, d, &why);
+        CHECK(ds != nullptr);
+        if (!ds) continue;
+        const uint64_t zp = 4608u * samples;
+        const uint64_t sp = samples == 1 ? 1152 : samples == 2 ? 2304 : 4608;
+        const uint64_t zbytes = (zp * 2448 + 4095) / 4096 * 4096;
+        const uint64_t sbytes = (sp * (samples == 1 ? 2464 : 2448) + 4095) / 4096 * 4096;
+        CHECK_EQ(ds->bytesPerRow(), zp);
+        CHECK_EQ(ds->stencilOffset(), zbytes);
+        CHECK_EQ(ds->stencilPitch(), sp);
+        CHECK_EQ(ds->stencilPlaneBytes(), sbytes);
+        CHECK_EQ(ds->buffer()->length(), zbytes + sbytes);
+        d.format = PixelFormat::kStencil8;
+        auto s8 = Texture::make(r.gpu, d, &why);
+        CHECK(s8 != nullptr);
+        if (!s8) continue;
+        CHECK_EQ(s8->stencilOffset(), 0u);
+        CHECK_EQ(s8->bytesPerRow(), sp);
+        CHECK_EQ(s8->buffer()->length(), sbytes);
+        auto descriptor = s8->sampledDescriptor();
+        CHECK_EQ(descriptor.dword[2] & a6xx::A6XX_TEX_CONST_2_PITCHALIGN__MASK, samples == 1 ? 1u : 2u);
+        CHECK((descriptor.dword[3] & a6xx::A6XX_TEX_CONST_3_TILE_ALL) != 0);
+        d.format = PixelFormat::kDepth16Unorm;
+        d.width = 65; d.height = 17;
+        auto d16 = Texture::make(r.gpu, d, &why);
+        CHECK(d16 != nullptr);
+        if (!d16) continue;
+        const uint64_t pitch = samples == 1 ? 256 : samples == 2 ? 512 : 1024;
+        CHECK_EQ(d16->bytesPerRow(), pitch);
+        CHECK_EQ(d16->depthPlaneBytes(), pitch * 32);
+        CHECK_EQ(d16->buffer()->length(), pitch * 32);
+    }
 }

@@ -254,8 +254,8 @@ namespace render {
 
 // VS to FS as ir3_link_shaders does it: every FS input with compmask && bary and inloc < totalIn takes the VS output of
 // the same slot at loc = inloc (ir3_link_add), then the position is appended at maxLoc with compmask 0xf. False with
-// *why: an FS varying no VS output serves (ir3 would read zeros through regid 63.0; refused here by slot), a VS without
-// a position, more than kMaxStageOutputs entries. Implemented in src/link.cpp.
+// *why: a VS without a position or more than kMaxStageOutputs entries. An FS varying without a VS output reads
+// zero through VPC interpolation. Implemented in src/link.cpp.
 bool link(const Stage& vs, const Stage& fs, Linkage* out, std::string* why);
 
 }  // namespace render
@@ -263,7 +263,8 @@ bool link(const Stage& vs, const Stage& fs, Linkage* out, std::string* why);
 // --- the pass and the draw --------------------------------------------------------------------------------------------
 enum class LoadAction : uint32_t { kDontCare = 0, kLoad = 1, kClear = 2 };     // MTLLoadAction's numbers
 enum class StoreAction : uint32_t { kDontCare = 0, kStore = 1 };               // MTLStoreAction's numbers
-enum class Primitive : uint32_t { kPoint = 0, kLine = 1, kLineStrip = 2, kTriangle = 3, kTriangleStrip = 4 };   // MTLPrimitiveType
+// MTLPrimitiveType, with the two private values AppleMetalGLRenderer sends for GL_LINE_LOOP and GL_TRIANGLE_FAN
+enum class Primitive : uint32_t { kPoint = 0, kLine = 1, kLineStrip = 2, kTriangle = 3, kTriangleStrip = 4, kLineLoop = 5, kTriangleFan = 6 };
 
 struct Viewport { double x, y, width, height, znear, zfar; };   // MTLViewport, Metal's top-left origin
 struct Scissor { uint32_t x, y, width, height; };               // MTLScissorRect
@@ -332,6 +333,7 @@ struct Draw {
     Primitive primitive = Primitive::kTriangle;  // step one: kTriangle and kTriangleStrip (DI_PT_TRILIST / DI_PT_TRISTRIP)
     uint32_t cullMode = 0;                       // MTLCullMode: None 0, Front 1, Back 2
     uint32_t winding = 0;                        // MTLWinding, the front face's: Clockwise 0, CounterClockwise 1 (in Metal's y-up NDC)
+    uint32_t glMode = 0;                         // hakios_metal_render_pass.gl_mode: GL depth 1, no viewport transform 4, last vertex provoking 8
     uint32_t vertexStart = 0;                    // VFD_INDEX_OFFSET: added to vertex_id by VFD_ADD_OFFSET.VERTEX (the static table)
     uint32_t vertexCount = 0;                    // CP_DRAW_INDX_OFFSET's NUM_INDICES (the index count of an indexed draw); 0 refused
     uint32_t instanceCount = 1;                  // NUM_INSTANCES, 1 or more
@@ -403,6 +405,11 @@ constexpr uint32_t kBlitFlushValue = 11;
 // the binning pass's cache flush, before the tiles read the visibility streams (fd6's FD6_FLUSH_CACHE after it)
 constexpr uint32_t kTableBinFlushAt = 76;
 constexpr uint32_t kBinFlushValue = 12;
+// the colour and depth CCU cleaned before the CCU is given over to the tiles (turnip's tu_emit_cache_flush_ccu: clean,
+// invalidate, wait for idle, then RB_CCU_CNTL); written, not waited on: the wait for idle after them is the wait
+constexpr uint32_t kTableGmemCleanColorAt = 80;
+constexpr uint32_t kTableGmemCleanDepthAt = 84;
+constexpr uint32_t kGmemCleanValue = 13;
 constexpr uint32_t kTableZeroedBytes = 96;        // what tableStart zeroes from kTableTimestampsAt: every word above
 static_assert(kTableMoreClearFlushAt + 4 * (kMaxColorOutputs - 1) <= kTableZeroedBytes, "the Clears' words are zeroed");
 // an occlusion query's two snapshots of the running sample count (RB_SAMPLE_COUNT_ADDR), begin and end, 64 bits each
@@ -463,6 +470,7 @@ struct Options {
     bool tailTimestampBit = false;   // must stay clear (28 October); here for the fake's test only
     bool dedupRegs = true;       // in an open pass, a register write that would put the value the register already holds is
                                  // left out (CommandBuffer::draw); off: every draw writes all of its state, as before
+    bool shaderState = true;     // shader preload/immediates; pushed buffer constants still load every draw
     bool gmem = true;            // a pass that qualifies (gmemPlan) is drawn tile by tile in GMEM: each tile loaded, every draw of the
                                  // pass replayed into it, stored once; off: every pass in sysmem, each draw's blending through memory
     bool gmemBinning = false;    // a GMEM pass's draws binned first by the hardware (the VSC), each tile drawing only those that reach
@@ -497,6 +505,11 @@ struct GmemPlan {
     // the CCU's colour cache shared out by bytes a pixel. Fixed when the pass opens -- the draws are encoded with it --
     // while the bins' size waits for the render area at its end (gmemTiles).
     uint32_t base[kMaxColorOutputs] = {}, room[kMaxColorOutputs] = {}, bpp[kMaxColorOutputs] = {};
+    // A multisample pass's SAMPLES samples a pixel sit side by side in its bin (bpp is a pixel's bytes in GMEM: the
+    // format's times the samples, turnip's att->cpp). The depth and the stencil attachment get bins of their own the same
+    // way (RB_DEPTH_BUFFER_BASE_GMEM, RB_STENCIL_BUFFER_BASE_GMEM); bpp 0 when the pass has none.
+    uint32_t samples = 1;
+    uint32_t depthBase = 0, depthRoom = 0, depthBpp = 0, stencilBase = 0, stencilRoom = 0, stencilBpp = 0;
     // the render area, X0 Y0 X1 Y1 inclusive (what the draws can touch), the grid's corner (aligned to the tile
     // alignment) and the bins over it
     uint32_t area[4] = {}, x0 = 0, y0 = 0;
@@ -507,7 +520,10 @@ struct GmemPlan {
 // bytes a pixel, their rows with room for the event blit's 16 x 4 granules past the edges; no depth or stencil. A bin
 // holds every attachment's pixels (CoreAnimation's main pass draws into two screens at once). False with *why
 // otherwise (the pass then runs in sysmem, as before).
-bool gmemPlan(const RenderPass& pass, GmemPlan* plan, std::string* why);
+// MSAA_ZS: a multisample pass, and a depth or stencil attachment, may be tiled too -- each multisample colour attachment
+// cleared or undefined at the start and never stored (its samples live in GMEM alone: memoryless, resolved from the
+// tile), the depth and stencil cleared or undefined and never stored; otherwise such a pass stays in sysmem.
+bool gmemPlan(const RenderPass& pass, GmemPlan* plan, std::string* why, bool msaaZs = true);
 // PLAN's bins over the render area AREA (X0 Y0 X1 Y1 inclusive, inside the window): turnip's tiling of a render area
 // (tu_tiling_config_update_tile_layout) -- the grid's corner at the area's aligned down, the bins as wide as the plan's
 // (gmemPlan picks the width; a fetch's descriptor holds it), as tall as every attachment's room holds. A pass whose draws touch a corner of the screen is drawn in the
@@ -521,6 +537,16 @@ uint64_t tuneKeyOf(const RenderPass& pass);
 // the colour attachments a draw of PROGRAM writes into, as a mask: a slot the stage writes, with an attachment, and a
 // write mask that lets something through
 uint32_t drawnAttachments(const Program& program, const RenderPass& pass);
+// v29i (P1): CoreAnimation's full-target clear quad (path_blit_vert + attachment_clear_frag, which writes (0,0,0,0) to
+// both of its targets and nothing else) -- whether the 2D engine's fill may write what it would have, and which colour
+// attachments that fill is still owed (a pass whose own Clear already wrote (0,0,0,0) is owed none). True only for the
+// pass's first draw, in sysmem, over the whole window, opaquely, with no depth/stencil state that could write or fail;
+// the geometry is read from the quad's own uniforms (buffer(0)'s float4x4 over buffer(1)'s rectangle, which must cover
+// the clip square). False with *why otherwise, and then the draw runs as before. Off: /var/db/hakios-metal-cache/
+// clearquad-fill-off (read once, as the other switches are). work/v29i/IMPL-clearquad-fill.md.
+bool clearQuadFillMask(const Program& program, const RenderPass& pass, const Draw& draw, const Bindings& vsBindings, uint32_t* mask, std::string* why);
+// ...and that fill, attachment by attachment of MASK, after encodeBegin's pass start (clearStream, as a Clear does it)
+void encodeClearFill(pm4::Stream& stream, const RenderPass& pass, uint32_t mask, uint64_t table);
 // whether a draw may be replayed per tile: the replay runs its vertex stage once a tile and reads the targets' memory
 // as it was before the pass, so no stage that writes buffers (Program::ssboWrites), no visibility result, no texture over an attachment's
 // memory (a framebuffer fetch reads the attachment's bin in GMEM instead: encodeInPass)
@@ -533,8 +559,26 @@ bool gmemDrawOk(const Program& program, const RenderPass& pass, const Draw& draw
 // CLEAR: the attachments cleared in GMEM instead of loaded (gmemClearWords' packing in CLEAR_WORDS), which
 // encodeBegin was told to leave unfilled
 // VSC: with Options::gmemBinning, the visibility streams' memory (vscBytes'), the draws having been encoded USE_VISIBILITY
+// What a tile does besides the colour loads, stores and clears: the depth and stencil Clears in the tile (ZS_CLEAR bit 0
+// depth, bit 1 stencil, with their packed words), each multisample colour attachment's resolve straight from the tile
+// into its one-sample texture (turnip's tu_store_gmem_attachment fast path: the event blit averages the samples), and
+// TRACE, a word the command processor writes its progress into (0: none)
+// encodeBegin's SKIP_CLEARS: bit i colour attachment i's Clear, and these two the depth's and the stencil's
+constexpr uint32_t kSkipDepthClear = 1u << 8, kSkipStencilClear = 1u << 9;
+struct GmemTileWork {
+    uint32_t zsClear = 0, depthWord = 0, stencilWord = 0;
+    const Texture* resolve[kMaxColorOutputs] = {};
+    uint32_t resolveLevel[kMaxColorOutputs] = {};
+    uint64_t trace = 0;
+    bool fetchBarrierInBody = false; // first fetch barrier executes in every unbinned tile
+    uint32_t traceTag = 0;   // (the pass's number in the trace word's bits 16-27)
+};
 void encodeGmem(pm4::Stream& stream, const RenderPass& pass, const GmemPlan& plan, uint64_t bodies, uint32_t bodyWords, uint64_t table, const Options& o,
-                uint32_t load, uint32_t store, bool fetch, uint32_t clear = 0, const uint32_t (*clearWords)[4] = nullptr, uint64_t vsc = 0);
+                uint32_t load, uint32_t store, bool fetch, uint32_t clear = 0, const uint32_t (*clearWords)[4] = nullptr, uint64_t vsc = 0,
+                const GmemTileWork* work = nullptr);
+// whether DST (level LEVEL) can take the resolve of the multisample colour attachment SRC from a tile: the same format,
+// one the event blit averages (8-bit unorm RGBA), the size of SRC, rows with room for the blit's 16 x 4 granules
+bool gmemResolveOk(const Texture& src, const Texture& dst, uint32_t level, std::string* why);
 // the visibility streams' memory a binned GMEM pass needs: each pipe's draw stream and its size word, each pipe's
 // primitive stream
 constexpr uint32_t kVscDrawPitch = 0x4000, kVscPrimPitch = 0x20000;
@@ -573,11 +617,44 @@ bool encodeBegin(pm4::Stream& stream, const RenderPass& pass, uint64_t table, ui
 // (GMEM: the pass's plan when it is drawn in tiles -- the attachments' bins in RB_MRT's BASE_GMEM, a framebuffer fetch
 // reading its bin in GMEM; nullptr in sysmem. AFTER_FETCH: the draw before it in the pass read its attachments too, so
 // in raster order a fetch needs no barrier)
+struct PipelineState { pm4::Stream vs, fs; };
+struct DrawState {
+    std::vector<uint8_t> vsTextures, fsTextures, vertex, viewport;
+};
 bool encodeInPass(pm4::Stream& stream, const Program& program, const RenderPass& pass, const Draw& draw,
                   const Bindings& vsBindings, const Bindings& fsBindings, uint64_t vsProgram, uint64_t fsProgram,
                   uint64_t table, uint8_t* tableCpu, std::string* why, const Options& options = Options{}, const GmemPlan* gmem = nullptr,
-                  bool afterFetch = false);
+                  bool afterFetch = false, PipelineState* pipeline = nullptr, DrawState* state = nullptr,
+                  bool fbBarrierOwed = true);
+// FB_BARRIER_OWED (sysmem only; v29i): whether this fetch draw is owed the CCU flush and cache invalidate. The flush is
+// the whole colour CCU's, so one covers every fetch until a draw writes a target again; CommandBuffer::draw passes
+// false when nothing has been written since the last one. true (the default) is the barrier every fetch draw paid.
 void encodeEnd(pm4::Stream& stream, const RenderPass& pass, uint64_t table, const Options& options = Options{});
+
+// Chained passes (CommandBuffer::setPassWfi(false), the default). Every pass used to end with encodeEnd's tail (a WFI,
+// the colour CCU flushed and waited for, the cache flushed and waited for) and to begin with the batch start (the
+// three invalidates, two WFIs, the static tables): the GPU drained between every two passes, though nothing of the one
+// was read by the next. Turnip pays that only where a barrier asks (tu_flush_for_access, tu_flush_for_stage: a CCU
+// clean, CACHE_INVALIDATE and a WFI for colour written and then sampled) and the batch start once a command buffer
+// (tu6_init_hw). So a pass closed for the next draw pass ends with encodeLightTail alone, the next opens with
+// lightHeadOptions (no batch start, no RB_CCU_CNTL: the CCU is still in sysmem), and the full tail is written once --
+// encodeTail on the last such pass's table, whose words no tail has used -- before anything that is not a draw
+// pass (a copy, a blit, a dispatch, the end of the buffer). GMEM passes also join this chain after encodeGmem's
+// resolve, CCU invalidate and mode-transition WFI; an incoming GMEM pass with a read dependency takes a full head/tail.
+// A draw that samples what an earlier pass of
+// the chain wrote -- a pass's first draw or a later one -- gets encodeBarrier before it, in its pass. The hazards are
+// CommandBuffer::draw's to find, by the memory each pass wrote and each draw read.
+// LRZ_FLUSH (both witnesses end a pass with it) when the options ask for it, and nothing else
+void encodeLightTail(pm4::Stream& stream, const Options& options = Options{});
+// encodeEnd's tail for TABLE's words (unused by any tail before), with the depth CCU's flush when DEPTH
+void encodeTail(pm4::Stream& stream, uint64_t table, const Options& options, bool depth);
+// the options of a chained pass's encodeBegin: OPTIONS without the batch start and the RB_CCU_CNTL write
+Options lightHeadOptions(const Options& options);
+// turnip's barrier for colour (and DEPTH: depth) written through the CCU and then read through the texture cache,
+// inside a pass: a WFI, PC_CCU_FLUSH_COLOR_TS (and _DEPTH_TS) each waited for on its word at WORDS (kBarrierBytes,
+// zeroed by the caller), CACHE_INVALIDATE, a WFI -- the framebuffer fetch's barrier, which the phone has run
+constexpr uint64_t kBarrierBytes = 8;
+void encodeBarrier(pm4::Stream& stream, uint64_t words, bool depth);
 
 // A pass with no draw: the batch start, the pass begin, the Clear's fill, the tail. What -[MTLRenderCommandEncoder
 // endEncoding] needs for an encoder that recorded nothing; any load action but kClear is refused (nothing to write).

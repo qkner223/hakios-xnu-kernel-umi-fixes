@@ -79,7 +79,9 @@ enum class PixelFormat : uint32_t {
     kBGR10A2Unorm = 94,    // blue in the low 10 bits (B10G10R10A2_UNORM): the same layout, the swap WXYZ    // three unsigned floats packed in 32 bits, red in the low 11 (Gallium's R11G11B10_FLOAT): an HDR target
     kRGBA32Uint = 123,
     kRGBA32Float = 125,
+    kDepth16Unorm = 250,
     kDepth32Float = 252,   // a depth attachment only: tiled (TILE6_3), since the hardware has no linear depth buffer
+    kStencil8 = 253,
     kDepth32FloatStencil8 = 260,
     kX32Stencil8 = 261,    // a view of a Depth32Float_Stencil8 texture's S8 plane, sampled as a uint: Texture::view alone   // the same depth plane and a separate S8 plane after it (turnip's D32_SFLOAT_S8_UINT)
     // Metal's private 500, the format CoreAnimation asks for over a '420f' or '420v' IOSurface (a decoded photo): both
@@ -241,12 +243,15 @@ public:
     // pair, 'RGBA' for the RGBA8 pair; 0 is taken as any), a depth format.
     // A two-plane format (YCbCr8_420_2P) takes the surface's second plane too: CHROMA its offset in the surface's memory
     // and its row bytes, which the caller reads off the surface (the kernel describes plane 0 alone).
+    // A raw 420f/420v plane instead supplies PLANE and LAYOUT from IOSurface's plane getters: R8 luma, RG8 chroma,
+    // or a wider packed view of those bytes. It uses the same surface buffer and linear row validation below.
     struct SurfacePlane {
         uint64_t offset;
         uint32_t rowBytes;
+        uint32_t width = 0, height = 0;
     };
     static std::shared_ptr<Texture> wrapSurface(Gpu& gpu, uint32_t surfaceId, const TextureDesc& desc, std::string* why,
-                                                const SurfacePlane* chroma = nullptr);
+                                                const SurfacePlane* chroma = nullptr, unsigned plane = 0, const SurfacePlane* layout = nullptr);
     // -[MTLBuffer newTextureWithDescriptor:offset:bytesPerRow:]: a texture whose rows are BUFFER's bytes from OFFSET,
     // BYTES_PER_ROW apart -- the same memory, so a write through either is seen through the other. One level of a
     // colour format, 1D or 2D; the rows the TP takes (a pitch and a start that are multiples of 64 bytes, as for a
@@ -260,6 +265,13 @@ public:
     static std::shared_ptr<Texture> view(const std::shared_ptr<Texture>& parent, PixelFormat format, TextureType type, uint32_t baseLevel, uint32_t levels,
                                          uint32_t baseSlice, uint32_t slices, std::string* why);
     uint32_t surface() const { return surface_; }   // the IOSurface's ID, 0 for a texture of its own memory
+    // v29i (D1): whether this texture's memory has been written at all since the object was made -- by a draw into it,
+    // a pass's Clear, a blit whose destination it was, a compute store, or an upload (-replaceRegion:). A texture a draw
+    // samples that no such write has reached reads memory this process never filled: on a fresh GEM_NEW that reads as
+    // zeros (black), on a best-fit reuse as whatever the buffer last held. Counted, never per frame, by
+    // CommandBuffer::reportPasses (command.cpp) and named there by size, surface and resource id.
+    void markWritten() const { written_.store(true, std::memory_order_relaxed); }
+    bool everWritten() const { return written_.load(std::memory_order_relaxed); }
     // what an argument buffer encodes for this texture (gpuResourceID), never 0, and the texture back from it while it
     // lives (nullptr after, or for an id no texture had)
     uint64_t resourceId() const { return id_; }
@@ -330,7 +342,10 @@ public:
     // DEPTH 1, ARRAY_PITCH the layer's bytes, the format's swap and swizzle (fd6_view.c:232-250)
     // (with mip levels: all of them, MIPLVLS levels - 1 and the layer the whole of them, fd6_view.c:232-250)
     a6xx::TexConst sampledDescriptor() const;
-    // ...of mip level L alone: what a framebuffer fetch reads of an attachment drawn at that level
+    // ...of mip level L alone: what a framebuffer fetch reads of an attachment drawn at that level -- a one-sample,
+    // linear 2D view of the level (its address, size and pitch; TYPE 2D, so slice 0 of an array, cube or 3D
+    // attachment is its level's rows). A multisample attachment takes sampledDescriptor (the MS fetch) and a
+    // compressed one is refused by the fetch: render.cpp's stageTextures, which is this view's only caller.
     a6xx::TexConst levelDescriptor(uint32_t level) const;
     // the descriptor a stib/ldib addresses it through, at IBO slot numSsbos + index: the same without PITCHALIGN,
     // MIPLVLS and SAMPLES (fd6_view.c:383-397)
@@ -343,8 +358,9 @@ private:
     static std::shared_ptr<Texture> wrapTwoPlanes(std::shared_ptr<Buffer> buffer, const SurfaceInfo& s, const std::string& name, const TextureDesc& desc,
                                                   const FormatInfo* info, const SurfacePlane* chroma, std::string* why);
     Texture(std::shared_ptr<Buffer> buffer, const TextureDesc& desc, const FormatInfo* info, uint64_t pitch, uint64_t offset = 0,
-            uint32_t pitchAlign = ~0u, uint32_t surface = 0)
-        : buffer_(std::move(buffer)), desc_(desc), info_(info), pitch_(pitch), offset_(offset), pitchAlign_(pitchAlign), surface_(surface) {}
+            uint32_t pitchAlign = ~0u, uint32_t surface = 0, bool written = false)
+        : buffer_(std::move(buffer)), desc_(desc), info_(info), pitch_(pitch), offset_(offset), pitchAlign_(pitchAlign), surface_(surface),
+          written_(written) {}
     std::shared_ptr<Buffer> buffer_;
     TextureDesc desc_;
     const FormatInfo* info_;
@@ -352,6 +368,9 @@ private:
     uint64_t offset_;        // where the pixels start in the buffer (an IOSurface's offset; 0 for a texture of its own)
     uint32_t pitchAlign_;    // TEX_CONST_2.PITCHALIGN; ~0u: log2(cpp), the layout's own (texturePitch)
     uint32_t surface_;
+    // v29i (D1): a write has reached this texture's memory (texture.hpp's markWritten); false at creation for a
+    // texture of its own memory, true for one laid over a surface's, a buffer's or a view of another texture
+    mutable std::atomic<bool> written_{false};
     uint64_t layerPitch_ = 0;   // a view's: its parent's sliceBytes, which a level or a run of levels does not recompute
     uint8_t swizzle_[4] = {2, 3, 4, 5};   // Metal's numbers (swizzled): the identity unless a swizzled view
     uint32_t swizzleWord(uint32_t dword0) const;   // TEX_CONST_0 with this texture's swizzle over the format's

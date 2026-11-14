@@ -2,7 +2,7 @@
  * (hakios) This is vcvkk's plug-in (github.com/vcvkk/darwin-redwood, branch hakios-workspace, userland/src/HakiosMetal.m
  * at eb9fdf5), the one that serves CoreAnimation's window server, with what this tree adds for it: CoreAnimation's
  * shaders chosen by pipeline (hm_bitcode_for()), QuartzCore's pipeline library given a default.metallib, stand-ins for
- * functions the library lacks (hm_stand_ins), and the device shown to the window server alone (metal_all=1: all).
+ * functions the library lacks (hm_stand_ins), and the device, shown to every process.
  * Built instead of hakios-metal's plug-in with METAL_PLUGIN=ca (userland/build.sh); the library it needs comes from
  * tools/ca-metallib.py.
  */
@@ -89,7 +89,9 @@
 #include <sys/sysctl.h>
 #include <sys/stat.h>
 #include <fcntl.h>
+#include <limits.h>
 #import <Metal/Metal.h>
+#import <IOSurface/IOSurfaceRef.h>
 #import <objc/message.h>
 #import <objc/runtime.h>
 #include <IOKit/IOKitLib.h>
@@ -103,9 +105,18 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "hakios-metal/hakios_metal.h"
+#include "hakios-metal/perf.h"
+
+static IOReturn hm_batch_surface_lock(IOSurfaceRef surface, IOSurfaceLockOptions options, uint32_t *seed)
+{
+    if (hakios_metal_surface_sync(IOSurfaceGetID(surface)) != 0) return kIOReturnError;
+    return IOSurfaceLock(surface, options, seed);
+}
+#define IOSurfaceLock hm_batch_surface_lock
 
 /* --- printing ----------------------------------------------------------------------------------------------- */
 
@@ -163,6 +174,148 @@ hm_print(const char *fmt, ...)
 			hm_print(__VA_ARGS__);				\
 		}							\
 	} while (0)
+
+/* --- flicker-diag: an IOSurface written on the processor while the GPU reads it (Freeform's stroke, 2026-11-10) ---
+ * A write lock moves a surface's seed at the lock and again at the unlock (MiniIOSurface.cpp: lockCommon; it starts
+ * at 1), so an even seed is a writer between the two. Lines are bounded: the first 24 of each kind, then one in 256. */
+extern Boolean IOSurfaceGetProhibitUseCount(IOSurfaceRef buffer);   /* (exported by IOSurface, not in its header) */
+
+static BOOL
+hm_flicker_say(unsigned *count)
+{
+	const unsigned n = __atomic_add_fetch(count, 1, __ATOMIC_RELAXED);
+
+	return n <= 24 || n % 256 == 0;
+}
+
+/* IOSurfaceIsInUse, which aborts on a surface made with kIOSurfaceProhibitUseCount: -1 there */
+static int
+hm_surface_in_use(IOSurfaceRef s)
+{
+	return IOSurfaceGetProhibitUseCount(s) ? -1 : IOSurfaceIsInUse(s) ? 1 : 0;
+}
+
+/* --- pixels looked at on the processor (HakiosMetalPixels.h: plain C, run by hakios-metal/tests/pixels_test.cpp) --- */
+
+#include "HakiosMetalPixels.h"
+#include "HakiosMetalYCbCr.h"
+
+static void hm_fps_ycbcr(void);
+static void hm_fps_ycbcr_time(double seconds); /* time spent copying planes and converting a YCbCr bind */
+static void hm_fps_ycbcr_gpu(double seconds);
+
+/* The matrix a two-plane surface declares: CoreVideo's attachment ("CVImageBufferYCbCrMatrix", ITU_R_709_2 for an HD
+ * video, which a buffer's propagated attachments put on its surface), else the surface's own key. HM_YCC_UNKNOWN when
+ * neither is there; *FROM the key it came from. */
+static int
+hm_surface_ycc_matrix(IOSurfaceRef surface, const char **from)
+{
+	static const char *const keys[] = { "CVImageBufferYCbCrMatrix", "IOSurfaceYCbCrMatrix" };
+
+	*from = "none";
+	for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
+		CFStringRef key = CFStringCreateWithCString(NULL, keys[i], kCFStringEncodingUTF8);
+		CFTypeRef value = key != NULL ? IOSurfaceCopyValue(surface, key) : NULL;
+		char name[64] = "";
+		int matrix = HM_YCC_UNKNOWN;
+
+		if (key != NULL) CFRelease(key);
+		if (value == NULL) continue;
+		if (CFGetTypeID(value) == CFStringGetTypeID() && CFStringGetCString((CFStringRef)value, name, sizeof(name), kCFStringEncodingUTF8)) {
+			matrix = hm_ycc_matrix_named(name);
+		}
+		CFRelease(value);
+		if (matrix != HM_YCC_UNKNOWN) {
+			*from = keys[i];
+			return matrix;
+		}
+	}
+	return HM_YCC_UNKNOWN;
+}
+
+/* A '420v' frame CA is converting (called under the read lock): any 0 in it is a byte its producer had not written
+ * yet, and its (0, 0) CbCr pairs are what come out green (v8). Said for the first 32 such frames and every 128th after;
+ * the first 8 are measured again 4 and 40 ms later with the seed, which tells a producer still writing (the zeros go,
+ * the seed stays) from one that never writes them. Measures only. */
+static void
+hm_ycc_report_unwritten(IOSurfaceRef surface, const hm_ycc_planes *planes, size_t w, size_t h, uint32_t seed)
+{
+	static unsigned frames, unwritten;
+	hm_ycc_unwritten u;
+
+	hm_ycc_measure_unwritten(planes, w, h, &u);
+	const unsigned n = __atomic_add_fetch(&frames, 1, __ATOMIC_RELAXED);
+	if (u.zeroC == 0 && u.zeroY == 0) return;
+	const unsigned k = __atomic_add_fetch(&unwritten, 1, __ATOMIC_RELAXED);
+	if (k > 32 && k % 128 != 0) return;
+	hm_print("ycbcr: 420v IOSurface %u seed %u converted with unwritten bytes: CbCr %zu of %zu pairs zero (rows %zu-%zu of %zu), "
+		 "Y %zu of %zu zero; %u of %u 420v frames so far\n", IOSurfaceGetID(surface), seed, u.zeroC, planes->cw * planes->ch,
+		 u.rowFirst, u.rowLast, planes->ch, u.zeroY, w * h, k, n);
+	if (k > 8) return;
+	const hm_ycc_planes later = *planes;
+	CFRetain(surface);
+	for (int ms = 4; ms <= 40; ms *= 10) {
+		CFRetain(surface);
+		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, ms * NSEC_PER_MSEC), dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+			uint32_t now = 0;
+			hm_ycc_unwritten v;
+
+			IOSurfaceLock(surface, kIOSurfaceLockReadOnly, &now);
+			hm_ycc_measure_unwritten(&later, w, h, &v);
+			IOSurfaceUnlock(surface, kIOSurfaceLockReadOnly, NULL);
+			hm_print("ycbcr: 420v IOSurface %u seed %u, %d ms later seed %u: CbCr %zu pairs zero (rows %zu-%zu), Y %zu zero\n",
+				 IOSurfaceGetID(surface), seed, ms, now, v.zeroC, v.rowFirst, v.rowLast, v.zeroY);
+			CFRelease(surface);
+		});
+	}
+	CFRelease(surface);
+}
+
+/*
+ * The census of flat pictures: a picture of 64 x 64 or more that a client hands over as one colour (every sample of
+ * a 16 x 16 grid the same pixel, or for ASTC the same void-extent block), said once per size, format and colour. The
+ * materials' purple came in so under GL (an 846 x 1827 ASTC picture of RGBA16 5959,1414,5959: PURPLE-umi.md): if it
+ * comes in so here too, the purple is the client's picture -- a wallpaper snapshot nobody made -- and no GPU fault;
+ * if it does not, it is made on the GPU. "the purple placeholder" marks red = blue well above green.
+ */
+static void
+hm_flat_census(const char *via, uint64_t texture, unsigned format, size_t w, size_t h, const void *bytes, size_t bytesPerRow)
+{
+	static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+	static struct { unsigned format; uint32_t w, h; uint8_t rgba[4]; } told[64];
+	static unsigned count, others;
+	uint8_t rgba[4];
+	int hdr = 0;
+
+	if (w * h < 64 * 64 || !hm_picture_flat(format, w, h, (const uint8_t *)bytes, bytesPerRow, rgba, &hdr)) {
+		return;
+	}
+	const BOOL magenta = hm_rgba_magenta(rgba);
+	unsigned bw = 0, bh = 0;
+	const BOOL astc = hm_astc_block(format, &bw, &bh);
+	pthread_mutex_lock(&lock);
+	for (unsigned i = 0; i < count; i++) {
+		if (told[i].format == format && told[i].w == w && told[i].h == h && memcmp(told[i].rgba, rgba, 4) == 0) {
+			pthread_mutex_unlock(&lock);
+			return;
+		}
+	}
+	/* (the room kept for the purple: flat greys and blacks are common and say little) */
+	if (count == sizeof(told) / sizeof(told[0]) || (!magenta && others >= 40)) {
+		pthread_mutex_unlock(&lock);
+		return;
+	}
+	told[count].format = format;
+	told[count].w = (uint32_t)w;
+	told[count].h = (uint32_t)h;
+	memcpy(told[count].rgba, rgba, 4);
+	count++;
+	others += !magenta;
+	pthread_mutex_unlock(&lock);
+	hm_print("flat picture: %zux%zu, pixel format %u%s, texture %llu, through %s: every sample RGBA8 (%u, %u, %u, %u)%s\n", w, h, format,
+		 astc ? (hdr ? " (ASTC, HDR void extent)" : " (ASTC void extent)") : "",
+		 (unsigned long long)texture, via, rgba[0], rgba[1], rgba[2], rgba[3], magenta ? " -- the purple placeholder" : "");
+}
 
 /*
  * Who sent the selector. backtrace(3) gives the frames; the ones inside this image, libobjc and CoreFoundation (the
@@ -475,6 +628,13 @@ _Static_assert(sizeof(struct MTLTargetDeviceArch) == 24 && __builtin_offsetof(st
 - (id)newPipelineLibraryWithFilePath:(NSString *)path error:(NSError **)error;
 @end
 
+/* and these (0x181a43838, 0x181aa8f4c): an _MTLFunctionInternal named "#main" over the GLES IR, its function data
+ * marking it GL's; nothing is compiled */
+@interface _MTLDevice (HakiosMetalGLES)
+- (id)newFunctionWithGLESIR:(const void *)ir inputsDescription:(dispatch_data_t)inputs functionType:(NSUInteger)type;
+- (id)newFunctionWithGLESIR:(const void *)ir functionType:(NSUInteger)type;
+@end
+
 @interface HakiosMetalDevice : _MTLDevice {
 	io_service_t _acceleratorService;        /* the IOAcceleratorES service Metal handed us */
 	hakios_metal_device *_gpu;               /* hakios-metal's device: the kernel's HakiosGPU client */
@@ -485,9 +645,235 @@ _Static_assert(sizeof(struct MTLTargetDeviceArch) == 24 && __builtin_offsetof(st
 - (hakios_metal_device *)hakiosDevice;
 @end
 
+/*
+ * Which command buffers a resource is in: -[IOGPUMetalResource isComplete] (iOS 16.5, 0x1ec17f860) answers whether the GPU
+ * has finished every submission that used the resource -- the resource's last-use stamp against the completed one, no
+ * wait -- and -waitUntilComplete waits for it. AppleMetalGLRenderer asks a buffer that before GL writes into it
+ * (gldTestMemoryPlugin: glBufferSubData, glMapBufferRange), and the plug-in had no such method on its buffers: the first
+ * GL application to update a buffer while playing a video died of it (bili-inter, v26). Here each command buffer is a
+ * sequence number (made when it is, committed, completed), each draw, dispatch and blit marks the resources it binds with
+ * its command buffer's number (the last HM_USES of them are kept), and a resource is complete when none of those is
+ * committed and not yet done. A command buffer still being recorded does not count, as Apple's does not (its work is not
+ * submitted; GL commits its own before it waits), so -waitUntilComplete cannot wait for a buffer nobody will commit.
+ */
+#define HM_USE_SLOTS 4096u
+#define HM_USES 4u
+enum { HM_USE_RECORDING = 1, HM_USE_COMMITTED = 2, HM_USE_DONE = 3 };
+static struct { uint64_t seq; unsigned state; } hm_use[HM_USE_SLOTS];   /* by sequence number; a slot reused is long done */
+static uint64_t hm_use_next = 1;
+static pthread_mutex_t hm_use_lock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t hm_use_cond = PTHREAD_COND_INITIALIZER;
+
+static uint64_t
+hm_use_begin(void)
+{
+	uint64_t seq;
+
+	pthread_mutex_lock(&hm_use_lock);
+	seq = hm_use_next++;
+	hm_use[seq % HM_USE_SLOTS].seq = seq;
+	hm_use[seq % HM_USE_SLOTS].state = HM_USE_RECORDING;
+	pthread_mutex_unlock(&hm_use_lock);
+	return seq;
+}
+
+static void
+hm_use_set(uint64_t seq, unsigned state)
+{
+	pthread_mutex_lock(&hm_use_lock);
+	if (seq != 0 && hm_use[seq % HM_USE_SLOTS].seq == seq) {
+		hm_use[seq % HM_USE_SLOTS].state = state;
+	}
+	if (state == HM_USE_DONE) {
+		pthread_cond_broadcast(&hm_use_cond);
+	}
+	pthread_mutex_unlock(&hm_use_lock);
+}
+
+/* (under hm_use_lock) one of USES committed and not completed */
+static BOOL
+hm_use_in_flight(const uint64_t *uses)
+{
+	for (unsigned i = 0; i < HM_USES; i++) {
+		const uint64_t seq = __atomic_load_n(&uses[i], __ATOMIC_RELAXED);
+
+		if (seq != 0 && hm_use[seq % HM_USE_SLOTS].seq == seq && hm_use[seq % HM_USE_SLOTS].state == HM_USE_COMMITTED) {
+			return YES;
+		}
+	}
+	return NO;
+}
+
+/* a resource's record of SEQ (the encoding thread; a lost race costs an older entry, never a wrong one) */
+static void
+hm_use_mark(uint64_t *uses, unsigned *at, uint64_t seq)
+{
+	if (seq == 0) {
+		return;
+	}
+	for (unsigned i = 0; i < HM_USES; i++) {
+		if (__atomic_load_n(&uses[i], __ATOMIC_RELAXED) == seq) {
+			return;
+		}
+	}
+	__atomic_store_n(&uses[__atomic_fetch_add(at, 1, __ATOMIC_RELAXED) % HM_USES], seq, __ATOMIC_RELAXED);
+}
+
+static BOOL
+hm_use_complete(const uint64_t *uses)
+{
+	BOOL busy;
+
+	pthread_mutex_lock(&hm_use_lock);
+	busy = hm_use_in_flight(uses);
+	pthread_mutex_unlock(&hm_use_lock);
+	return !busy;
+}
+
+/* (at most two seconds: a wait asked from inside a completion handler of the same queue would otherwise wait for a
+ * completion that only comes after the handler returns; said once if it ever runs out) */
+static void
+hm_use_wait(const uint64_t *uses)
+{
+    hakios_metal_drain_all(HAKIOS_METAL_DRAIN_CPU_SYNC);
+	struct timespec deadline;
+	BOOL late = NO;
+
+	clock_gettime(CLOCK_REALTIME, &deadline);
+	deadline.tv_sec += 2;
+	pthread_mutex_lock(&hm_use_lock);
+	while (hm_use_in_flight(uses) && !late) {
+		late = pthread_cond_timedwait(&hm_use_cond, &hm_use_lock, &deadline) != 0 && hm_use_in_flight(uses);
+	}
+	pthread_mutex_unlock(&hm_use_lock);
+	if (late) {
+		HM_ONCE("-waitUntilComplete gave up after 2 s with the resource's command buffer still in flight (a wait from its own "
+			"queue's completion?)\n");
+	}
+}
+
+/*
+ * A read after a write, across command buffers, through a shadow copy (v29u: the App Library's background black).
+ *
+ * A surface whose rows the GPU cannot take where they lie (a pitch that is not a multiple of 64 bytes) is drawn through
+ * copies of its rows, and every pass that draws into it is given a copy of its own -- CoreAnimation draws the App
+ * Library's snapshot through several, each a copy of its own. A copy's GPU writes reach the surface when that copy's
+ * command buffer completes (-hakiosWriteBackShadow), so a pass in a later command buffer that *samples* the surface
+ * through yet another copy takes the surface as it was before those writes landed: the previous snapshot, or nothing at
+ * all the first time (the surface is new and zero). Zero-copy scanout raised the frame rate and the write-back kept its
+ * cost, and the gap between them became one the user sees: the background goes black for a frame or two.
+ *
+ * So what is queued here is a count, per surface, of the copies whose GPU writes have not yet been written back. A
+ * command buffer that samples such a surface waits for them (bounded) before it is submitted, and takes its copies from
+ * the surface again. The table is fixed and the count is a hint: a full table loses an entry, which costs a wait, never
+ * a wrong picture, and a wait that runs out is counted and leaves the sample as it was before.
+ */
+#define HM_SHADOW_SURFACES 16u
+static struct { IOSurfaceID id; unsigned pending; } hm_shadowSurface[HM_SHADOW_SURFACES];
+static pthread_mutex_t hm_shadowSurfaceLock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t hm_shadowSurfaceCond = PTHREAD_COND_INITIALIZER;
+
+/* (an entry is found by surface id alone: an id is not reused while a write into that surface is still queued, which is
+ * the only time an entry is looked at, and the texture that queued it holds the surface until then) */
+static unsigned
+hm_shadow_surface_slot(IOSurfaceID id)
+{
+	unsigned free_ = HM_SHADOW_SURFACES;
+
+	for (unsigned i = 0; i < HM_SHADOW_SURFACES; i++) {
+		if (hm_shadowSurface[i].pending != 0) {
+			if (hm_shadowSurface[i].id == id) {
+				return i;
+			}
+		} else if (free_ == HM_SHADOW_SURFACES) {
+			free_ = i;
+		}
+	}
+	return free_ != HM_SHADOW_SURFACES ? free_ : 0;   /* (full: the first, whose count is lost) */
+}
+
+static void
+hm_shadow_surface_add(IOSurfaceID id)
+{
+	unsigned i;
+
+	pthread_mutex_lock(&hm_shadowSurfaceLock);
+	i = hm_shadow_surface_slot(id);
+	if (hm_shadowSurface[i].pending == 0 || hm_shadowSurface[i].id != id) {
+		hm_shadowSurface[i].id = id;
+		hm_shadowSurface[i].pending = 0;
+	}
+	hm_shadowSurface[i].pending++;
+	pthread_mutex_unlock(&hm_shadowSurfaceLock);
+}
+
+/* a queued write has reached the surface (written back), or the command buffer that owed it went away */
+static void
+hm_shadow_surface_done(IOSurfaceID id)
+{
+	unsigned i;
+
+	pthread_mutex_lock(&hm_shadowSurfaceLock);
+	i = hm_shadow_surface_slot(id);
+	if (hm_shadowSurface[i].pending != 0 && hm_shadowSurface[i].id == id) {
+		if (--hm_shadowSurface[i].pending == 0) {
+			pthread_cond_broadcast(&hm_shadowSurfaceCond);
+		}
+	}
+	pthread_mutex_unlock(&hm_shadowSurfaceLock);
+}
+
+static unsigned
+hm_shadow_surface_pending(IOSurfaceID id)
+{
+	unsigned i, pending = 0;
+
+	pthread_mutex_lock(&hm_shadowSurfaceLock);
+	i = hm_shadow_surface_slot(id);
+	if (hm_shadowSurface[i].pending != 0 && hm_shadowSurface[i].id == id) {
+		pending = hm_shadowSurface[i].pending;
+	}
+	pthread_mutex_unlock(&hm_shadowSurfaceLock);
+	return pending;
+}
+
+/* Wait until at most OWN of the surface's queued writes are still out; OWN is what this command buffer queues itself,
+ * whose completion it cannot wait for (it is not submitted yet). Returns NO when the wait ran out. */
+static BOOL
+hm_shadow_surface_wait(IOSurfaceID id, unsigned own, double seconds)
+{
+	struct timespec deadline;
+	BOOL drained = YES;
+
+	clock_gettime(CLOCK_REALTIME, &deadline);
+	deadline.tv_sec += (time_t)seconds;
+	deadline.tv_nsec += (long)((seconds - (double)(time_t)seconds) * 1e9);
+	if (deadline.tv_nsec >= 1000000000L) {
+		deadline.tv_sec++;
+		deadline.tv_nsec -= 1000000000L;
+	}
+	pthread_mutex_lock(&hm_shadowSurfaceLock);
+	{
+		const unsigned i = hm_shadow_surface_slot(id);
+
+		while (hm_shadowSurface[i].id == id && hm_shadowSurface[i].pending > own && drained) {
+			/* (late only when the deadline passed with writes still out: a wakeup for another surface's, or a spurious
+			 * one, is not a wait that ran out) */
+			if (pthread_cond_timedwait(&hm_shadowSurfaceCond, &hm_shadowSurfaceLock, &deadline) != 0 &&
+			    hm_shadowSurface[i].id == id && hm_shadowSurface[i].pending > own) {
+				drained = NO;
+			}
+		}
+	}
+	pthread_mutex_unlock(&hm_shadowSurfaceLock);
+	return drained;
+}
+
 @interface HakiosMetalBuffer : _MTLResource {
 	HakiosMetalDevice *_device;
 	hakios_metal_buffer *_buffer;
+	uint64_t _uses[HM_USES];   /* the command buffers that last bound it (-isComplete) */
+	unsigned _usesAt;
 	/* a no-copy buffer's own pages and the block Metal promises to call when the buffer goes (see
 	 * -newBufferWithBytesNoCopy:...) */
 	void (^_deallocator)(void *, NSUInteger);
@@ -498,6 +884,7 @@ _Static_assert(sizeof(struct MTLTargetDeviceArch) == 24 && __builtin_offsetof(st
 - (void)hakiosSetDeallocator:(void (^)(void *, NSUInteger))deallocator bytes:(void *)bytes length:(NSUInteger)length;
 - (hakios_metal_buffer *)hakiosBuffer;
 - (void *)contents;
+- (void)hakiosUsedBy:(uint64_t)seq;
 @end
 
 /*
@@ -513,6 +900,8 @@ _Static_assert(sizeof(struct MTLTargetDeviceArch) == 24 && __builtin_offsetof(st
 @interface HakiosMetalTexture : _MTLResource {
 	HakiosMetalDevice *_device;
 	hakios_metal_texture *_texture;
+	uint64_t _uses[HM_USES];            /* the command buffers that last bound it (-isComplete) */
+	unsigned _usesAt;
 	MTLTextureUsage _usage;             /* what hakios-metal was given: ShaderRead, ShaderWrite, or both */
 	MTLResourceOptions _askedOptions;   /* the descriptor's, for -unfilteredResourceOptions; what was GIVEN is shared memory */
 	BOOL _allowGPUOptimizedContents;    /* the descriptor's word; the layout is linear either way */
@@ -531,9 +920,20 @@ _Static_assert(sizeof(struct MTLTargetDeviceArch) == 24 && __builtin_offsetof(st
 	BOOL _swizzled;                     /* a swizzled view: _texture is the core's, read through _swizzle */
 	MTLTextureSwizzleChannels _swizzle;
 	void (^_deallocator)(void *, NSUInteger);   /* a no-copy texture's: its caller's bytes are given back at dealloc */
-	int _ycbcr;                         /* a two-plane surface read as RGBA8 converted from it: 0 not, 1 BT.601, 2 BT.709 */
+	int _ycbcr;                         /* a two-plane surface read as RGBA8 converted from it: 0 not, else its matrix (HM_YCC_*) */
 	BOOL _ycbcrFull;                    /* ... '420f' (full range) rather than '420v' (video range) */
 	MTLPixelFormat _ycbcrFormat;        /* ... and the private format it was asked as (500, 540), which it answers */
+	BOOL _ycbcrDeclared;                /* ... the matrix the surface declares (else BT.601, looked for again at each copy) */
+	BOOL _ycbcrTold;                    /* ... its first frame said (the census of YCbCr surfaces) */
+	uint8_t *_ycbcrRows;                /* reused RGBA8 conversion destination, avoiding a 5 MB malloc/free per frame */
+	size_t _ycbcrRowsBytes;
+	hakios_metal_queue *_ycbcrGPUQueue; /* the conversion pass is synchronous before CA samples the shadow */
+	hakios_metal_kernel *_ycbcrGPUKernel;
+	hakios_metal_buffer *_ycbcrGPUParams;
+	BOOL _ycbcrGPUReported;
+	hakios_metal_texture *_ycbcrGPULuma, *_ycbcrGPUChroma;
+	NSLock *_shadowLock;                /* a texture can be bound by CA's worker threads at the same time */
+	unsigned _shadowWrites;             /* flicker-diag: GPU writes into the copy not yet written back */
 	void *_deallocBytes;
 	NSUInteger _deallocLength;
 }
@@ -542,14 +942,21 @@ _Static_assert(sizeof(struct MTLTargetDeviceArch) == 24 && __builtin_offsetof(st
 - (hakios_metal_texture *)hakiosTexture;
 - (void)hakiosSetIOSurface:(IOSurfaceRef)surface plane:(NSUInteger)plane;
 - (void)hakiosShadow:(IOSurfaceRef)surface;
+- (void)hakiosShadow:(IOSurfaceRef)surface plane:(NSUInteger)plane;
 - (BOOL)hakiosIsShadow;
 - (BOOL)hakiosIsTurned;
 - (void)hakiosTurnInto:(hakios_metal_cb *)cb;
 - (void)hakiosSetTurned:(hakios_metal_texture *)surface rotation:(unsigned)rotation;
 - (void)hakiosWriteBackShadow;
+- (void)hakiosShadowWriteQueued;     /* flicker-diag: a command buffer writing the copy, written back at its completion */
+- (void)hakiosShadowWriteDropped;    /* that command buffer went away uncompleted: nothing to write back */
 static void hm_fps_shadow(BOOL in, double seconds);   /* metal_fps's count of the copies below */
+static void hm_fps_shadow_kept(BOOL torn);            /* ... and of the refreshes that took no copy */
+static void hm_fps_shadow_sample(unsigned pending, unsigned waited, unsigned timeouts);
 static void hm_fps_encoded(double seconds, BOOL held);   /* metal_fps: a buffer's making to its commit */
 static BOOL hm_timeline_on(void);   /* metal_fps=timeline */
+static void hm_fps_texture_waited(double seconds);
+static void hm_fps_shadow_blit(BOOL write);
 static void hm_fps_waited(double seconds);   /* metal_fps: time in -waitUntilCompleted */
 static void hm_fps_drew(double seconds, unsigned cpu);   /* metal_fps: our time in a draw call */
 static void hm_fps_core(double seconds);   /* metal_fps: the core's time in a draw call */
@@ -557,11 +964,40 @@ static BOOL hm_fps_on(void);                          /* metal_fps: command buff
 #define HM_CACHE_DIR  "/private/var/db/hakios-metal-cache"     /* compiled stages, kept across boots by var_store */
 #define HM_CACHE_SEED "/redwood/share/hakios-metal-cache"     /* the same, baked into the image (read-only) */
 static BOOL hm_gmem_on(void);                         /* metal_gmem=1: tiled rendering where a pass allows it */
+static BOOL hm_pass_wfi(void);                        /* metal_pass_wfi=1: every pass its own full tail and batch start */
 - (void)hakiosShadowYCbCr:(IOSurfaceRef)surface format:(MTLPixelFormat)format;
+- (BOOL)hakiosConvertYCbCrGPU:(const hm_ycc_planes *)planes width:(size_t)w height:(size_t)h;
 - (void)hakiosRefreshShadow;
 - (void)hakiosSetDeallocator:(void (^)(void *, NSUInteger))deallocator bytes:(void *)bytes length:(NSUInteger)length;
 - (unsigned)hakiosStorageKind;   /* metal_fps=timeline: 0 a surface's, else 1 + its storage mode */
+- (void)hakiosUsedBy:(uint64_t)seq;
 @end
+
+#include "HakiosMetalBootArgs.h"
+
+static BOOL hm_ca_arg(const char *arg) {
+    char args[1024] = {0}; size_t size = sizeof(args)-1;
+    return sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && hm_boot_arg_token(args, arg);
+}
+static BOOL hm_ca_sync(void) {
+    static int on = -1;
+    if (on < 0) {
+        on = hm_ca_arg("metal_sync=1");
+    }
+    return on != 0;
+}
+/* boot-arg metal_big=1: mark the CA Metal caller interactive.
+ * The morning trace shows CPU0-3 taking 16-31 us per draw and CPU4-6 77-110 us. This is an A/B hint only:
+ * the default leaves Apple's QoS untouched. BCM2837 uses Clutch, not Apple's AMP scheduler;
+ * QoS does not guarantee placement on a fast core. */
+static void hm_big_hint(void) {
+    static int done = -1;
+    if (done < 0) done = hm_ca_arg("metal_big=1");
+    if (done == 1) {
+        int error = pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0);
+        HM_ONCE("metal_big=1: CA Metal caller QoS set to user-interactive (error %d)\n", error);
+    }
+}
 
 /* A sampler state: hakios-metal's four TEX_SAMP words, computed once from the descriptor, under Metal's own base class
  * (which keeps the device, the label and the pixel format and answers <MTLSamplerState> itself). The ivar names are
@@ -572,8 +1008,8 @@ static BOOL hm_gmem_on(void);                         /* metal_gmem=1: tiled ren
  * this plug-in knows the contract of. */
 /* A fence: a name for an ordering this device already keeps. Every encoder of a command buffer runs in the order it
  * was encoded and every command buffer of the queue in commit order, each dispatch and pass flushing what it wrote
- * before the next begins, so -updateFence: and -waitForFence: have nothing to add and the encoders take them as
- * no-ops. What Metal requires of the object is a device and a label. */
+ * before the next begins. Fence entry points also make the owning CB a submission boundary.
+ * What Metal requires of the object is a device and a label. */
 @interface HakiosMetalFence : NSObject <MTLFence> {
 	id<MTLDevice> _device;
 	NSString *_label;
@@ -696,6 +1132,7 @@ static BOOL hm_gmem_on(void);                         /* metal_gmem=1: tiled ren
 }
 - (void)hakiosWaitFor:(uint64_t)value
 {
+    hakios_metal_drain_all(HAKIOS_METAL_DRAIN_CPU_SYNC);
 	[_lock lock];
 	while (_value < value) {
 		[_lock wait];
@@ -1208,6 +1645,7 @@ HM_REFUSES_OUT_LOUD
 	unsigned _fsConstantCount;
 	int _specBinding;
 	unsigned _specLength;
+	uint8_t _specMask[256];   /* 0xff for each byte of that buffer the fragment stage reads: a content is those bytes alone */
 	NSMutableDictionary *_specialised;
 }
 - (instancetype)initWithHakiosDevice:(HakiosMetalDevice *)device program:(hakios_metal_program *)program
@@ -1222,22 +1660,31 @@ HM_REFUSES_OUT_LOUD
 	hakios_metal_queue *_queue;
 	NSUInteger _gpuPriority, _backgroundGPUPriority;
 	dispatch_queue_t _completionQueue;       /* only where Apple's own ivar is missing */
-	dispatch_queue_t _deferred;              /* commits held for an event, in commit order; made on the first one */
-	long _deferring;                         /* commits on _deferred not yet made (atomic) */
+	dispatch_queue_t _deferred;              /* submissions in enqueue order, including event waits */
+	NSMutableArray *_pending;               /* reserved positions, under @synchronized(self) */
+	unsigned _onDeferred;                   /* submissions given to _deferred and not yet made, under @synchronized(self) */
+	BOOL _idlePending;
 }
 - (instancetype)initWithHakiosDevice:(HakiosMetalDevice *)device descriptor:(id)descriptor;
 - (hakios_metal_queue *)hakiosQueue;
 - (dispatch_queue_t)hakiosCompletionQueue;
-- (BOOL)hakiosDeferring;
-- (void)hakiosDefer:(dispatch_block_t)commit;
+- (void)hakiosEnqueue:(HakiosMetalCommandBuffer *)buffer;
+- (void)hakiosCommit:(HakiosMetalCommandBuffer *)buffer;
+- (void)hakiosSendBuffers:(NSArray *)buffers;
+- (void)hakiosDrain:(unsigned)reason;
 @end
 
 @interface HakiosMetalCommandBuffer : _MTLCommandBuffer {
 	HakiosMetalCommandQueue *_queue;
 	hakios_metal_cb *_cb;
 	NSMutableArray *_scheduled, *_completed; /* handler blocks, copied to the heap */
+	NSMutableArray *_shadowTargets;         /* driver publication, inline before events/client callbacks */
+	NSMutableArray *_shadowSamples;         /* the shadow copies this buffer samples: surfaces whose queued writes it waits for */
+	NSMutableSet *_probeReads, *_probeWrites; /* unique textures per CB; metal_fps handoff diagnostics */
 	NSError *_error;
 	BOOL _committed;
+	BOOL _enqueued, _readyToSubmit, _scheduledDelivered, _completedDelivered;
+    unsigned _drainReason;                   /* reason + 1; zero permits private-resource deferral */
 	BOOL _owesSlot;                          /* holds one of the queue's maxCommandBufferCount slots */
 	double _committedAt;                     /* host seconds, for the GPU times Metal reports */
 	double _createdAt;                       /* ...and when it was made: metal_fps's encoding time */
@@ -1245,11 +1692,33 @@ HM_REFUSES_OUT_LOUD
 	NSMutableArray *_signals, *_waits;       /* { HakiosMetalEvent, value }: applied at completion / met before the GPU sees it */
 	dispatch_semaphore_t _sent;              /* a held commit: signalled once it has reached the GPU */
 	NSMutableArray *_turned;                 /* HakiosMetalTexture: turned framebuffers drawn here, copied into their surfaces at commit */
+	IOSurfaceRef _reads[8];                  /* flicker-diag (window server): surfaces sampled here straight from their rows (retained) */
+	uint32_t _readSeeds[8];                  /* ... their seeds when first sampled, then when sent to the GPU */
+	unsigned _readCount;
+	double _sentAt;
+	uint64_t _useSeq;                        /* this buffer's number for its resources' -isComplete (hm_use_*) */
 }
 - (instancetype)initWithHakiosQueue:(HakiosMetalCommandQueue *)queue;
+- (uint64_t)hakiosUseSeq;
 - (void)hakiosTurnAtCommit:(id)texture;
+- (void)hakiosWriteShadowAtCompletion:(HakiosMetalTexture *)texture;
+- (void)hakiosTrackTexture:(HakiosMetalTexture *)texture write:(BOOL)write;
+- (void)hakiosTrackSample:(HakiosMetalTexture *)texture;
+- (void)hakiosShadowSampleSync;
+- (void)hakiosNoteRead:(IOSurfaceRef)surface;
+- (void)hakiosCheckReads:(BOOL)done;
 - (hakios_metal_cb *)hakiosCommandBuffer;
 - (double)hakiosCreatedAt;
+- (BOOL)hakiosReadyToSubmit;
+- (void)hakiosMarkReady;
+- (BOOL)hakiosWaits;
+- (unsigned)hakiosDrainReason;
+- (void)hakiosRequireSync:(unsigned)reason;
+- (void)hakiosPrepareSend;
+- (void)hakiosSend;
+- (void)hakiosSent;
+- (void)hakiosDeliverScheduled;
+- (void)hakiosSubmit;
 @end
 
 /* A parallel render encoder: one pass whose draws come from several sub-encoders, filled on any thread in any order and
@@ -1324,6 +1793,10 @@ HM_REFUSES_OUT_LOUD
 	unsigned _vsHighestTexture, _vsHighestSampler;
 	NSMutableArray *_scratch;                   /* the buffers -setVertexBytes:/-setFragmentBytes: made */
 	MTLWinding _frontFacingWinding;             /* -setFrontFacingWinding:'s, also in _pass.winding for the draws */
+	BOOL _glNoTransform;                        /* -setViewportTransformEnabled:NO (OpenGL ES's own blits): window coordinates */
+	BOOL _glProvokingLast;                      /* -setProvokingVertexMode:1, GL's: flat varyings from the last vertex */
+	unsigned _flipWidth, _flipHeight;           /* a pass into a yInverted attachment (hm_yinvert_size): its size, the
+	                                             * height each draw is turned about; 0: not such a pass */
 	char _refused[160];                         /* a binding or state this encoder could not take: the next draw is failed by it */
 	NSMutableIndexSet *_visibilityCounted;      /* the result words (offset / 8) a draw of this encoder has counted into */
 }
@@ -1332,6 +1805,7 @@ HM_REFUSES_OUT_LOUD
 - (instancetype)initWithHakiosCommandBuffer:(HakiosMetalCommandBuffer *)commandBuffer pass:(const struct hakios_metal_render_pass *)pass
 			       colorTexture:(HakiosMetalTexture *)texture sub:(hakios_metal_cb *)sub;
 - (void)hakiosTakeResolves:(MTLRenderPassDescriptor *)descriptor;
+- (void)hakiosSetYInvertWidth:(unsigned)width height:(unsigned)height;
 @end
 
 /* ============================================================================================================
@@ -1601,51 +2075,245 @@ hm_ca_nearest(NSString *frag)
 	return best;
 }
 
+/* --- OpenGL ES: AppleMetalGLRenderer's shaders -----------------------------------------------------------------------
+ *
+ * An application's EAGLContext reaches this device through OpenGLES.framework: libGFXShared reads IOGLESMetalBundleName
+ * off the IOAcceleratorES service (the kernel publishes it when the switch file below is there), loads
+ * /System/Library/Extensions/AppleMetalGLRenderer.bundle, and that renderer draws GL with Metal on this device. A GL
+ * program's shaders arrive as -newFunctionWithGLESIR:inputsDescription:functionType:, Apple's GL compiler's serialized
+ * IR ([u32 length][the stream], its first word the stream's version), not AIR. On Apple's GPU the compiler service turns
+ * it into AIR with OpenGLES.framework/libGLVMPlugin.dylib (MTLCompiler dlopens it and calls
+ * oglCodeGenServiceGenerateIR(LLVMContext, stream, length), which hands back an llvm::Module); that is done here, in
+ * the process, with the same plug-in and the system's own libLLVM.dylib through its C entry points, then mem2reg and
+ * simplifycfg (the generator's output is every GLSL variable in an alloca), and the module is written as bitcode. What
+ * comes out is ordinary AIR -- a "#main" vertex or fragment function, air.vertex_input attributes by location,
+ * user(slotN) varyings, the default-uniform block as an air.buffer, textures and samplers as arguments -- which the
+ * compiler here takes as it takes CoreAnimation's (hakios-metal tests: gl_ijk_vs/gl_ijk_fs, gl_quad_vs/gl_quad_fs,
+ * made the same way on the host from the macOS twin of the plug-in). _MTLDevice's own method makes the function
+ * object (an _MTLFunctionInternal named "#main" over the IR); the AIR is kept on it, and hm_bitcode_for() hands that
+ * to every pipeline made of it. Nothing is linked against libLLVM or the plug-in: both are dlopened, every symbol
+ * looked up, and a missing one is a refusal by name (the function is nil, the GL program fails to link, as GL lets
+ * it).
+ *
+ * The inputs description (4 bytes for each fragment function measured on the host, none for a vertex function) is the
+ * GL front end's note to Apple's backend; the AIR carries the inputs itself, so it is only printed.
+ */
+#define HM_GLES_SWITCH HM_CACHE_DIR "/gles-on"   /* the gate: with it the window server publishes IOGLESMetalBundleName */
+#define HM_GLES_SWITCH_IMAGE "/redwood/share/gles/gles-on"   /* ... or baked into an image (build.sh EXTRA_SHARE=<dir>/gles) */
+
+static char hm_gles_key, hm_gles_text_key;       /* on a function: its AIR (NSData) and, for the first few, the text */
+static volatile BOOL hm_gles_active;             /* this process made a GLES function: it is a GL client */
+
+static struct {
+	void *(*contextCreate)(void);
+	void (*contextDispose)(void *);
+	void (*initialize)(void);
+	void *(*generate)(void *, const void *, size_t);
+	void (*disposeModule)(void *);
+	void *(*writeBitcode)(void *);
+	const char *(*bufferStart)(void *);
+	size_t (*bufferSize)(void *);
+	void (*disposeBuffer)(void *);
+	void *(*createPassManager)(void);
+	void (*addMem2Reg)(void *);
+	void (*addSimplifyCFG)(void *);
+	int (*runPassManager)(void *, void *);
+	void (*disposePassManager)(void *);
+	char *(*printModule)(void *);
+	void (*disposeMessage)(char *);
+	char why[200];
+} hm_glvm;
+static pthread_mutex_t hm_glvm_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* the plug-in and LLVM's C interface, once; hm_glvm.why says what is missing */
+static void
+hm_glvm_load(void)
+{
+	static dispatch_once_t once;
+
+	dispatch_once(&once, ^{
+		void *llvm = dlopen("/usr/lib/libLLVM.dylib", RTLD_NOW | RTLD_LOCAL);
+		void *plugin = dlopen("/System/Library/Frameworks/OpenGLES.framework/libGLVMPlugin.dylib", RTLD_NOW | RTLD_LOCAL);
+
+		if (llvm == NULL || plugin == NULL) {
+			snprintf(hm_glvm.why, sizeof(hm_glvm.why), "dlopen: %s", dlerror());
+			return;
+		}
+#define HM_GLVM_SYM(field, handle, name)								\
+		if ((*(void **)&hm_glvm.field = dlsym(handle, name)) == NULL) {				\
+			snprintf(hm_glvm.why, sizeof(hm_glvm.why), "%s is not in %s", name,		\
+				 handle == llvm ? "libLLVM.dylib" : "libGLVMPlugin.dylib");		\
+			return;										\
+		}
+		HM_GLVM_SYM(contextCreate, llvm, "LLVMContextCreate");
+		HM_GLVM_SYM(contextDispose, llvm, "LLVMContextDispose");
+		HM_GLVM_SYM(disposeModule, llvm, "LLVMDisposeModule");
+		HM_GLVM_SYM(writeBitcode, llvm, "LLVMWriteBitcodeToMemoryBuffer");
+		HM_GLVM_SYM(bufferStart, llvm, "LLVMGetBufferStart");
+		HM_GLVM_SYM(bufferSize, llvm, "LLVMGetBufferSize");
+		HM_GLVM_SYM(disposeBuffer, llvm, "LLVMDisposeMemoryBuffer");
+		HM_GLVM_SYM(printModule, llvm, "LLVMPrintModuleToString");
+		HM_GLVM_SYM(disposeMessage, llvm, "LLVMDisposeMessage");
+		HM_GLVM_SYM(initialize, plugin, "oglCodeGenServiceInitialize");
+		HM_GLVM_SYM(generate, plugin, "oglCodeGenServiceGenerateIR");
+#undef HM_GLVM_SYM
+		/* the passes are a refinement: without them the allocas go to scratch memory, which the compiler serves */
+		*(void **)&hm_glvm.createPassManager = dlsym(llvm, "LLVMCreatePassManager");
+		*(void **)&hm_glvm.addMem2Reg = dlsym(llvm, "LLVMAddPromoteMemoryToRegisterPass");
+		*(void **)&hm_glvm.addSimplifyCFG = dlsym(llvm, "LLVMAddCFGSimplificationPass");
+		*(void **)&hm_glvm.runPassManager = dlsym(llvm, "LLVMRunPassManager");
+		*(void **)&hm_glvm.disposePassManager = dlsym(llvm, "LLVMDisposePassManager");
+		hm_glvm.initialize();
+	});
+}
+
+/* IR, the GLES IR -newFunctionWithGLESIR: is handed ([u32 length][stream]), as AIR bitcode; nil with WHY. TEXT, when
+ * not NULL, gets the module as LLVM's text (for the log when a pipeline of it is refused). */
+static NSData *
+hm_gles_air(const void *ir, NSString **text, char *why, size_t size)
+{
+	const uint32_t length = ir != NULL ? *(const uint32_t *)ir : 0;
+	NSData *air = nil;
+	void *context, *module, *buffer;
+
+	hm_glvm_load();
+	if (hm_glvm.why[0] != '\0') {
+		snprintf(why, size, "no GL code generator: %s", hm_glvm.why);
+		return nil;
+	}
+	if (ir == NULL || length < 4 || length > (64u << 20)) {
+		snprintf(why, size, "a GLES IR of %u bytes", length);
+		return nil;
+	}
+	pthread_mutex_lock(&hm_glvm_lock);   /* (the plug-in's state is its own business: one module at a time) */
+	context = hm_glvm.contextCreate();
+	module = context != NULL ? hm_glvm.generate(context, (const uint8_t *)ir + 4, length) : NULL;
+	if (module == NULL) {
+		snprintf(why, size, "oglCodeGenServiceGenerateIR refused the stream (version %u, %u bytes)", ((const uint32_t *)ir)[1], length);
+	} else {
+		if (hm_glvm.createPassManager != NULL && hm_glvm.addMem2Reg != NULL && hm_glvm.runPassManager != NULL) {
+			void *pm = hm_glvm.createPassManager();
+
+			if (pm != NULL) {
+				hm_glvm.addMem2Reg(pm);
+				if (hm_glvm.addSimplifyCFG != NULL) hm_glvm.addSimplifyCFG(pm);
+				hm_glvm.runPassManager(pm, module);
+				if (hm_glvm.disposePassManager != NULL) hm_glvm.disposePassManager(pm);
+			}
+		}
+		buffer = hm_glvm.writeBitcode(module);
+		if (buffer != NULL) {
+			air = [NSData dataWithBytes:hm_glvm.bufferStart(buffer) length:hm_glvm.bufferSize(buffer)];
+			hm_glvm.disposeBuffer(buffer);
+		} else {
+			snprintf(why, size, "LLVMWriteBitcodeToMemoryBuffer failed");
+		}
+		if (air != nil && text != NULL) {
+			char *s = hm_glvm.printModule(module);
+
+			if (s != NULL) {
+				if (strlen(s) < 65536) *text = [NSString stringWithUTF8String:s];
+				hm_glvm.disposeMessage(s);
+			}
+		}
+		hm_glvm.disposeModule(module);
+	}
+	if (context != NULL) hm_glvm.contextDispose(context);
+	pthread_mutex_unlock(&hm_glvm_lock);
+	return air;
+}
+
+/* a function made by -newFunctionWithGLESIR:...: its AIR, else nil */
+static NSData *
+hm_gles_bitcode(id function)
+{
+	return function != nil ? objc_getAssociatedObject(function, &hm_gles_key) : nil;
+}
+
+/* a refused pipeline's GLES function, as the generator's AIR text, a line each (the first three refused per process):
+ * what to take apart when the compiler here refuses something Apple's GL code generator emits */
+static void
+hm_gles_dump_refused(const char *stage, id function)
+{
+	static int dumped;
+	NSString *text = function != nil ? objc_getAssociatedObject(function, &hm_gles_text_key) : nil;
+
+	if (text == nil || __atomic_fetch_add(&dumped, 1, __ATOMIC_RELAXED) >= 3) {
+		return;
+	}
+	unsigned n = 0;
+	for (NSString *line in [text componentsSeparatedByString:@"\n"]) {
+		if ([line length] == 0) continue;
+		if (n++ >= 160) {
+			hm_print("gles-air %s: (cut at 160 lines)\n", stage);
+			break;
+		}
+		hm_print("gles-air %s: %s\n", stage, [line UTF8String]);
+	}
+}
+
+/*
+ * The gate. The kernel publishes IOGLESMetalBundleName on the accelerator only when asked (IOAcceleratorES::setProperties,
+ * metal=1), and the window server asks for it here, once a boot, when /var/db/hakios-metal-cache/gles-on (or, baked into
+ * an image, /redwood/share/gles/gles-on) exists: without
+ * the file every application's EAGLContext stays nil as before (no OpenGL ES at all, which applications are written to
+ * survive). With it they get GL on this device. Removing the file and rebooting takes it away again. Only the first
+ * process of a boot with write access to the registry entry (backboardd, which opens the device before any
+ * application runs) does it; the others find the property there or the file absent.
+ */
+static void
+hm_gles_gate(io_service_t accelerator)
+{
+	static dispatch_once_t once;
+
+	if (accelerator == IO_OBJECT_NULL) {
+		return;
+	}
+	dispatch_once(&once, ^{
+		CFTypeRef published = IORegistryEntryCreateCFProperty(accelerator, CFSTR("IOGLESMetalBundleName"), kCFAllocatorDefault, 0);
+		const char *switched = access(HM_GLES_SWITCH, F_OK) == 0 ? HM_GLES_SWITCH :
+				       access(HM_GLES_SWITCH_IMAGE, F_OK) == 0 ? HM_GLES_SWITCH_IMAGE : NULL;
+		const BOOL wanted = switched != NULL;
+
+		if (published != NULL) {
+			CFRelease(published);
+			if (strcmp(getprogname(), "backboardd") == 0) {
+				hm_print("gles: the accelerator names AppleMetalGLRenderer: applications' EAGLContexts are served by this device\n");
+			}
+			return;
+		}
+		if (!wanted) {
+			if (strcmp(getprogname(), "backboardd") == 0) {
+				hm_print("gles: off (no %s, no %s): applications get no OpenGL ES context\n", HM_GLES_SWITCH, HM_GLES_SWITCH_IMAGE);
+			}
+			return;
+		}
+		/* (the SDK marks the setter unavailable on iOS; IOKit has it, and the kernel's IOAcceleratorES::setProperties is
+		 * what answers it) */
+		kern_return_t (*set)(io_registry_entry_t, CFStringRef, CFTypeRef) =
+			(kern_return_t (*)(io_registry_entry_t, CFStringRef, CFTypeRef))dlsym(RTLD_DEFAULT, "IORegistryEntrySetCFProperty");
+		kern_return_t kr = set != NULL ? set(accelerator, CFSTR("IOGLESMetalBundleName"), CFSTR("AppleMetalGLRenderer")) : KERN_FAILURE;
+		hm_print("gles: %s exists: asked the kernel to publish IOGLESMetalBundleName = AppleMetalGLRenderer: %s (%#x)\n", switched,
+			 kr == KERN_SUCCESS ? "published" : "refused", kr);
+	});
+}
+
 /* The module to compile for FUNCTION (of the pipeline labelled PIPELINE, vertex stage or not): its variant when
  * CoreAnimation's labels name one, else what the function itself has. */
 static NSData *
 hm_bitcode_for(id function, NSString *pipeline, BOOL vertex)
 {
 	static unsigned said;
+	NSData *gles = hm_gles_bitcode(function);
+
+	if (gles != nil) {
+		return gles;   /* an OpenGL ES function: the AIR made of its GLES IR (above) */
+	}
 	NSString *name = [function respondsToSelector:@selector(name)] ? [function name] : nil, *label = nil, *chosen = nil;
 	NSData *own = ((NSData *(*)(id, SEL))objc_msgSend)(function, sel_getUid("bitcodeData")), *variant = nil;
 
-	if (name != nil && [name hasPrefix:@"edr_scale_"]) {
-		/* the stand-in at compile time too: the window server gets edr_scale by a road the library hooks do not see,
-		 * and the later CoreAnimation's reads buffers iOS 16.5's never binds (see hm_stand_ins) */
-		static NSData *copies[2];
-		static dispatch_once_t once;
-		const int lpf = [name hasSuffix:@"_lpf"];
-
-		dispatch_once(&once, ^{
-			id<MTLDevice> device = [function respondsToSelector:@selector(device)] ? [function device] : nil;
-
-			if (device == nil) device = MTLCreateSystemDefaultDevice();   /* (the function's own answered nil) */
-			NSError *e = nil;
-			id lib = [device newLibraryWithURL:[NSURL fileURLWithPath:@"/redwood/share/ca-share/QuartzCore-default.metallib"]
-						     error:&e];
-			hm_print("inplace_copy for edr_scale: device %s, library %s%s\n", device ? "yes" : "nil", lib ? "opened" : "not opened: ",
-				 lib ? "" : [[e description] UTF8String]);
-			for (int i = 0; i < 2 && lib != nil; i++) {
-				id f = [lib newFunctionWithName:i ? @"inplace_copy_lpf" : @"inplace_copy_lph"];
-
-				if (f != nil && [f respondsToSelector:sel_getUid("bitcodeData")]) {
-					copies[i] = [((NSData *(*)(id, SEL))objc_msgSend)(f, sel_getUid("bitcodeData")) retain];
-				}
-				[f release];
-			}
-			[lib release];
-		});
-		static unsigned told;
-		if (told++ < 3 || (told & (told - 1)) == 0) {
-			hm_print("CoreAnimation's %s: %s (%u times)\n", [name UTF8String], copies[lpf] != nil ?
-				 "compiled as inplace_copy, the source as it is" : "no inplace_copy to stand in, its own module", told);
-		}
-		if (copies[lpf] != nil) {
-			return copies[lpf];
-		}
-		return own;
-	}
+	/* (edr_scale was compiled as inplace_copy here while the library's was a later CoreAnimation's, whose buffers iOS
+	 * 16.5 never binds; iOS 16.5's own library has its own, compiled as it is) */
 	if (name == nil || ![name hasPrefix:@"fixed_"]) {
 		return own;
 	}
@@ -1776,6 +2444,290 @@ hm_dump_refused(const char *label, id function)
 	hm_dump_function(label, function, "metal_dump=refused", NULL, 0);
 }
 
+/* v29d handoff probes share IOSurface IDs across the producer and render server.
+ * No drawable/layer is retained by these records; a reused slot gets a new record.
+ * The probes are off unless /var/db/hakios-metal-cache/handoff-diag exists: the
+ * boot-args have no room left, and the file is read once per process, as the
+ * switches beside it are (bo-cache-off, batch-commit-off, gmem-args). */
+static BOOL hm_handoff_on(void)
+{
+    static int on = -1;
+    int value = __atomic_load_n(&on, __ATOMIC_RELAXED);
+
+    if (value < 0) {
+        value = access("/var/db/hakios-metal-cache/handoff-diag", F_OK) == 0;
+        __atomic_store_n(&on, value, __ATOMIC_RELAXED);
+    }
+    return value != 0;
+}
+
+/* Every handoff probe is a counter, taken by the 2 s fps: window: a per-frame,
+ * per-pass or per-texture event may not print a line each (v29d's probes printed
+ * 562 lines a second). State changes keep a line of their own. */
+static struct {
+    unsigned cb;
+    unsigned encodeReads, encodeWrites, submitReads, submitWrites;
+    unsigned fenceReads, fenceWrites, visibleWrites;
+    unsigned shadowQueued, shadowPublished;
+    unsigned passAttachments;
+    unsigned imports, planeImports, shadowImports;
+    unsigned cpuWrites, cpuReads, textureWaits;
+    unsigned contentsChanges, dirtyMarks, appearanceChanges;
+    unsigned txBegin, txCommit, txFlush;
+    unsigned signals, poolReuses;
+    unsigned steps[10];   /* the drawable steps, in hm_step_names order */
+} hm_diag;
+
+static void
+hm_diag_add(unsigned *counter)
+{
+    __atomic_fetch_add(counter, 1, __ATOMIC_RELAXED);
+}
+
+static unsigned
+hm_diag_take(unsigned *counter)
+{
+    return __atomic_exchange_n(counter, 0, __ATOMIC_RELAXED);
+}
+
+static const char *const hm_step_names[] = {
+    "next-request", "next-return", "present-call", "texture-ready", "present-return-inserted",
+    "contents-dirty", "transaction-flush-return", "handler-register", "handler-deliver", "other",
+};
+
+static unsigned
+hm_step(const char *step)
+{
+    for (unsigned i = 0; i < 9; i++) {
+        if (!strcmp(step, hm_step_names[i])) return i;
+    }
+    return 9;
+}
+
+/* where the drawable is the live object the layer method was given with the step */
+static BOOL
+hm_drawable_live_step(const char *step)
+{
+    return !strcmp(step, "next-return") || !strcmp(step, "present-call") || !strcmp(step, "texture-ready");
+}
+
+static char hm_drawable_record_key;
+static NSMapTable *hm_ca_layers;   /* each layer's image queue as last reported: a state-change test */
+static CFTypeID (*hm_ca_queue_type)(void);
+static unsigned long (*hm_ca_queue_pending)(CFTypeRef);
+static uint64_t (*hm_ca_queue_updated)(CFTypeRef);
+static unsigned (*hm_ca_queue_pixels)(CFTypeRef);
+static void hm_ca_queue_trace(id layer, const char *step)
+{
+    (void)step;
+    id queue = ((id (*)(id, SEL))objc_msgSend)(layer, @selector(contents));
+    if (queue == nil || CFGetTypeID((CFTypeRef)queue) != hm_ca_queue_type()) return;
+    /* only followed, not printed: the 2 s pass prints it when it changed */
+    @synchronized (hm_ca_layers) {
+        if ([hm_ca_layers objectForKey:layer] == nil) [hm_ca_layers setObject:@{} forKey:layer];
+    }
+}
+
+/* a layer's image queue, once a 2 s window and only when it changed */
+static void hm_ca_queue_report(id layer)
+{
+    id queue = ((id (*)(id, SEL))objc_msgSend)(layer, @selector(contents));
+    if (queue == nil || CFGetTypeID((CFTypeRef)queue) != hm_ca_queue_type()) return;
+    const unsigned long pending = hm_ca_queue_pending((CFTypeRef)queue);
+    const uint64_t updated = hm_ca_queue_updated((CFTypeRef)queue);
+    const unsigned pixels = hm_ca_queue_pixels((CFTypeRef)queue);
+    NSDictionary *last;
+
+    @synchronized (hm_ca_layers) { last = [[hm_ca_layers objectForKey:layer] retain]; }
+    const BOOL same = last != nil && [last[@"updated"] unsignedLongLongValue] == updated &&
+                      [last[@"pending"] unsignedLongValue] == pending && [last[@"pixels"] unsignedIntValue] == pixels;
+    [last release];
+    if (same) return;
+    @synchronized (hm_ca_layers) {
+        [hm_ca_layers setObject:@{ @"updated": @(updated), @"pending": @(pending), @"pixels": @(pixels) } forKey:layer];
+    }
+    id root = layer, parent;
+    while ((parent = ((id (*)(id, SEL))objc_msgSend)(root, sel_getUid("superlayer"))) != nil) root = parent;
+    hm_print("ca-queue: layer=%p root=%p queue=%p unconsumed=%lu server-update-host=%llu displayed-pixels=%u t=%.6f\n",
+        layer, root, queue, pending, (unsigned long long)updated, pixels, hm_now());
+}
+
+/* status and insertSeed of the last drawable reported: a ca-life line only when one changes,
+ * not for every present */
+static struct { pthread_mutex_t lock; uintptr_t drawable; unsigned long status; unsigned seed; } hm_drawable_state =
+    { PTHREAD_MUTEX_INITIALIZER, 0, 0, 0 };
+
+static void hm_drawable_trace(const char *step, id layer, id drawable, double argument)
+{
+    if (!hm_handoff_on()) return;
+    hm_diag_add(&hm_diag.steps[hm_step(step)]);
+    if (layer != nil) hm_ca_queue_trace(layer, step);
+    NSDictionary *record = drawable != nil ? objc_getAssociatedObject(drawable, &hm_drawable_record_key) : nil;
+    if (drawable != nil && (!strcmp(step, "next-return") || !strcmp(step, "present-call"))) {
+        id texture = ((id (*)(id, SEL))objc_msgSend)(drawable, @selector(texture));
+        IOSurfaceRef surface = [(HakiosMetalTexture *)texture iosurface];
+        record = @{ @"texture": @((uintptr_t)texture), @"surface": @(surface != NULL ? IOSurfaceGetID(surface) : 0),
+                    @"drawable": @(((uint64_t (*)(id, SEL))objc_msgSend)(drawable, sel_getUid("drawableID"))) };
+        objc_setAssociatedObject(drawable, &hm_drawable_record_key, record, OBJC_ASSOCIATION_RETAIN);
+        if (surface != NULL) {
+            NSDictionary *previous = (NSDictionary *)IOSurfaceCopyValue(surface, CFSTR("HakiosMetalProducer"));
+            if (!strcmp(step, "next-return") && previous != nil) hm_diag_add(&hm_diag.poolReuses);
+            [previous release];
+            IOSurfaceSetValue(surface, CFSTR("HakiosMetalProducer"), (CFTypeRef)@{
+                @"pid": @(getpid()), @"layer": @((uintptr_t)layer), @"drawable": record[@"drawable"] });
+        }
+    }
+    /* Only the drawable a layer method passed in the step itself is live: the delayed
+     * notifications (release-private, handler deliveries) can arrive after it went away,
+     * and an address kept in a record is not the object. */
+    if (!hm_drawable_live_step(step)) return;
+    const unsigned long status = ((unsigned long (*)(id, SEL))objc_msgSend)(drawable, sel_getUid("status"));
+    const unsigned seed = ((unsigned (*)(id, SEL))objc_msgSend)(drawable, sel_getUid("insertSeed"));
+    pthread_mutex_lock(&hm_drawable_state.lock);
+    /* a status is the drawable's state, not its address (the pool hands the slots round)
+     * nor its seed (which the present path writes every frame) */
+    const BOOL changed = hm_drawable_state.status != status;
+    if (changed) {
+        hm_drawable_state.drawable = (uintptr_t)drawable;
+        hm_drawable_state.status = status;
+        hm_drawable_state.seed = seed;
+    }
+    pthread_mutex_unlock(&hm_drawable_state.lock);
+    if (!changed) return;
+    uint64_t tid = 0; pthread_threadid_np(NULL, &tid);
+    hm_print("ca-life: step=%s layer=%p drawable=%p id=%llu status=%lu insert-seed=%u tid=%llu main=%u arg=%.6f t=%.6f\n",
+             step, layer, drawable, [record[@"drawable"] unsignedLongLongValue], status, seed,
+             (unsigned long long)tid, [NSThread isMainThread], argument, hm_now());
+}
+static BOOL hm_notes_layers_on(void)
+{
+    return hm_handoff_on() && !strcmp(getprogname(), "MobileNotes");
+}
+static void (*hm_layer_contents_original)(id, SEL, id);
+static void (*hm_layer_dirty_original)(id, SEL);
+static void (*hm_layer_hidden_original)(id, SEL, BOOL);
+static void (*hm_layer_opaque_original)(id, SEL, BOOL);
+static void (*hm_layer_opacity_original)(id, SEL, float);
+static void hm_layer_contents(id layer, SEL sel, id contents)
+{
+    if (hm_layer_contents_original == NULL) return;
+    const BOOL changed = hm_notes_layers_on() && ((id (*)(id, SEL))objc_msgSend)(layer, @selector(contents)) != contents;
+    hm_layer_contents_original(layer, sel, contents);
+    if (changed) hm_diag_add(&hm_diag.contentsChanges);
+}
+static void hm_layer_dirty(id layer, SEL sel)
+{
+    if (hm_layer_dirty_original == NULL) return;
+    hm_layer_dirty_original(layer, sel);
+    if (hm_notes_layers_on()) hm_diag_add(&hm_diag.dirtyMarks);
+}
+static void hm_layer_hidden(id layer, SEL sel, BOOL value)
+{
+    if (hm_layer_hidden_original == NULL) return;
+    const BOOL changed = hm_notes_layers_on() && ((BOOL (*)(id, SEL))objc_msgSend)(layer, sel_getUid("isHidden")) != value;
+    hm_layer_hidden_original(layer, sel, value);
+    if (changed) hm_diag_add(&hm_diag.appearanceChanges);
+}
+static void hm_layer_opaque(id layer, SEL sel, BOOL value)
+{
+    if (hm_layer_opaque_original == NULL) return;
+    const BOOL changed = hm_notes_layers_on() && ((BOOL (*)(id, SEL))objc_msgSend)(layer, sel_getUid("isOpaque")) != value;
+    hm_layer_opaque_original(layer, sel, value);
+    if (changed) hm_diag_add(&hm_diag.appearanceChanges);
+}
+static void hm_layer_opacity(id layer, SEL sel, float value)
+{
+    if (hm_layer_opacity_original == NULL) return;
+    const BOOL changed = hm_notes_layers_on() && ((float (*)(id, SEL))objc_msgSend)(layer, sel_getUid("opacity")) != value;
+    hm_layer_opacity_original(layer, sel, value);
+    if (changed) hm_diag_add(&hm_diag.appearanceChanges);
+}
+static void (*hm_tx_begin_original)(id, SEL);
+static void (*hm_tx_commit_original)(id, SEL);
+static void (*hm_tx_flush_original)(id, SEL);
+static void hm_tx_begin(id cls, SEL sel)
+{
+    if (hm_tx_begin_original != NULL) hm_tx_begin_original(cls, sel);
+    hm_diag_add(&hm_diag.txBegin);
+}
+static void hm_tx_commit(id cls, SEL sel)
+{
+    if (hm_tx_commit_original != NULL) hm_tx_commit_original(cls, sel);
+    hm_diag_add(&hm_diag.txCommit);
+}
+static void hm_tx_flush(id cls, SEL sel)
+{
+    if (hm_tx_flush_original != NULL) hm_tx_flush_original(cls, sel);
+    hm_diag_add(&hm_diag.txFlush);
+}
+
+/* Only a method the class implements itself: class_getInstanceMethod walks the
+ * superclasses, and method_setImplementation(NULL, ...) is undefined. The real
+ * type encoding is printed once, so a wrapper's C signature can be checked
+ * against it. Returns the original IMP (NULL when the method is not this class's). */
+static IMP hm_hook(Class cls, const char *name, IMP imp)
+{
+    unsigned count = 0;
+    IMP old = NULL;
+    Method install = NULL;
+    Method *methods = class_copyMethodList(cls, &count);
+
+    for (unsigned i = 0; i < count; i++) {
+        if (strcmp(sel_getName(method_getName(methods[i])), name) != 0) continue;
+        install = methods[i];
+        old = method_getImplementation(install);
+        break;
+    }
+    if (install == NULL) {
+        hm_print("handoff: -[%s %s] is not this class's own method; not installed\n", class_getName(cls), name);
+    } else {
+        hm_print("handoff: -[%s %s] %s\n", class_getName(cls), name, method_getTypeEncoding(install) ?: "(no encoding)");
+        method_setImplementation(install, imp);
+    }
+    free(methods);
+    return old;
+}
+
+static void hm_drawable_diagnostics_install(Class layer, Class drawable)
+{
+    (void)layer;
+    (void)drawable;
+    if (!hm_handoff_on()) return;
+    hm_ca_layers = [[NSMapTable weakToStrongObjectsMapTable] retain];
+    hm_ca_queue_type = dlsym(RTLD_DEFAULT, "CAImageQueueGetTypeID");
+    hm_ca_queue_pending = dlsym(RTLD_DEFAULT, "CAImageQueueGetUnconsumedImageCount");
+    hm_ca_queue_updated = dlsym(RTLD_DEFAULT, "CAImageQueueGetLastUpdateHostTime");
+    hm_ca_queue_pixels = dlsym(RTLD_DEFAULT, "CAImageQueueGetDisplayedPixelCount");
+    dispatch_source_t monitor = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_global_queue(QOS_CLASS_UTILITY, 0));
+    dispatch_source_set_timer(monitor, dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC), 2 * NSEC_PER_SEC, NSEC_PER_MSEC * 50);
+    dispatch_source_set_event_handler(monitor, ^{
+        @autoreleasepool {
+            NSArray *layers;
+            @synchronized (hm_ca_layers) { layers = [[[hm_ca_layers keyEnumerator] allObjects] retain]; }
+            for (id liveLayer in layers) hm_ca_queue_report(liveLayer);
+            [layers release];
+            NSArray *contexts = ((id (*)(id, SEL))objc_msgSend)((id)objc_getClass("CAContext"), sel_getUid("allContexts"));
+            for (id context in contexts)
+                hm_print("ca-context: context=%p id=%u root=%p commit-id=%u t=%.6f\n", context,
+                    ((unsigned (*)(id, SEL))objc_msgSend)(context, sel_getUid("contextId")),
+                    ((id (*)(id, SEL))objc_msgSend)(context, @selector(layer)),
+                    ((unsigned (*)(id, SEL))objc_msgSend)(context, sel_getUid("commitId")), hm_now());
+        }
+    });
+    dispatch_resume(monitor);
+    Class caLayer = objc_getClass("CALayer"), tx = objc_getClass("CATransaction");
+    hm_layer_contents_original = (void (*)(id, SEL, id))hm_hook(caLayer, "setContents:", (IMP)hm_layer_contents);
+    hm_layer_dirty_original = (void (*)(id, SEL))hm_hook(caLayer, "setContentsChanged", (IMP)hm_layer_dirty);
+    hm_layer_hidden_original = (void (*)(id, SEL, BOOL))hm_hook(caLayer, "setHidden:", (IMP)hm_layer_hidden);
+    hm_layer_opaque_original = (void (*)(id, SEL, BOOL))hm_hook(caLayer, "setOpaque:", (IMP)hm_layer_opaque);
+    hm_layer_opacity_original = (void (*)(id, SEL, float))hm_hook(caLayer, "setOpacity:", (IMP)hm_layer_opacity);
+    hm_tx_begin_original = (void (*)(id, SEL))hm_hook(object_getClass(tx), "begin", (IMP)hm_tx_begin);
+    hm_tx_commit_original = (void (*)(id, SEL))hm_hook(object_getClass(tx), "commit", (IMP)hm_tx_commit);
+    hm_tx_flush_original = (void (*)(id, SEL))hm_hook(object_getClass(tx), "flush", (IMP)hm_tx_flush);
+}
+
+#include "HakiosMetalDrawables.h"
+
 @implementation HakiosMetalDevice
 
 /* Declared at +load because Metal loads this bundle and is therefore already in the process; -initWithAcceleratorPort:
@@ -1792,6 +2744,73 @@ hm_ensure_spi(Class cls)
 }
 
 HM_REFUSES_OUT_LOUD
+
+/* OpenGL ES's shaders (see hm_gles_air): Metal's own function object, with the AIR made of its GLES IR kept on it, or
+ * nil with the reason -- a GL program that then fails to link, which GL applications check for. Each of the first 16
+ * (then every power of two) is said, with its sizes and the inputs description's bytes. */
+- (id)hakiosGLESFunction:(id)function ir:(const void *)ir inputs:(dispatch_data_t)inputs type:(NSUInteger)type
+{
+	static unsigned made;
+	char why[256] = "";
+	NSString *text = nil;
+	const unsigned n = __atomic_fetch_add(&made, 1, __ATOMIC_RELAXED);
+	const BOOL say = n < 16 || (n & (n - 1)) == 0;
+	const double began = hm_now();
+	NSData *air = function != nil ? hm_gles_air(ir, n < 64 ? &text : NULL, why, sizeof(why)) : nil;
+	char described[80] = "none";
+
+	hm_gles_active = YES;
+	if (inputs != nil) {
+		const void *bytes = NULL;
+		size_t size = 0;
+		dispatch_data_t map = dispatch_data_create_map(inputs, &bytes, &size);
+		size_t at = (size_t)snprintf(described, sizeof(described), "%zu bytes", size);
+
+		for (size_t i = 0; i < size && i < 16 && at + 4 < sizeof(described); i++) {
+			at += (size_t)snprintf(described + at, sizeof(described) - at, "%s%02x", i ? "" : " ", ((const uint8_t *)bytes)[i]);
+		}
+		dispatch_release(map);
+	}
+	if (function == nil) {
+		hm_print("gles: refused: function %u (type %lu): _MTLDevice made no function of the GLES IR\n", n, (unsigned long)type);
+		return nil;
+	}
+	if (air == nil) {
+		hm_print("gles: refused: function %u (type %lu, GLES IR %u bytes): %s; nil, the GL program will not link\n", n,
+			 (unsigned long)type, ir != NULL ? *(const uint32_t *)ir : 0, why);
+		[function release];
+		return nil;
+	}
+	objc_setAssociatedObject(function, &hm_gles_key, air, OBJC_ASSOCIATION_RETAIN);
+	if (text != nil) objc_setAssociatedObject(function, &hm_gles_text_key, text, OBJC_ASSOCIATION_RETAIN);
+	if (say) {
+		hm_print("gles: function %u: %s, GLES IR %u bytes (stream version %u) -> AIR %lu bytes in %.1f ms; inputs description %s\n", n,
+			 type == MTLFunctionTypeVertex ? "vertex" : type == MTLFunctionTypeFragment ? "fragment" : "of another type",
+			 *(const uint32_t *)ir, ((const uint32_t *)ir)[1], (unsigned long)[air length], (hm_now() - began) * 1e3, described);
+	}
+	return function;
+}
+
+- (id)newFunctionWithGLESIR:(const void *)ir inputsDescription:(dispatch_data_t)inputs functionType:(NSUInteger)type
+{
+	return [self hakiosGLESFunction:[super newFunctionWithGLESIR:ir inputsDescription:inputs functionType:type] ir:ir inputs:inputs type:type];
+}
+
+- (id)newFunctionWithGLESIR:(const void *)ir functionType:(NSUInteger)type
+{
+	return [self hakiosGLESFunction:[super newFunctionWithGLESIR:ir functionType:type] ir:ir inputs:nil type:type];
+}
+
+/* Apple's shader sampling (AppleMetalGLRenderer's profiling property): not here; NO, and the renderer says so to GL */
+- (BOOL)mapShaderSampleBufferWithBuffer:(void *)buffer capacity:(NSUInteger)capacity size:(NSUInteger)size
+{
+	(void)buffer;
+	(void)capacity;
+	(void)size;
+	HM_ONCE("Apple's shader sampling (-mapShaderSampleBufferWithBuffer:...) was asked for; not served\n");
+	return NO;
+}
+- (void)unmapShaderSampleBuffer { }
 
 /* An argument encoder for buffer INDEX of FUNCTION, from what the function's AIR says the set holds; nil, said, when it has
  * no set there or the front end refused it. */
@@ -1876,21 +2895,16 @@ hm_functions_encode_from_metadata(void)
 }
 
 /*
- * Functions CoreAnimation of iOS 16.5 asks its library for that the library given it (QuartzCore-default.metallib:
- * this image's uber shaders and a later CoreAnimation's other functions) does not have under that name, each answered
- * with the nearest one it has: luma_boost (a picture's luminance raised) by inplace_copy, the picture as it is -- both
- * read only the source at texture 3 beside std_vert1 (Metal's reflection on a Mac); edr_scale, tried first, reads
- * buffers 5 and 7 that CoreAnimation binds for neither, and its draws were refused. A function asked for that the
- * library has is never touched. (hakios)
+ * Functions CoreAnimation of iOS 16.5 asks its library for that the library given it does not have under that name,
+ * each answered with the nearest one it has. iOS 16.5's own QuartzCore default.metallib (tools/ca-metallib.py) has
+ * every function its CoreAnimation asks for, so with it nothing here is used; the entries answer an older ca-share
+ * (a later CoreAnimation's library), whose luma_boost was missing. A function asked for that the library has is never
+ * touched; an entry marked "always" would replace even that, and none is. (hakios)
  */
 static const char *const hm_stand_ins[][3] = {
 	/* asked for, given instead, "always" when the library's own is the wrong one (not just missing) */
 	{ "luma_boost_lph", "inplace_copy_lph", "" },
 	{ "luma_boost_lpf", "inplace_copy_lpf", "" },
-	/* the later CoreAnimation's edr_scale reads buffers 5 and 7 and texture 9; iOS 16.5's binds three fragment
-	 * buffers and its source at 3, and 3 259 of its draws were refused in one run (logs/163451-run.log) */
-	{ "edr_scale_lph", "inplace_copy_lph", "always" },
-	{ "edr_scale_lpf", "inplace_copy_lpf", "always" },
 };
 static id (*hm_orig_fn_name)(id, SEL, NSString *);
 static id (*hm_orig_fn_constants)(id, SEL, NSString *, MTLFunctionConstantValues *, NSError **);
@@ -1904,6 +2918,49 @@ hm_stand_in(NSString *name, BOOL found)
 		}
 	}
 	return nil;
+}
+
+/* GCD copies the block (including self and the completion block). Mutable API
+ * inputs are copied before enqueueing; all results/errors live through the callback. */
+static void
+hm_creation_async(dispatch_block_t work)
+{
+	dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{
+		@autoreleasepool { work(); }
+	});
+}
+
+static void
+hm_fn_constants_async(id self, SEL sel, NSString *name, MTLFunctionConstantValues *values,
+                      void (^handler)(id<MTLFunction>, NSError *))
+{
+	(void)sel;
+	name = [name copy];
+	values = [values copy];
+	hm_creation_async(^{
+		NSError *error = nil;
+		id function = [(id<MTLLibrary>)self newFunctionWithName:name constantValues:values error:&error];
+		if (handler != NULL) handler(function, error);
+		[function release];
+	});
+	[name release];
+	[values release];
+}
+
+static void
+hm_fn_descriptor_async(id self, SEL sel, MTLFunctionDescriptor *descriptor,
+                       void (^handler)(id<MTLFunction>, NSError *))
+{
+	const BOOL intersection = sel == @selector(newIntersectionFunctionWithDescriptor:completionHandler:);
+	descriptor = [descriptor copy];
+	hm_creation_async(^{
+		NSError *error = nil;
+		id function = intersection ? [(id<MTLLibrary>)self newIntersectionFunctionWithDescriptor:(id)descriptor error:&error]
+		                           : [(id<MTLLibrary>)self newFunctionWithDescriptor:descriptor error:&error];
+		if (handler != NULL) handler(function, error);
+		[function release];
+	});
+	[descriptor release];
 }
 
 static id
@@ -1939,16 +2996,46 @@ hm_fn_constants(id self, SEL sel, NSString *name, MTLFunctionConstantValues *val
 	return f;
 }
 
+#ifdef HAKIOS_UMI
+static id (*hm_ca_url2)(id, SEL, id, id);
+static id (*hm_ca_url3)(id, SEL, id, id, id);
+static id hm_ca_default_url(id bundle, id name, id ext, id found) {
+    if (found == nil && [name isEqual:@"default"] && [ext isEqual:@"metallib"] &&
+        [[bundle bundlePath] rangeOfString:@"QuartzCore.framework"].location != NSNotFound) {
+        return [NSURL fileURLWithPath:@"/redwood/share/ca-share/QuartzCore-default.metallib"];
+    }
+    return found;
+}
+static id hm_ca_get_url2(id self, SEL cmd, id name, id ext) {
+    return hm_ca_default_url(self, name, ext, hm_ca_url2(self, cmd, name, ext));
+}
+static id hm_ca_get_url3(id self, SEL cmd, id name, id ext, id dir) {
+    return hm_ca_default_url(self, name, ext, hm_ca_url3(self, cmd, name, ext, dir));
+}
+#endif
+
 static void
 hm_library_stand_ins(void)
 {
 	static dispatch_once_t once;
 
 	dispatch_once(&once, ^{
+#ifdef HAKIOS_UMI
+        Method u2 = class_getInstanceMethod([NSBundle class], @selector(URLForResource:withExtension:));
+        Method u3 = class_getInstanceMethod([NSBundle class], @selector(URLForResource:withExtension:subdirectory:));
+        if (u2) hm_ca_url2 = (void *)method_setImplementation(u2, (IMP)hm_ca_get_url2);
+        if (u3) hm_ca_url3 = (void *)method_setImplementation(u3, (IMP)hm_ca_get_url3);
+#endif
 		Class library = NSClassFromString(@"_MTLLibrary");
 		Method a = library ? class_getInstanceMethod(library, @selector(newFunctionWithName:)) : NULL;
 		Method b = library ? class_getInstanceMethod(library, @selector(newFunctionWithName:constantValues:error:)) : NULL;
 
+		class_replaceMethod(library, @selector(newFunctionWithName:constantValues:completionHandler:),
+		                    (IMP)hm_fn_constants_async, "v@:@@@?");
+		class_replaceMethod(library, @selector(newFunctionWithDescriptor:completionHandler:),
+		                    (IMP)hm_fn_descriptor_async, "v@:@@?");
+		class_replaceMethod(library, @selector(newIntersectionFunctionWithDescriptor:completionHandler:),
+		                    (IMP)hm_fn_descriptor_async, "v@:@@?");
 		if (a != NULL) hm_orig_fn_name = (id (*)(id, SEL, NSString *))method_setImplementation(a, (IMP)hm_fn_name);
 		if (b != NULL) hm_orig_fn_constants = (id (*)(id, SEL, NSString *, MTLFunctionConstantValues *, NSError **))
 			method_setImplementation(b, (IMP)hm_fn_constants);
@@ -2112,31 +3199,13 @@ hm_m2v_missing(const char *class, const char *selector)
 static bool
 hm_boot_arg_set(const char *what)
 {
-	char args[1024] = "";
-	size_t size = sizeof(args) - 1;
-
-	return sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && strstr(args, what) != NULL;
+	return hm_ca_arg(what);
 }
 
 - (instancetype)initWithAcceleratorPort:(io_service_t)port
 {
-	/* (hakios) the window server alone is shown the device: every other client of this image's Metal (SpringBoard
-	 * through SiriUICore, mediaserverd, ...) finds pipeline libraries made for Apple's GPUs with no default.metallib
-	 * beside them and aborts, while without a device it takes the road it takes today. Boot-arg metal_all=1: all. */
-	{
-		static int all = -1;
-		char args[1024] = "";
-		size_t size = sizeof(args) - 1;
-		const char *name = getprogname();
-
-		if (all < 0) {
-			all = sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && strstr(args, "metal_all=1") != NULL;
-		}
-		if (!all && (name == NULL || strcmp(name, "backboardd") != 0)) {
-			HM_ONCE("%s is not shown the device: the window server alone is (metal_all=1: every process)\n", name ? name : "?");
-			return nil;     /* (not released: before -init, _MTLDevice's -dealloc reads what -init never set) */
-		}
-	}
+	/* (hakios) every process is shown the device (2026-11-10, after the metal_all=1 trial: METAL-ALL-umi.md).
+	 * The window-server-only whitelist made PencilKit (Notes) abort on a nil device. */
 	/* (hakios) metal_m2v=1: the device is UniXNU's Metal on Vulkan instead (AdrenoMetal's frontend over metal2vulkan
 	 * over Turnip, tools/mk-m2v.sh; linked in by userland/build.sh M2V=1): its own objects, from the device down */
 	if (native_bridge_metal_open != NULL && hm_boot_arg_set("metal_m2v=1")) {
@@ -2313,6 +3382,22 @@ hm_boot_arg_set(const char *what)
 		}
 	}
 	setenv("HAKIOS_METAL_LISTING", "0", 0);
+	hakios_metal_perf_enable(hm_fps_on());
+	hm_drawables_install();
+	if (hm_fps_on()) {
+		hm_print("stage-cache: build=%s writable=%s seed=%s\n", hakios_metal_stage_cache_build(),
+			 getenv("HAKIOS_METAL_CACHE"), getenv("HAKIOS_METAL_CACHE_SEED") ?: "(none)");
+	}
+	{
+		char executable[4096];
+		uint32_t length = sizeof(executable);
+		if (_NSGetExecutablePath(executable, &length) == 0 && hakios_metal_stage_cache_set_process(executable)) {
+			hm_print("stage-prewarm: enabled, replay queued\n");
+			dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+				@autoreleasepool { hakios_metal_stage_cache_prewarm(); }
+			});
+		}
+	}
 	hm_ensure_spi([self class]);
 	hm_functions_encode_from_metadata();
 	self = [super init];
@@ -2352,6 +3437,7 @@ hm_boot_arg_set(const char *what)
 		 [_name UTF8String], (unsigned)port,
 		 hakios_metal_has_compiler() ? "in this build" : "NOT in this build (make ios MESA=1): every pipeline will be refused",
 		 _targetName);
+	hm_gles_gate(port);
 	return self;
 }
 
@@ -2382,6 +3468,9 @@ hm_boot_arg_set(const char *what)
 /* Not measured: nothing has asked the kernel what one allocation may be. It only has to be non-zero for initLimits
  * to accept it; a buffer longer than the kernel gives is refused at -newBufferWithLength:options:, with the reason. */
 - (uint64_t)maxBufferLength { return 256ULL << 20; }
+
+/* Sysmem colour and depth/stencil attachments, with colour resolve on store. */
+- (BOOL)supportsSampleCount:(NSUInteger)count { return count == 1 || count == 2 || count == 4; }
 
 /* profile 0's own maxVertexAmplificationCount is 1 */
 - (BOOL)supportsVertexAmplificationCount:(NSUInteger)count { return count <= 1; }
@@ -2483,9 +3572,8 @@ hm_print_callers(const char *what)
 				 withDestinationPath:[parent stringByAppendingPathComponent:entry] error:NULL];
 		}
 	}
-	/* QuartzCore's of this image (the iPhone X's) has no default.metallib beside it; the one made of its own functions
-	 * file (hakios: merge_metallib.py, the four uber shaders, one variant each -- hm_bitcode_for() picks the variant a
-	 * pipeline needs) stands in for it, from where the image puts it */
+	/* QuartzCore's of this image (the iPhone X's) has no default.metallib beside it: the flash image leaves it out. The
+	 * same IPSW's own (tools/ca-metallib.py copies it, unchanged) is put there, from where the image puts it */
 	NSString *ours = @"/redwood/share/ca-share/QuartzCore-default.metallib";
 	NSString *beside = [frame stringByAppendingPathComponent:@"default.metallib"];
 	if ([path rangeOfString:@"QuartzCore.framework"].location != NSNotFound && ![fm fileExistsAtPath:beside] &&
@@ -2523,6 +3611,9 @@ hm_print_callers(const char *what)
 
 /* true of this SoC: the GPU reads the same DRAM the processor does, and every buffer here is mapped on both sides */
 - (BOOL)hasUnifiedMemory { return YES; }
+
+- (BOOL)supportsTextureSampleCount:(NSUInteger)count { return count == 1 || count == 2 || count == 4; }
+
 
 /* the GPU memory this device has allocated and not given back (hakios-metal counts every buffer it asks the kernel
  * for); Resident Evil 4 sizes what it keeps resident by it */
@@ -2588,6 +3679,44 @@ hm_print_callers(const char *what)
 
 /* --- buffers --- */
 
+#include "hakios-metal/bo_cache.hpp"
+
+/* Resource allocation only: queue-owned command/slab pools keep their own policy.
+ * Cache completed BOs even when Metal's resource wrappers are short-lived. */
+static uint64_t
+hm_bo_begin(unsigned format, unsigned usage, unsigned kind)
+{
+	static int enabled = -1;
+	int on = __atomic_load_n(&enabled, __ATOMIC_RELAXED);
+	if (on < 0) {
+		on = access("/var/db/hakios-metal-cache/bo-cache-off", F_OK) != 0;
+		__atomic_store_n(&enabled, on, __ATOMIC_RELAXED);
+	}
+	return hakios_metal_bo_context(on ? hm_bo_key(format, usage, kind) : 0);
+}
+
+static void
+hm_bo_end(uint64_t previous)
+{
+	hakios_metal_bo_context(previous);
+	if (!hakios_metal_perf_enabled()) return;
+	static uint64_t last;
+	const uint64_t now = hm_perf_clock(CLOCK_MONOTONIC);
+	uint64_t before = __atomic_load_n(&last, __ATOMIC_RELAXED);
+	if (now - before < 2000000000ull ||
+	    !__atomic_compare_exchange_n(&last, &before, now, NO, __ATOMIC_RELAXED, __ATOMIC_RELAXED)) return;
+	if (before == 0) return;
+	uint64_t s[HM_BO_STAT_COUNT];
+	hakios_metal_bo_cache_take(s);
+	hm_print("bo-cache: window %.1f ms allocations %llu hits %llu new %llu fit %llu waste %llu KiB maps %llu unmaps %llu evictions %llu busy %llu "
+		 "memoryless-hits %llu; new %.1f map %.1f unmap %.1f zero %.1f ms; cached %llu KiB memoryless %llu KiB objects %llu\n",
+		 (now - before) / 1e6, s[HM_BO_ALLOCATIONS], s[HM_BO_HITS], s[HM_BO_NEW], s[HM_BO_FIT_HITS],
+		 s[HM_BO_FIT_WASTE_BYTES] >> 10, s[HM_BO_MAPS], s[HM_BO_UNMAPS],
+		 s[HM_BO_EVICTIONS], s[HM_BO_BUSY], s[HM_BO_MEMORYLESS_HITS], s[HM_BO_ALLOC_NS] / 1e6,
+		 s[HM_BO_MAP_NS] / 1e6, s[HM_BO_UNMAP_NS] / 1e6, s[HM_BO_ZERO_NS] / 1e6,
+		 s[HM_BO_CACHED_BYTES] >> 10, s[HM_BO_MEMORYLESS_BYTES] >> 10, s[HM_BO_CACHED_COUNT]);
+}
+
 /* every allocation here is one kind of memory -- shared, write-combined -- and the buffer says so; the options are
  * read for what cannot be given, so that a request for private storage is not silently given something else */
 - (id)newBufferWithLength:(NSUInteger)length options:(MTLResourceOptions)options
@@ -2596,7 +3725,10 @@ hm_print_callers(const char *what)
 		HM_ONCE("a buffer was asked for with private storage; every buffer here is shared memory, and that is what "
 			"is given (the GPU reads the same pages the processor maps)\n");
 	}
-	return [[HakiosMetalBuffer alloc] initWithHakiosDevice:self length:length];
+	uint64_t previous = hm_bo_begin(0, (unsigned)options, HM_BO_BUFFER);
+	id buffer = [[HakiosMetalBuffer alloc] initWithHakiosDevice:self length:length];
+	hm_bo_end(previous);
+	return buffer;
 }
 
 - (id)newBufferWithBytes:(const void *)bytes length:(NSUInteger)length options:(MTLResourceOptions)options
@@ -2612,9 +3744,9 @@ hm_print_callers(const char *what)
 /* The GPU's memory is the kernel's allocation and nothing else: an application's own pages cannot be handed to it as
  * they are. So the bytes are copied into GPU memory as the buffer is made, and the deallocator is kept and called when
  * the buffer goes, as Metal promises. What the copy loses is the sharing: a write by the GPU is not seen in the caller's
- * pages, nor a later write by the caller in the GPU's. QuartzCore's one caller (CA::OGL::MetalContext::
- * copy_image_to_texture) wraps a decoded image to blit it into a texture at once, which loses neither; refusing it had
- * left those textures as whatever memory they were given. */
+ * pages, nor a later write by the caller in the GPU's. QuartzCore's one caller wraps a CPU image to make a linear
+ * texture over it that it treats as the image's memory for good; that texture is refused (see
+ * -newLinearTextureWithDescriptor:...), and QuartzCore then uploads the image itself. */
 - (id)newBufferWithBytesNoCopy:(void *)bytes length:(NSUInteger)length options:(MTLResourceOptions)options
 		   deallocator:(void (^)(void *, NSUInteger))deallocator
 {
@@ -2622,7 +3754,7 @@ hm_print_callers(const char *what)
 
 	HM_ONCE("a no-copy buffer was asked for; its bytes are copied into GPU memory, so neither side sees the other's later "
 		"writes\n");
-	if (buffer != nil && deallocator != nil) {
+	if (buffer != nil) {
 		[buffer hakiosSetDeallocator:deallocator bytes:bytes length:length];
 	}
 	return buffer;
@@ -2699,161 +3831,11 @@ hm_print_callers(const char *what)
 
 /* The nil this device returns, with the sentence that goes with it: an NSError for the caller and a printed line for the
  * log, because a caller that swallows the NSError (QuartzCore does) would otherwise swallow the reason with it. */
-/* The values a pipeline's function was specialised with (-[MTLLibrary newFunctionWithName:constantValues:error:]), as
- * hakios-metal's compiler takes them: each constant the function declares (functionConstantsDictionary: name to
- * MTLFunctionConstant, its index and type) with the value -[_MTLFunctionInternal baseFunctionConstantValues] holds
- * for it (-constantValueWithFunctionConstant:, a pointer to the value's bytes, or NULL when none was given). The bytes
- * go into the 64-bit word as they lie, which is the component-at-i-times-width packing the C interface asks for; a
- * constant the function declares and nobody set is left out, which tells the front end it is not defined. *COUNT
- * the number written, at most MAX. Read off this Metal's own classes by selector (Metal.framework's class dump):
- * nothing of their layout is assumed. */
-static unsigned
-hm_data_type_bytes(MTLDataType t)
-{
-	switch (t) {
-	case MTLDataTypeBool: case MTLDataTypeChar: case MTLDataTypeUChar: return 1;
-	case MTLDataTypeBool2: case MTLDataTypeChar2: case MTLDataTypeUChar2: case MTLDataTypeShort: case MTLDataTypeUShort: case MTLDataTypeHalf: return 2;
-	case MTLDataTypeBool3: case MTLDataTypeChar3: case MTLDataTypeUChar3: return 3;
-	case MTLDataTypeBool4: case MTLDataTypeChar4: case MTLDataTypeUChar4: case MTLDataTypeShort2: case MTLDataTypeUShort2: case MTLDataTypeHalf2:
-	case MTLDataTypeInt: case MTLDataTypeUInt: case MTLDataTypeFloat: return 4;
-	case MTLDataTypeShort3: case MTLDataTypeUShort3: case MTLDataTypeHalf3: return 6;
-	case MTLDataTypeShort4: case MTLDataTypeUShort4: case MTLDataTypeHalf4: case MTLDataTypeInt2: case MTLDataTypeUInt2: case MTLDataTypeFloat2:
-	case MTLDataTypeLong: case MTLDataTypeULong: return 8;
-	default: return 0;   /* wider than the word the front end takes: left out, and the module refuses what it cannot fold */
-	}
-}
-
-/* A specialised function's values as Metal hands them to its compiler: -[_MTLFunctionInternal specializationAirScript],
- * a FlatBuffers buffer with the file identifier "AIRC" (MTLFunctionConstantValuesInternal's newConstantScriptForFunction:
- * makes it). Read off the bytes of CoreAnimation's own functions on the phone, not a published schema: the root's
- * third field a table whose first field is the function's name and whose third a vector of tables, one per constant,
- * each with the constant's index (u16, field 0, absent for 0), its MTLDataType (a byte, field 1) and, at the forward
- * offset in field 2, the value's bytes. fixed_frag_lph_cph's 58 entries read as plausible values throughout -- every
- * bool 0 or 1, fc_attachment_count 2 where the pass has two targets, fc_framebuffer_fetch 1 where it reads one -- and
- * that is the whole of the evidence. Every offset is checked against the size; a buffer that does not hold together
- * gives no constants, and says so. */
-static unsigned hm_function_constants_declared(id function, hakios_metal_constant *out, unsigned max);
 static void hm_note_constants(const void *program, NSString *constants);
 static BOOL hm_tracing(void);
 
-static unsigned
-hm_script_constants(const uint8_t *b, size_t size, hakios_metal_constant *out, unsigned max)
-{
-#define HM_FITS(o, n) ((uint64_t)(o) + (n) <= size)
-	uint32_t root, sub, vec, n, count = 0;
-
-	if (size < 8 || memcmp(b + 4, "AIRC", 4) != 0) {
-		return 0;
-	}
-	/* field K of the table at T: its absolute position, or 0 when absent */
-	uint64_t (^field)(uint64_t, unsigned) = ^uint64_t(uint64_t t, unsigned k) {
-		int32_t so;
-		uint64_t vt;
-		uint16_t vlen, off;
-
-		if (!HM_FITS(t, 4)) return 0;
-		memcpy(&so, b + t, 4);
-		vt = t - (int64_t)so;
-		if (!HM_FITS(vt, 4)) return 0;
-		memcpy(&vlen, b + vt, 2);
-		if (4 + 2 * k + 2 > vlen || !HM_FITS(vt + 4 + 2 * k, 2)) return 0;
-		memcpy(&off, b + vt + 4 + 2 * k, 2);
-		return off != 0 ? t + off : 0;
-	};
-	/* the forward offset stored at position P, followed */
-	uint64_t (^follow)(uint64_t) = ^uint64_t(uint64_t p) {
-		uint32_t o;
-
-		if (p == 0 || !HM_FITS(p, 4)) return 0;
-		memcpy(&o, b + p, 4);
-		return HM_FITS(p + o, 1) ? p + o : 0;
-	};
-	memcpy(&root, b, 4);
-	sub = (uint32_t)follow(field(root, 2));
-	vec = sub != 0 ? (uint32_t)follow(field(sub, 2)) : 0;
-	if (vec == 0 || !HM_FITS(vec, 4)) {
-		HM_ONCE("a specialization script that does not hold together (%zu bytes): its function is compiled with no constants\n", size);
-		return 0;
-	}
-	memcpy(&n, b + vec, 4);
-	for (uint32_t e = 0; e < n && count < max && HM_FITS(vec + 4 + 4 * e, 4); e++) {
-		uint64_t et = follow(vec + 4 + 4 * e), fi, ft, fv;
-		uint16_t index = 0;
-		unsigned bytes;
-
-		if (et == 0) break;
-		fi = field(et, 0);
-		ft = field(et, 1);
-		fv = follow(field(et, 2));
-		if (ft == 0 || fv == 0) continue;
-		if (fi != 0 && HM_FITS(fi, 2)) memcpy(&index, b + fi, 2);
-		bytes = hm_data_type_bytes((MTLDataType)b[ft]);
-		if (bytes == 0 || !HM_FITS(fv, bytes)) continue;
-		out[count].index = index;
-		out[count].bits = 0;
-		memcpy(&out[count].bits, b + fv, bytes);
-		count++;
-	}
-	return count;
-#undef HM_FITS
-}
-
-static unsigned
-hm_function_constants(id function, hakios_metal_constant *out, unsigned max)
-{
-	SEL scriptSel = sel_getUid("specializationAirScript");
-
-	if (function != nil && [function respondsToSelector:scriptSel]) {
-		dispatch_data_t script = ((dispatch_data_t(*)(id, SEL))objc_msgSend)(function, scriptSel);
-
-		if (script != nil) {
-			const void *bytes = NULL;
-			size_t size = 0;
-			dispatch_data_t map = dispatch_data_create_map(script, &bytes, &size);
-			unsigned n = hm_script_constants(bytes, size, out, max);
-
-			dispatch_release(map);
-			HM_ONCE("function constants: %s was specialised by a script of %zu bytes giving %u values (the first such function)\n",
-				[[function name] UTF8String], size, n);
-			return n;
-		}
-	}
-	return hm_function_constants_declared(function, out, max);
-}
-
-static unsigned
-hm_function_constants_declared(id function, hakios_metal_constant *out, unsigned max)
-{
-	SEL baseSel = sel_getUid("baseFunctionConstantValues"), valueSel = sel_getUid("constantValueWithFunctionConstant:");
-	NSDictionary *declared;
-	id values;
-	unsigned n = 0;
-
-	if (function == nil || ![function respondsToSelector:@selector(functionConstantsDictionary)] || ![function respondsToSelector:baseSel]) {
-		return 0;
-	}
-	declared = [function functionConstantsDictionary];
-	values = ((id(*)(id, SEL))objc_msgSend)(function, baseSel);
-	if ([declared count] == 0 || values == nil || ![values respondsToSelector:valueSel]) {
-		return 0;
-	}
-	for (NSString *name in declared) {
-		MTLFunctionConstant *c = [declared objectForKey:name];
-		const void *v = ((const void *(*)(id, SEL, id))objc_msgSend)(values, valueSel, c);
-		unsigned bytes = hm_data_type_bytes([c type]);
-
-		if (v == NULL || bytes == 0 || n >= max) {
-			continue;
-		}
-		out[n].index = (unsigned)[c index];
-		out[n].bits = 0;
-		memcpy(&out[n].bits, v, bytes);
-		n++;
-	}
-	HM_ONCE("function constants: %s declares %lu and was given %u of them (the first function seen with constants)\n",
-		[[function name] UTF8String], (unsigned long)[declared count], n);
-	return n;
-}
+/* A function's specialization values, and the exact CA path that compiles from them (shared with the host test). */
+#include "HakiosMetalCAExact.h"
 
 - (id)hakiosRefuse:(NSError **)error what:(const char *)what why:(NSString *)why
 {
@@ -2866,6 +3848,7 @@ hm_function_constants_declared(id function, hakios_metal_constant *out, unsigned
 
 - (id)hakiosPipelineForFunction:(id)function descriptor:(id)descriptor error:(NSError **)error
 {
+	hm_perf_mark pipelineBegan = hm_perf_begin();
 	SEL bitcode = sel_getUid("bitcodeData");
 	NSData *air;
 	hakios_metal_kernel *kernel;
@@ -2903,7 +3886,12 @@ hm_function_constants_declared(id function, hakios_metal_constant *out, unsigned
 	hm_print("compiled %s: %u resources, %u threads a threadgroup at most, execution width %u, %u bytes of threadgroup memory\n",
 		 hakios_metal_kernel_name(kernel), hakios_metal_kernel_resource_count(kernel), hakios_metal_kernel_max_threads(kernel),
 		 hakios_metal_kernel_execution_width(kernel), hakios_metal_kernel_threadgroup_memory(kernel));
-	return [[HakiosMetalComputePipelineState alloc] initWithHakiosDevice:self kernel:kernel descriptor:descriptor];
+	id state = [[HakiosMetalComputePipelineState alloc] initWithHakiosDevice:self kernel:kernel descriptor:descriptor];
+	hm_perf_end(HM_PERF_COMPUTE_PIPELINE, pipelineBegan, 0);
+	if (pipelineBegan.wall && hm_perf_clock(CLOCK_MONOTONIC) - pipelineBegan.wall >= 50000000ull)
+		hm_print("slow-pipeline: compute %s %.1f ms at %.0f us\n", [[function name] UTF8String],
+		         (hm_perf_clock(CLOCK_MONOTONIC) - pipelineBegan.wall) / 1e6, hm_now() * 1e6);
+	return state;
 }
 
 /* The base class demands a descriptor; Apple's own -newComputePipelineStateWithFunction: builds a
@@ -2935,26 +3923,30 @@ hm_function_constants_declared(id function, hakios_metal_constant *out, unsigned
 
 - (void)newComputePipelineStateWithFunction:(id)function completionHandler:(MTLNewComputePipelineStateCompletionHandler)handler
 {
-	NSError *error = nil;
-	id state = [self newComputePipelineStateWithFunction:function error:&error];
+	hm_creation_async(^{
+		NSError *error = nil;
+		id state = [self newComputePipelineStateWithFunction:function error:&error];
 
-	if (handler != NULL) {
-		handler(state, error);
-	}
-	[state release];
+		if (handler != NULL) {
+			handler(state, error);
+		}
+		[state release];
+	});
 }
 
 - (void)newComputePipelineStateWithFunction:(id)function options:(MTLPipelineOption)options
 			  completionHandler:(MTLNewComputePipelineStateWithReflectionCompletionHandler)handler
 {
-	NSError *error = nil;
-	MTLComputePipelineReflection *reflection = nil;
-	id state = [self newComputePipelineStateWithFunction:function options:options reflection:&reflection error:&error];
+	hm_creation_async(^{
+		NSError *error = nil;
+		MTLComputePipelineReflection *reflection = nil;
+		id state = [self newComputePipelineStateWithFunction:function options:options reflection:&reflection error:&error];
 
-	if (handler != NULL) {
-		handler(state, reflection, error);
-	}
-	[state release];
+		if (handler != NULL) {
+			handler(state, reflection, error);
+		}
+		[state release];
+	});
 }
 
 - (id)newComputePipelineStateWithDescriptor:(MTLComputePipelineDescriptor *)descriptor options:(MTLPipelineOption)options
@@ -2975,14 +3967,31 @@ hm_function_constants_declared(id function, hakios_metal_constant *out, unsigned
 - (void)newComputePipelineStateWithDescriptor:(MTLComputePipelineDescriptor *)descriptor options:(MTLPipelineOption)options
 			    completionHandler:(MTLNewComputePipelineStateWithReflectionCompletionHandler)handler
 {
-	NSError *error = nil;
-	MTLComputePipelineReflection *reflection = nil;
-	id state = [self newComputePipelineStateWithDescriptor:descriptor options:options reflection:&reflection error:&error];
+	descriptor = [descriptor copy];
+	hm_creation_async(^{
+		NSError *error = nil;
+		MTLComputePipelineReflection *reflection = nil;
+		id state = [self newComputePipelineStateWithDescriptor:descriptor options:options reflection:&reflection error:&error];
 
-	if (handler != NULL) {
-		handler(state, reflection, error);
-	}
-	[state release];
+		if (handler != NULL) {
+			handler(state, reflection, error);
+		}
+		[state release];
+	});
+	[descriptor release];
+}
+
+- (void)newComputePipelineStateWithDescriptor:(MTLComputePipelineDescriptor *)descriptor
+                           completionHandler:(MTLNewComputePipelineStateCompletionHandler)handler
+{
+	descriptor = [descriptor copy];
+	hm_creation_async(^{
+		NSError *error = nil;
+		id state = [self newComputePipelineStateWithDescriptor:descriptor error:&error];
+		if (handler != NULL) handler(state, error);
+		[state release];
+	});
+	[descriptor release];
 }
 
 /* --- render pipeline states: a vertex and a fragment function linked for one colour attachment --- */
@@ -3035,6 +4044,133 @@ hm_set_vertex_descriptor(hakios_metal_program *program, MTLVertexDescriptor *vd)
 	return YES;
 }
 
+/* The per-sample fetch is the default: a fragment that reads [[color(0)]] on a pipeline of more than one sample gets
+ * txf_ms of the attachment with the pipeline's rasterSampleCount (compiler.cpp: lowerFbRead), which is what Metal's
+ * framebuffer fetch means there -- and without it Maps' GlowAlpha and PatternedRibbon were refused outright (a 1-sample
+ * txf of a 4-sample attachment, whose samples are interleaved in its memory). The file turns it back off for a bisect;
+ * the descriptor read itself still needs a device pixel check. */
+static BOOL
+hm_msaa_fbfetch(void)
+{
+	static int on = -1;
+	if (on < 0) on = access(HM_CACHE_DIR "/msaa-fbfetch-off", F_OK) != 0;
+	return on != 0;
+}
+
+static BOOL
+hm_maps_trace(void)
+{
+	static int on = -1;
+	if (on < 0) on = access(HM_CACHE_DIR "/maps-trace", F_OK) == 0;
+	return on != 0;
+}
+
+/* The draws the encoder refuses, deduplicated: one line the first time a (program, reason) is refused, and again only
+ * when another reason of that program follows. Keyed by the program's function name and the WHOLE reason, both hashed:
+ * the program's address is not stable (a freed program's address can come back with another), and a reason cut at a
+ * fixed length merged two that only differed past it (its shape, not its numbers, is what a line says). The counter of
+ * the period is reported as one aggregate, hm_refusal_report below, never a line a draw: Maps refused 1,961 draws of
+ * two shaders in one run, 6.5 lines a second. */
+#define HM_REFUSAL_KINDS 16
+/* FNV-1a: the key has to survive an address being reused, so it is the text's hash, not a pointer. */
+static uint64_t
+hm_hash64(const char *text)
+{
+	uint64_t hash = 1469598103934665603ull;
+
+	for (; text != NULL && *text != 0; text++) hash = (hash ^ (unsigned char)*text) * 1099511628211ull;
+	return hash;
+}
+
+static struct {
+	pthread_mutex_t lock;
+	struct {
+		BOOL used;
+		uint64_t program;   /* its function name's hash: stable across a freed program's address being reused */
+		uint64_t why;       /* the whole reason's hash */
+		char name[80];
+		unsigned count;     /* this period's */
+	} kinds[HM_REFUSAL_KINDS];
+	unsigned dropped;       /* past the table: counted in the aggregate, not named */
+} hm_refusals = { .lock = PTHREAD_MUTEX_INITIALIZER };
+
+/* YES: this (program, reason) is new to the table, so the caller says its line now. */
+static BOOL
+hm_refusal_first(hakios_metal_program *program, const char *why)
+{
+	const char *name = program != NULL ? hakios_metal_program_name(program) : NULL;
+	const uint64_t programKey = hm_hash64(name != NULL ? name : "?");
+	const uint64_t whyKey = hm_hash64(why);
+	BOOL first = NO;
+	int freeSlot = -1;
+
+	pthread_mutex_lock(&hm_refusals.lock);
+	for (int i = 0; i < HM_REFUSAL_KINDS; i++) {
+		if (!hm_refusals.kinds[i].used) {
+			if (freeSlot < 0) freeSlot = i;
+			continue;
+		}
+		if (hm_refusals.kinds[i].program != programKey || hm_refusals.kinds[i].why != whyKey) continue;
+		hm_refusals.kinds[i].count++;
+		pthread_mutex_unlock(&hm_refusals.lock);
+		return NO;
+	}
+	if (freeSlot >= 0) {
+		hm_refusals.kinds[freeSlot].used = YES;
+		hm_refusals.kinds[freeSlot].program = programKey;
+		hm_refusals.kinds[freeSlot].why = whyKey;
+		strlcpy(hm_refusals.kinds[freeSlot].name, name != NULL ? name : "?", sizeof hm_refusals.kinds[freeSlot].name);
+		hm_refusals.kinds[freeSlot].count = 1;
+		first = YES;
+	} else {
+		hm_refusals.dropped++;
+	}
+	pthread_mutex_unlock(&hm_refusals.lock);
+	return first;
+}
+
+/* The period's refusals in one line (hm_fps_note's two-second report), the counters restarted; the keys stay, so the
+ * first lines are not said again when the same reason comes back. */
+static void
+hm_refusal_report(void)
+{
+	char by[256] = "";
+	size_t at = 0;
+	unsigned total, kinds = 0;
+
+	pthread_mutex_lock(&hm_refusals.lock);
+	total = hm_refusals.dropped;   /* (under the same lock as hm_refusal_first's increment: no count lost or raced) */
+	hm_refusals.dropped = 0;
+	for (int i = 0; i < HM_REFUSAL_KINDS; i++) {
+		if (!hm_refusals.kinds[i].used || hm_refusals.kinds[i].count == 0) continue;
+		kinds++;
+		total += hm_refusals.kinds[i].count;
+		if (at < sizeof by - 1) {
+			const int wrote = snprintf(by + at, sizeof by - at, "%s%s:%u", at != 0 ? " " : "", hm_refusals.kinds[i].name,
+						   hm_refusals.kinds[i].count);
+
+			if (wrote > 0) at += MIN((size_t)wrote, sizeof by - 1 - at);
+		}
+		hm_refusals.kinds[i].count = 0;
+	}
+	pthread_mutex_unlock(&hm_refusals.lock);
+	if (total != 0) hm_print("refused: total %u kinds %u [%s]\n", total, kinds, by);
+}
+
+/* Preserve NSError on every call, but print a particular compiler failure once.
+ * The core remembers the failed specialization for this process too. */
+static BOOL
+hm_first_compile_failure(NSString *why)
+{
+	static NSMutableSet *seen;
+	@synchronized ([HakiosMetalDevice class]) {
+		if (seen == nil) seen = [[NSMutableSet alloc] init];
+		if ([seen containsObject:why]) return NO;
+		[seen addObject:why];
+		return YES;
+	}
+}
+
 /*
  * Why a render pipeline descriptor cannot be served, or nil. Everything the base initialiser does not read is read here,
  * by name, BEFORE any compilation and before super is given the descriptor: the step-one contract (hakios_metal.h) is one
@@ -3071,14 +4207,15 @@ hm_set_vertex_descriptor(hakios_metal_program *program, MTLVertexDescriptor *vd)
 	/* blending and the write mask are hakios-metal's (hakios_metal_program_set_blend after the compile), dual-source
 	 * factors included: the draw takes a stage's [[color(0), index(1)]] as the second source */
 	if ([d depthAttachmentPixelFormat] != MTLPixelFormatInvalid && [d depthAttachmentPixelFormat] != MTLPixelFormatDepth32Float &&
+	    [d depthAttachmentPixelFormat] != MTLPixelFormatDepth16Unorm &&
 	    [d depthAttachmentPixelFormat] != MTLPixelFormatDepth32Float_Stencil8) {
-		return [NSString stringWithFormat:@"a depth attachment pixel format of %lu; Depth32Float (252) and Depth32Float_Stencil8 "
+		return [NSString stringWithFormat:@"a depth attachment pixel format of %lu; Depth16Unorm (250), Depth32Float (252) and Depth32Float_Stencil8 "
 						  "(260) are the depth formats served", (unsigned long)[d depthAttachmentPixelFormat]];
 	}
-	/* the stencil is the S8 plane of a Depth32Float_Stencil8 texture, so a stencil format is that one, alone or with the
-	 * same depth format beside it */
-	if ([d stencilAttachmentPixelFormat] != MTLPixelFormatInvalid && [d stencilAttachmentPixelFormat] != MTLPixelFormatDepth32Float_Stencil8) {
-		return [NSString stringWithFormat:@"a stencil attachment pixel format of %lu; Depth32Float_Stencil8 (260) is the stencil "
+	/* A6xx uses a separate S8 plane, either standalone or following D32. */
+	if ([d stencilAttachmentPixelFormat] != MTLPixelFormatInvalid && [d stencilAttachmentPixelFormat] != MTLPixelFormatStencil8 &&
+	    [d stencilAttachmentPixelFormat] != MTLPixelFormatDepth32Float_Stencil8) {
+		return [NSString stringWithFormat:@"a stencil attachment pixel format of %lu; Stencil8 (253) and Depth32Float_Stencil8 (260) are the stencil "
 						  "format served", (unsigned long)[d stencilAttachmentPixelFormat]];
 	}
 	if ([d rasterSampleCount] != 1 && [d rasterSampleCount] != 2 && [d rasterSampleCount] != 4) {
@@ -3113,6 +4250,28 @@ hm_set_vertex_descriptor(hakios_metal_program *program, MTLVertexDescriptor *vd)
 	if ([[d binaryArchives] count] != 0) {
 		HM_ONCE("a render pipeline descriptor carries %lu binary archives; none is consulted, the AIR is compiled here\n",
 			(unsigned long)[[d binaryArchives] count]);
+	}
+	/* OpenGL ES's fixed-function leftovers, which Metal's descriptor keeps for Apple's GPU (AppleMetalGLRenderer sets
+	 * them from GL state): each said once and not served -- the pipeline is made, and draws without it */
+	{
+		static const char *const gl[] = { "isAlphaTestEnabled", "isLogicOperationEnabled", "isPointSmoothEnabled" };
+
+		for (size_t i = 0; i < sizeof(gl) / sizeof(gl[0]); i++) {
+			SEL sel = sel_getUid(gl[i]);
+
+			if ([d respondsToSelector:sel] && ((BOOL (*)(id, SEL))objc_msgSend)(d, sel)) {
+				static BOOL said[3];
+
+				if (!said[i]) {
+					said[i] = YES;
+					hm_print("gles: a render pipeline asks for %s; not served (GL ES 1's state): drawn without it\n", gl[i]);
+				}
+			}
+		}
+		if ([d respondsToSelector:sel_getUid("clipDistanceEnableMask")] &&
+		    ((NSUInteger (*)(id, SEL))objc_msgSend)(d, sel_getUid("clipDistanceEnableMask")) != 0) {
+			HM_ONCE("gles: a render pipeline enables user clip distances; not served: drawn unclipped\n");
+		}
 	}
 	return nil;
 }
@@ -3159,6 +4318,19 @@ hm_describe_function(id f)
 	}
 }
 
+/* A CoreAnimation pipeline (com.apple.coreanimation.draw.<spec>) whose fragment variant the pipeline library has not
+ * got: CoreAnimation made it at run time, and its functions are compiled from their own AIR (hm_ca_exact_why_not). */
+static BOOL hm_ca_missing(NSString *pipeline)
+{
+    if (![pipeline hasPrefix:@"com.apple.coreanimation.draw."]) return NO;
+    hm_ca_load();
+    NSString *spec = [pipeline substringFromIndex:[@"com.apple.coreanimation.draw." length]];
+    NSRange under = [spec rangeOfString:@"_"];
+    if (under.location == NSNotFound) return NO;
+    NSString *frag = [@"com.apple.coreanimation.frag." stringByAppendingString:[spec substringFromIndex:NSMaxRange(under)]];
+    return hm_ca_variants[frag] == nil;
+}
+
 /*
  * The one entry point every form below ends in. The order is: the descriptor's own rules (above), then the compiler
  * (hakios_metal_program_new_bitcode: AIR to NIR to ir3 for both stages, the link, the format against the fragment
@@ -3167,6 +4339,7 @@ hm_describe_function(id f)
  */
 - (id)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)descriptor error:(NSError **)error
 {
+	hm_perf_mark pipelineBegan = hm_perf_begin();
 	SEL bitcode = sel_getUid("bitcodeData");
 	NSString *why = [self hakiosRenderPipelineWhy:descriptor];
 	id vs, fs;
@@ -3187,8 +4360,9 @@ hm_describe_function(id f)
 		return [self hakiosRefuse:error what:"a render pipeline"
 				      why:@"a function does not answer bitcodeData, so its AIR cannot be read (not an _MTLFunction of this Metal?)"];
 	}
-	vsAir = hm_bitcode_for(vs, [descriptor label], YES);
-	fsAir = fs != nil ? hm_bitcode_for(fs, [descriptor label], NO) : nil;   /* nil: the built-in fragment function */
+    BOOL missingCA = hm_ca_missing([descriptor label]);
+    vsAir = missingCA ? ((id(*)(id,SEL))objc_msgSend)(vs, bitcode) : hm_bitcode_for(vs, [descriptor label], YES);
+    fsAir = fs != nil ? (missingCA ? ((id(*)(id,SEL))objc_msgSend)(fs, bitcode) : hm_bitcode_for(fs, [descriptor label], NO)) : nil;   /* nil: the built-in fragment function */
 	if (vsAir == nil || [vsAir length] == 0 || (fs != nil && (fsAir == nil || [fsAir length] == 0))) {
 		return [self hakiosRefuse:error what:"a render pipeline"
 				      why:[NSString stringWithFormat:@"%@ or %@ has no bitcode", [vs name], [fs name]]];
@@ -3198,12 +4372,51 @@ hm_describe_function(id f)
 		hakios_metal_constant vsConstants[64], fsConstants[64];
 		unsigned vsCount = hm_function_constants(vs, vsConstants, 64), fsCount = hm_function_constants(fs, fsConstants, 64);
 
-		program = hakios_metal_program_new_bitcode_constants([vsAir bytes], [vsAir length], vsConstants, vsCount, fsAir != nil ? [fsAir bytes] : NULL,
+        if (missingCA) {
+            /* CoreAnimation's own functions (iOS 16.5's QuartzCore default.metallib) with the named values it set, as Metal
+             * recorded them: the exact program. Anything else is said, with the reason, before a stand-in is used. */
+            NSString *spec = [[descriptor label] substringFromIndex:[@"com.apple.coreanimation.draw." length]];
+            NSString *whyNot = hm_ca_exact_why_not(vs, vsAir, vsConstants, vsCount);
+
+            if (whyNot == nil) whyNot = hm_ca_exact_why_not(fs, fsAir, fsConstants, fsCount);
+            if (whyNot == nil) {
+                hm_print("CoreAnimation exact configuration: %s: %s (%u constants) + %s (%u constants), iOS 16.5 AIR\n", [spec UTF8String],
+                         [[vs name] UTF8String], vsCount, fs != nil ? [[fs name] UTF8String] : "(built-in)", fsCount);
+            } else {
+                NSString *frag = [@"com.apple.coreanimation.frag." stringByAppendingString:[spec substringFromIndex:[spec rangeOfString:@"_"].location + 1]];
+                NSString *chosen = hm_ca_nearest(frag);
+                NSData *v = chosen ? hm_ca_variants[hm_ca_frag_vert[chosen]] : nil, *f = chosen ? hm_ca_variants[chosen] : nil;
+
+                hm_print("exact CA configuration impossible for %s: %s; emergency paired fallback: %s\n", [spec UTF8String], [whyNot UTF8String],
+                         v && f ? [chosen UTF8String] : "none, its own module with the values it has");
+                if (v && f) { vsAir = v; fsAir = f; }
+            }
+        }
+        program = hakios_metal_program_new_bitcode_samples([vsAir bytes], [vsAir length], vsConstants, vsCount, fsAir != nil ? [fsAir bytes] : NULL,
 								     fsAir != nil ? [fsAir length] : 0,
-								     fsConstants, fsCount, format);
+								     fsConstants, fsCount, format,
+								     hm_msaa_fbfetch() ? (unsigned)[descriptor rasterSampleCount] : 1);
+		if (program != NULL && [descriptor rasterSampleCount] > 1 && hakios_metal_program_framebuffer_fetch(program)) {
+			static unsigned said;
+			if (__atomic_fetch_add(&said, 1, __ATOMIC_RELAXED) < 16) {
+				hm_print("msaa-fetch: %s, %lu samples: %s\n", hakios_metal_program_name(program),
+					 (unsigned long)[descriptor rasterSampleCount], hm_msaa_fbfetch() ? "current-sample texture read, per-sample shading (msaa-fbfetch-off turns it off)"
+					 : "legacy single-sample read; /var/db/hakios-metal-cache/msaa-fbfetch-off is present");
+			}
+		}
 		if (program != NULL) {
 			hm_dump_function("vs", vs, "metal_dump=fn", vsConstants, vsCount);
 			if (fs != nil) hm_dump_function("fs", fs, "metal_dump=fn", fsConstants, fsCount);
+		}
+		if (program != NULL && hm_gles_bitcode(vs) != nil) {
+			static unsigned glPipelines;
+			const unsigned k = __atomic_fetch_add(&glPipelines, 1, __ATOMIC_RELAXED);
+
+			if (k < 16 || (k & (k - 1)) == 0) {
+				hm_print("gles: pipeline %u compiled: %s; colour format %u, depth format %lu, %lu samples\n", k,
+					 hakios_metal_program_name(program), format, (unsigned long)[descriptor depthAttachmentPixelFormat],
+					 (unsigned long)[descriptor rasterSampleCount]);
+			}
 		}
 		if (program == NULL) {
 			/* the core's sentence, passed through: the stage and the construct it refused, or the format by name -- and the
@@ -3213,11 +4426,18 @@ hm_describe_function(id f)
 			for (unsigned i = 0; i < fsCount; i++) {
 				if (fsConstants[i].bits != 0) [fc appendFormat:@" %u=%llu", fsConstants[i].index, (unsigned long long)fsConstants[i].bits];
 			}
+			NSString *failure = [NSString stringWithFormat:@"%@ + %@ for pixel format %u (fragment constants not 0:%@): %s", [vs name], [fs name],
+							       format, fc, hakios_metal_error()];
+			if (!hm_first_compile_failure(failure)) {
+				if (error != NULL) *error = [NSError errorWithDomain:@"HakiosMetal" code:1 userInfo:@{ NSLocalizedDescriptionKey: failure }];
+				return nil;
+			}
 			hm_dump_refused("vs", vs);
 			hm_dump_refused("fs", fs);
+			hm_gles_dump_refused("vertex", vs);
+			hm_gles_dump_refused("fragment", fs);
 			return [self hakiosRefuse:error what:"a render pipeline"
-					      why:[NSString stringWithFormat:@"%@ + %@ for pixel format %u (fragment constants not 0:%@): %s", [vs name], [fs name],
-							       format, fc, hakios_metal_error()]];
+					      why:failure];
 		}
 	}
 	hakios_metal_program_set_samples(program, (unsigned)[descriptor rasterSampleCount]);   /* 1, 2 or 4: judged above */
@@ -3301,7 +4521,11 @@ hm_describe_function(id f)
 		hakios_metal_constant fc[64];
 		unsigned count = fs != nil ? hm_function_constants(fs, fc, 64) : 0;
 
-		if (state != nil && fsAir != nil) [state hakiosKeepFragment:fsAir constants:fc count:count];
+		if (state != nil && fsAir != nil && !missingCA) [state hakiosKeepFragment:fsAir constants:fc count:count];
+		hm_perf_end(HM_PERF_RENDER_PIPELINE, pipelineBegan, 0);
+		if (pipelineBegan.wall && hm_perf_clock(CLOCK_MONOTONIC) - pipelineBegan.wall >= 50000000ull)
+			hm_print("slow-pipeline: render %s %.1f ms at %.0f us\n", [[descriptor label] UTF8String],
+			         (hm_perf_clock(CLOCK_MONOTONIC) - pipelineBegan.wall) / 1e6, hm_now() * 1e6);
 		return state;
 	}
 }
@@ -3317,38 +4541,44 @@ hm_describe_function(id f)
 	return [self newRenderPipelineStateWithDescriptor:descriptor error:error];
 }
 
-/* The handler forms are answered synchronously, inside the call: Metal promises only that the handler runs, not when,
- * and the earlier plug-in measured the alternative -- a form left to the base class sends to a nil compiler, returns,
- * and the handler never runs; a client building its pipelines asynchronously then waits for ever, the one failure no
- * log shows. The state is released after the handler, which has retained it if it wants it. */
+/* Handler forms enqueue the build and callback off the caller's thread. Each
+ * descriptor is snapshotted; the returned +1 state is released after the handler. */
 - (void)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)descriptor
 			   completionHandler:(MTLNewRenderPipelineStateCompletionHandler)handler
 {
-	NSError *error = nil;
-	id state = [self newRenderPipelineStateWithDescriptor:descriptor error:&error];
+	descriptor = [descriptor copy];
+	hm_creation_async(^{
+		NSError *error = nil;
+		id state = [self newRenderPipelineStateWithDescriptor:descriptor error:&error];
 
-	if (handler != NULL) {
-		handler(state, error);
-	}
-	[state release];
+		if (handler != NULL) {
+			handler(state, error);
+		}
+		[state release];
+	});
+	[descriptor release];
 }
 
 - (void)newRenderPipelineStateWithDescriptor:(MTLRenderPipelineDescriptor *)descriptor options:(MTLPipelineOption)options
 			   completionHandler:(MTLNewRenderPipelineStateWithReflectionCompletionHandler)handler
 {
-	NSError *error = nil;
-	id state = [self newRenderPipelineStateWithDescriptor:descriptor options:options reflection:NULL error:&error];
+	descriptor = [descriptor copy];
+	hm_creation_async(^{
+		NSError *error = nil;
+		id state = [self newRenderPipelineStateWithDescriptor:descriptor options:options reflection:NULL error:&error];
 
-	if (handler != NULL) {
-		handler(state, nil, error);
-	}
-	[state release];
+		if (handler != NULL) {
+			handler(state, nil, error);
+		}
+		[state release];
+	});
+	[descriptor release];
 }
 
 /* The mesh and tile forms are _MTLDevice's own, and the mesh ones RE-ENTER the plain forms above on self with a render
  * descriptor derived from the mesh descriptor (the earlier plug-in read those four entry points): inherited, they would
  * hand a mesh pipeline to the vertex-plus-fragment builder and get something compiled rather than a refusal. Overridden
- * to refuse by name, every form, handlers called at once with the error. */
+ * to refuse by name, every form, handlers enqueued with the error. */
 - (id)newRenderPipelineStateWithMeshDescriptor:(MTLMeshRenderPipelineDescriptor *)descriptor options:(MTLPipelineOption)options
 				    reflection:(MTLAutoreleasedRenderPipelineReflection *)reflection error:(NSError **)error
 {
@@ -3367,23 +4597,33 @@ hm_describe_function(id f)
 - (void)newRenderPipelineStateWithMeshDescriptor:(MTLMeshRenderPipelineDescriptor *)descriptor options:(MTLPipelineOption)options
 			       completionHandler:(MTLNewRenderPipelineStateWithReflectionCompletionHandler)handler
 {
-	NSError *error = nil;
-	id state = [self newRenderPipelineStateWithMeshDescriptor:descriptor options:options reflection:NULL error:&error];
+	descriptor = [descriptor copy];
+	hm_creation_async(^{
+		NSError *error = nil;
+		id state = [self newRenderPipelineStateWithMeshDescriptor:descriptor options:options reflection:NULL error:&error];
 
-	if (handler != NULL) {
-		handler(state, nil, error);
-	}
+		if (handler != NULL) {
+			handler(state, nil, error);
+		}
+		[state release];
+	});
+	[descriptor release];
 }
 
 - (void)newRenderPipelineStateWithMeshDescriptor:(MTLMeshRenderPipelineDescriptor *)descriptor
 			       completionHandler:(MTLNewRenderPipelineStateCompletionHandler)handler
 {
-	NSError *error = nil;
-	id state = [self newRenderPipelineStateWithMeshDescriptor:descriptor options:0 reflection:NULL error:&error];
+	descriptor = [descriptor copy];
+	hm_creation_async(^{
+		NSError *error = nil;
+		id state = [self newRenderPipelineStateWithMeshDescriptor:descriptor options:0 reflection:NULL error:&error];
 
-	if (handler != NULL) {
-		handler(state, error);
-	}
+		if (handler != NULL) {
+			handler(state, error);
+		}
+		[state release];
+	});
+	[descriptor release];
 }
 
 - (id)newRenderPipelineStateWithTileDescriptor:(MTLTileRenderPipelineDescriptor *)descriptor options:(MTLPipelineOption)options
@@ -3405,23 +4645,33 @@ hm_describe_function(id f)
 - (void)newRenderPipelineStateWithTileDescriptor:(MTLTileRenderPipelineDescriptor *)descriptor options:(MTLPipelineOption)options
 			       completionHandler:(MTLNewRenderPipelineStateWithReflectionCompletionHandler)handler
 {
-	NSError *error = nil;
-	id state = [self newRenderPipelineStateWithTileDescriptor:descriptor options:options reflection:NULL error:&error];
+	descriptor = [descriptor copy];
+	hm_creation_async(^{
+		NSError *error = nil;
+		id state = [self newRenderPipelineStateWithTileDescriptor:descriptor options:options reflection:NULL error:&error];
 
-	if (handler != NULL) {
-		handler(state, nil, error);
-	}
+		if (handler != NULL) {
+			handler(state, nil, error);
+		}
+		[state release];
+	});
+	[descriptor release];
 }
 
 - (void)newRenderPipelineStateWithTileDescriptor:(MTLTileRenderPipelineDescriptor *)descriptor
 			       completionHandler:(MTLNewRenderPipelineStateCompletionHandler)handler
 {
-	NSError *error = nil;
-	id state = [self newRenderPipelineStateWithTileDescriptor:descriptor options:0 reflection:NULL error:&error];
+	descriptor = [descriptor copy];
+	hm_creation_async(^{
+		NSError *error = nil;
+		id state = [self newRenderPipelineStateWithTileDescriptor:descriptor options:0 reflection:NULL error:&error];
 
-	if (handler != NULL) {
-		handler(state, error);
-	}
+		if (handler != NULL) {
+			handler(state, error);
+		}
+		[state release];
+	});
+	[descriptor release];
 }
 
 /* Metal source needs Metal's own compiler service, which this device has not got; what it compiles is AIR out of a
@@ -3448,12 +4698,32 @@ hm_describe_function(id f)
 - (void)newLibraryWithSource:(NSString *)source options:(MTLCompileOptions *)options
 	   completionHandler:(MTLNewLibraryCompletionHandler)handler
 {
-	NSError *error = nil;
-	id library = [self newLibraryWithSource:source options:options error:&error];
+	source = [source copy];
+	options = [options copy];
+	hm_creation_async(^{
+		NSError *error = nil;
+		id library = [self newLibraryWithSource:source options:options error:&error];
 
-	if (handler != NULL) {
-		handler(library, error);
-	}
+		if (handler != NULL) {
+			handler(library, error);
+		}
+		[library release];
+	});
+	[source release];
+	[options release];
+}
+
+- (void)newLibraryWithStitchedDescriptor:(MTLStitchedLibraryDescriptor *)descriptor
+                     completionHandler:(MTLNewLibraryCompletionHandler)handler
+{
+	descriptor = [descriptor copy];
+	hm_creation_async(^{
+		NSError *error = nil;
+		id library = [self newLibraryWithStitchedDescriptor:descriptor error:&error];
+		if (handler != NULL) handler(library, error);
+		[library release];
+	});
+	[descriptor release];
 }
 
 /* --- textures --- */
@@ -3573,7 +4843,8 @@ hm_compress(MTLTextureDescriptor *descriptor, MTLTextureUsage usage)
 		HM_ONCE("a texture was asked for with usage Unknown (0); it is given shader read, shader write and render target, the "
 			"three uses one has here\n");
 		usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsageRenderTarget;
-		if ([descriptor pixelFormat] == MTLPixelFormatDepth32Float || [descriptor pixelFormat] == MTLPixelFormatDepth32Float_Stencil8) {
+		if ([descriptor pixelFormat] == MTLPixelFormatDepth16Unorm || [descriptor pixelFormat] == MTLPixelFormatStencil8 ||
+	    [descriptor pixelFormat] == MTLPixelFormatDepth32Float || [descriptor pixelFormat] == MTLPixelFormatDepth32Float_Stencil8) {
 			usage = MTLTextureUsageRenderTarget;   /* a depth texture is tiled and is an attachment alone (hakios-metal's texture.hpp) */
 		}
 		{
@@ -3588,13 +4859,10 @@ hm_compress(MTLTextureDescriptor *descriptor, MTLTextureUsage usage)
 			}
 		}
 	}
-	/* Memoryless is a render target an Apple GPU keeps in tile memory alone, its contents undefined past the pass. This GPU
-	 * draws into memory (sysmem), so the texture is given memory like any other: what Metal leaves undefined is kept, which
-	 * is one of the things undefined allows. CoreAnimation asks for these for its blur and backdrop passes, and a refusal
-	 * here was a pass with no texture and a layer drawn from nothing. */
+	/* Whole-pass sysmem replay needs backing even for a pass which never stores.
+	 * Retain it in the fence-safe BO pool, capped at 256 MiB per device. */
 	if ([descriptor storageMode] == MTLStorageModeMemoryless) {
-		HM_ONCE("a texture was asked for with memoryless storage; this GPU has no tile memory to keep it in, so it is given "
-			"memory as any other texture is\n");
+		HM_ONCE("memoryless attachments retain backing for whole-pass sysmem replay\n");
 	}
 	if ([descriptor storageMode] == MTLStorageModePrivate) {
 		HM_ONCE("a texture was asked for with private storage; every texture here is shared memory, and that is what is "
@@ -3605,14 +4873,40 @@ hm_compress(MTLTextureDescriptor *descriptor, MTLTextureUsage usage)
 							    "(lossless, 0, is what every texture here is)", (long)[descriptor compressionType]]);
 	}
 	swizzle = [descriptor swizzle];
-	if (swizzle.red != MTLTextureSwizzleRed || swizzle.green != MTLTextureSwizzleGreen || swizzle.blue != MTLTextureSwizzleBlue ||
-	    swizzle.alpha != MTLTextureSwizzleAlpha) {
-		return hm_refuse_texture([NSString stringWithFormat:@"a swizzle of (%u %u %u %u); only the identity (red 2, green 3, blue 4, "
-							    "alpha 5) is served: the descriptor's own swizzle field carries the format's channel "
-							    "order", swizzle.red, swizzle.green, swizzle.blue, swizzle.alpha]);
+	/* A swizzle in the descriptor (AppleMetalGLRenderer's -setSwizzleKey:, the same field: GL_LUMINANCE as R8 read
+	 * (r, r, r, 1), GL_ALPHA as (0, 0, 0, r)...): the texture is made plain and handed out as a swizzled view of itself,
+	 * the core composing the swizzle into the view's descriptors as -newTextureViewWithPixelFormat:...swizzle: does. A key
+	 * of four zeros, which no caller means (every channel 0), is taken as the identity. */
+	if ((swizzle.red != MTLTextureSwizzleRed || swizzle.green != MTLTextureSwizzleGreen || swizzle.blue != MTLTextureSwizzleBlue ||
+	     swizzle.alpha != MTLTextureSwizzleAlpha) &&
+	    !(swizzle.red == 0 && swizzle.green == 0 && swizzle.blue == 0 && swizzle.alpha == 0)) {
+		MTLTextureDescriptor *plain = [[descriptor copy] autorelease];
+		HakiosMetalTexture *base, *view;
+
+		[plain setSwizzle:MTLTextureSwizzleChannelsDefault];
+		base = [self newTextureWithDescriptor:plain];
+		if (base == nil) {
+			return nil;   /* (said by the call above) */
+		}
+		view = [base newTextureViewWithPixelFormat:[plain pixelFormat] textureType:[plain textureType]
+						    levels:NSMakeRange(0, [plain mipmapLevelCount])
+						    slices:NSMakeRange(0, [plain textureType] == MTLTextureType3D ? 1 : [base arrayLength] *
+								       ([plain textureType] == MTLTextureTypeCube || [plain textureType] == MTLTextureTypeCubeArray ? 6 : 1))
+						   swizzle:swizzle];
+		[base release];   /* (the view keeps it) */
+		if (view == nil) {
+			return hm_refuse_texture([NSString stringWithFormat:@"a swizzle of (%u %u %u %u) over pixel format %lu", swizzle.red, swizzle.green,
+								    swizzle.blue, swizzle.alpha, (unsigned long)[plain pixelFormat]]);
+		}
+		HM_ONCE("a texture with a swizzle in its descriptor (%u %u %u %u) is a swizzled view of a texture of its own\n", swizzle.red,
+			swizzle.green, swizzle.blue, swizzle.alpha);
+		return view;
 	}
 	/* the mip levels are the core's (texture.hpp: fdl6_layout's rule, which the TP follows): it refuses a count past the
 	 * bottom of the chain with the numbers */
+	uint64_t previous = hm_bo_begin((unsigned)[descriptor pixelFormat],
+		(unsigned)usage | ((unsigned)[descriptor sampleCount] << 8) | ((unsigned)[descriptor textureType] << 16),
+		[descriptor storageMode] == MTLStorageModeMemoryless ? HM_BO_MEMORYLESS : HM_BO_TEXTURE);
 	if ([descriptor textureType] == MTLTextureType2DMultisample) {
 		/* drawn into and resolved, never read or written by a shader here: the shader bits Metal's Unknown default
 		 * gives are dropped rather than refused */
@@ -3644,6 +4938,7 @@ hm_compress(MTLTextureDescriptor *descriptor, MTLTextureUsage usage)
 							  (unsigned)[descriptor width], (unsigned)[descriptor height],
 							  (unsigned)[descriptor mipmapLevelCount], (unsigned)usage);
 	}
+	hm_bo_end(previous);
 	if (texture == NULL) {
 		/* the core's own sentence: the format by name, a size outside 1..32767, or no memory */
 		return hm_refuse_texture([NSString stringWithFormat:@"%lux%lu, pixel format %lu, usage %#lx: %s", (unsigned long)[descriptor width],
@@ -3659,6 +4954,7 @@ hm_compress(MTLTextureDescriptor *descriptor, MTLTextureUsage usage)
  * nil became a drawable with a nil texture that CoreAnimation asserted on somewhere else. */
 - (id)newTextureWithDescriptor:(MTLTextureDescriptor *)descriptor iosurface:(IOSurfaceRef)surface plane:(NSUInteger)plane
 {
+	hm_drawables_install();
 	if (hm_timeline_on() && descriptor != nil && [descriptor width] * [descriptor height] >= 500000) {
 		hm_print("timeline: a texture of %lux%lu, format %lu, usage %#lx, over surface %u\n", (unsigned long)[descriptor width],
 			 (unsigned long)[descriptor height], (unsigned long)[descriptor pixelFormat], (unsigned long)[descriptor usage],
@@ -3706,10 +5002,13 @@ hm_compress(MTLTextureDescriptor *descriptor, MTLTextureUsage usage)
 				hakios_metal_texture *upright = hakios_metal_texture_new_iosurface(_gpu, IOSurfaceGetID(surface), 0, (unsigned)[descriptor pixelFormat],
 												   (unsigned)sw, (unsigned)sh,
 												   (unsigned)(MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget));
+				uint64_t previous = hm_bo_begin((unsigned)[descriptor pixelFormat],
+					MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget, HM_BO_TEXTURE);
 				hakios_metal_texture *drawn = upright == NULL ? NULL :
 							      hakios_metal_texture_new_levels(_gpu, 2, (unsigned)[descriptor pixelFormat], (unsigned)[descriptor width],
 											      (unsigned)[descriptor height], 1,
 											      (unsigned)(MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget));
+				hm_bo_end(previous);
 
 				if (drawn != NULL) {
 					HM_ONCE("a framebuffer turned by rotation %lu over IOSurface %u (%zux%zu) is drawn %lux%lu and turned into the "
@@ -3740,14 +5039,10 @@ hm_compress(MTLTextureDescriptor *descriptor, MTLTextureUsage usage)
 		 * and only ever written through replace, and SpringBoard's heavy frames read a 1105x1160 one most after the
 		 * wallpaper) */
 		hakios_metal_texture *copy = NULL;
-		if (hm_compress_ok() && [descriptor width] * [descriptor height] >= 65536) {
-			copy = hakios_metal_texture_new_compressed(_gpu, 70, (unsigned)[descriptor width], (unsigned)[descriptor height],
-								   (unsigned)MTLTextureUsageShaderRead);
-		}
-		if (copy == NULL) {
-			copy = hakios_metal_texture_new_levels(_gpu, 2, 70, (unsigned)[descriptor width], (unsigned)[descriptor height], 1,
-								(unsigned)MTLTextureUsageShaderRead);
-		}
+		/* The conversion pass writes this shadow as an image.  Compressed textures are
+		 * read-only in hakios-metal, so YCbCr shadows always use a linear RGBA8 target. */
+		copy = hakios_metal_texture_new_levels(_gpu, 2, 70, (unsigned)[descriptor width], (unsigned)[descriptor height], 1,
+							(unsigned)(MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite));
 		if (copy == NULL) {
 			return hm_refuse_texture([NSString stringWithFormat:@"a %lux%lu RGBA8 copy of a two-plane surface: %s",
 							    (unsigned long)[descriptor width], (unsigned long)[descriptor height], hakios_metal_error()]);
@@ -3757,6 +5052,48 @@ hm_compress(MTLTextureDescriptor *descriptor, MTLTextureUsage usage)
 		t = [[HakiosMetalTexture alloc] initWithHakiosDevice:self texture:copy descriptor:descriptor usage:MTLTextureUsageShaderRead];
 		[t hakiosShadowYCbCr:surface format:[descriptor pixelFormat]];
 		return t;
+	} else if (IOSurfaceGetPlaneCount(surface) > 1) {
+		const OSType fourcc = IOSurfaceGetPixelFormat(surface);
+		if (IOSurfaceGetPlaneCount(surface) != 2 || plane >= 2 || (fourcc != 0x34323066 && fourcc != 0x34323076)) {
+			return hm_refuse_texture(@"a raw plane texture needs plane 0 or 1 of a two-plane 420f/420v IOSurface");
+		}
+		const size_t pw = IOSurfaceGetWidthOfPlane(surface, plane), ph = IOSurfaceGetHeightOfPlane(surface, plane);
+		const size_t pitch = IOSurfaceGetBytesPerRowOfPlane(surface, plane);
+		const size_t element = IOSurfaceGetBytesPerElementOfPlane(surface, plane);
+		const uintptr_t base = (uintptr_t)IOSurfaceGetBaseAddress(surface), start = (uintptr_t)IOSurfaceGetBaseAddressOfPlane(surface, plane);
+		const size_t offset = start - base, alloc = IOSurfaceGetAllocSize(surface);
+		unsigned bw, bh, bytes;
+		/* VideoToolbox writes four Y bytes (or two CbCr pairs) through each RGBA8 texel.
+		 * This is a raw packed view, not an RGB image to convert as private format 500. */
+		if (base == 0 || start < base || element != (plane == 0 ? 1u : 2u) ||
+		    !hakios_metal_format_block((unsigned)[descriptor pixelFormat], &bw, &bh, &bytes) || bw != 1 || bh != 1 ||
+		    bytes < element || [descriptor width] == 0 || [descriptor height] == 0 || [descriptor width] > pw ||
+		    [descriptor height] > ph || (uint64_t)[descriptor width] * bytes > (uint64_t)pw * element ||
+		    (uint64_t)pw * element > pitch || offset > alloc || (uint64_t)pitch * ph > alloc - offset) {
+			return hm_refuse_texture([NSString stringWithFormat:@"IOSurface %u plane %lu: format %lu, %lux%lu does not fit %zux%zu, %zu-byte elements, pitch %zu",
+				IOSurfaceGetID(surface), (unsigned long)plane, (unsigned long)[descriptor pixelFormat],
+				(unsigned long)[descriptor width], (unsigned long)[descriptor height], pw, ph, element, pitch]);
+		}
+		const BOOL shadow = pitch % 64 != 0 || offset % 64 != 0;
+		texture = shadow ? hakios_metal_texture_new_levels(_gpu, 2, (unsigned)[descriptor pixelFormat],
+			(unsigned)[descriptor width], (unsigned)[descriptor height], 1, (unsigned)usage) :
+			hakios_metal_texture_new_iosurface_plane(_gpu, IOSurfaceGetID(surface), (unsigned)plane, (unsigned)[descriptor pixelFormat],
+				(unsigned)[descriptor width], (unsigned)[descriptor height], (unsigned)usage, offset, (unsigned)pitch, (unsigned)pw, (unsigned)ph);
+		if (texture != NULL) {
+			t = [[HakiosMetalTexture alloc] initWithHakiosDevice:self texture:texture descriptor:descriptor usage:usage];
+			if (shadow) [t hakiosShadow:surface plane:plane];
+			else [t hakiosSetIOSurface:surface plane:plane];
+			if (hm_handoff_on()) hm_diag_add(&hm_diag.planeImports);
+			static unsigned imports;
+			if (__atomic_fetch_add(&imports, 1, __ATOMIC_RELAXED) < 32) {
+				hm_print("iosurface-plane: IOSurface %u '%c%c%c%c' plane %lu, format %lu, texture %lux%lu, plane %zux%zu, offset %zu, pitch %zu, usage %#lx: %s\n",
+					IOSurfaceGetID(surface), (char)(fourcc >> 24), (char)(fourcc >> 16), (char)(fourcc >> 8), (char)fourcc,
+					(unsigned long)plane, (unsigned long)[descriptor pixelFormat], (unsigned long)[descriptor width],
+					(unsigned long)[descriptor height], pw, ph, offset, pitch, (unsigned long)usage,
+					shadow ? "raw plane shadow" : "shared plane");
+			}
+			return t;
+		}
 	} else {
 		/* A surface is drawn into whatever usage its texture was asked with: CoreAnimation renders a material's
 		 * snapshot (the App Library's blurred wallpaper) into a texture it made with ShaderRead alone, and Apple's
@@ -3801,6 +5138,7 @@ hm_compress(MTLTextureDescriptor *descriptor, MTLTextureUsage usage)
 				"surface changes\n", IOSurfaceGetBytesPerRow(surface));
 			t = [[HakiosMetalTexture alloc] initWithHakiosDevice:self texture:copy descriptor:descriptor usage:copyUsage];
 			[t hakiosShadow:surface];
+			if (hm_handoff_on()) hm_diag_add(&hm_diag.imports);
 			return t;
 		}
 	}
@@ -3835,8 +5173,13 @@ hm_compress(MTLTextureDescriptor *descriptor, MTLTextureUsage usage)
 								    IOSurfaceGetID(surface), shape, (unsigned long)plane, (unsigned long)[descriptor usage], named,
 								    rotation, hakios_metal_error()]);
 	}
+	if (plane == 0 && IOSurfaceGetPlaneCount(surface) <= 1) {
+		hm_flat_census("an IOSurface", hakios_metal_texture_resource_id(texture), (unsigned)[descriptor pixelFormat], [descriptor width],
+			       [descriptor height], IOSurfaceGetBaseAddress(surface), IOSurfaceGetBytesPerRow(surface));
+	}
 	t = [[HakiosMetalTexture alloc] initWithHakiosDevice:self texture:texture descriptor:descriptor usage:usage];
 	[t hakiosSetIOSurface:surface plane:plane];
+	if (hm_handoff_on()) hm_diag_add(&hm_diag.imports);
 	return t;
 }
 
@@ -3939,7 +5282,8 @@ hm_refuse_sampler(NSString *why)
 {
 	MTLTextureUsage usage = [descriptor usage] & ~(MTLTextureUsage)MTLTextureUsagePixelFormatView;
 	const MTLTextureType type = [descriptor textureType];
-	const BOOL depth = [descriptor pixelFormat] == MTLPixelFormatDepth32Float || [descriptor pixelFormat] == MTLPixelFormatDepth32Float_Stencil8;
+	const BOOL depth = [descriptor pixelFormat] == MTLPixelFormatDepth16Unorm || [descriptor pixelFormat] == MTLPixelFormatStencil8 ||
+	    [descriptor pixelFormat] == MTLPixelFormatDepth32Float || [descriptor pixelFormat] == MTLPixelFormatDepth32Float_Stencil8;
 	const unsigned layers = type == MTLTextureType2DArray || type == MTLTextureType1DArray ? (unsigned)[descriptor arrayLength] :
 				type == MTLTextureTypeCubeArray ? (unsigned)[descriptor arrayLength] * 6 : type == MTLTextureTypeCube ? 6 :
 				type == MTLTextureType3D ? (unsigned)[descriptor depth] : 1;
@@ -4057,17 +5401,36 @@ HM_REFUSES_OUT_LOUD
 	_callerLength = length;
 }
 
-- (hakios_metal_buffer *)hakiosBuffer { return _buffer; }
+- (hakios_metal_buffer *)hakiosBuffer {
+    static int refresh = -1;
+    if (refresh < 0) refresh = hm_ca_arg("metal_nocopy_refresh=1");
+    /* (in an OpenGL ES process too: AppleMetalGLRenderer wraps GL's own buffer storage with -newBufferWithBytesNoCopy:,
+     * and GL writes that storage, not the copy, between draws) */
+    if ((refresh || hm_gles_active) && _callerBytes && _callerLength) {
+        memcpy(hakios_metal_buffer_contents(_buffer), _callerBytes, _callerLength);
+        HM_ONCE("metal_nocopy_refresh=1: borrowed CPU upload bytes refreshed at binding (diagnostic)\n");
+    }
+    return _buffer;
+}
 
 - (void *)contents          { return hakios_metal_buffer_contents(_buffer); }
+/* -[IOGPUMetalResource isComplete] and -waitUntilComplete (hm_use_*), and IOGPUMetalBuffer's -iosurface: a buffer here is
+ * never over a surface */
+- (BOOL)isComplete          { return hm_use_complete(_uses); }
+- (void)waitUntilComplete   { hm_use_wait(_uses); }
+- (void)hakiosUsedBy:(uint64_t)seq { hm_use_mark(_uses, &_usesAt, seq); }
+- (IOSurfaceRef)iosurface   { return NULL; }
 - (NSUInteger)length        { return (NSUInteger)hakios_metal_buffer_length(_buffer); }
 - (uint64_t)gpuAddress      { return hakios_metal_buffer_gpu_address(_buffer); }
 - (NSUInteger)allocatedSize { return [self length]; }
 - (id)device                { return _device; }
 
-/* The memory is write-combined and the GPU reads it through no cache of the processor's, so there is nothing to push
- * out: a no-op that is the truth about this memory, not an omission (and the method is macOS-only in any case). */
-- (void)didModifyRange:(NSRange)range { (void)range; }
+/* Shared write-combined memory needs no cache push; pending GPU uses still have to finish before CPU reuse. */
+- (void)didModifyRange:(NSRange)range
+{
+    (void)range;
+    if (hakios_metal_buffer_sync(_buffer) != 0) hm_print("refused: buffer CPU synchronization: %s\n", hakios_metal_error());
+}
 
 /* what was asked for does not change what was given: one kind of memory, described as what it is */
 - (MTLStorageMode)storageMode               { return MTLStorageModeShared; }
@@ -4126,14 +5489,28 @@ HM_REFUSES_OUT_LOUD
 			 (unsigned long)bytesPerRow, (unsigned long)offset, hakios_metal_error());
 		return nil;
 	}
+	hm_flat_census("a texture over a buffer", hakios_metal_texture_resource_id(texture), (unsigned)[descriptor pixelFormat], [descriptor width],
+		       [descriptor height], (const uint8_t *)hakios_metal_buffer_contents(_buffer) + offset, bytesPerRow);
 	return [[HakiosMetalTexture alloc] initWithHakiosDevice:_device texture:texture descriptor:descriptor usage:usage];
 }
 
-/* the SPI form QuartzCore sends: the image size beside the rows, which a single 2D level does not need */
+/* the SPI form QuartzCore sends: the image size beside the rows, which a single 2D level does not need.
+ * Over a no-copy buffer it is refused. QuartzCore (iOS 16.5, the texture upload at 0x18834e7bc: 0x18847b410) asks for it
+ * over a CPU image's own pages, marks the texture as that memory (bit 0x200 at +0x7b) and from then on never uploads
+ * to it: when the image is drawn again in place (a CPU-drawn layer's backing store, Freeform's stroke) it only records
+ * the new generation. Here the buffer is a copy taken when it was made (see -newBufferWithBytesNoCopy:...), so the
+ * texture kept the empty first frame (logs/test-1110-183501: 640x640 and 640x516 "through a texture over a buffer",
+ * every sample 0) while the stroke was drawn. Given nil, QuartzCore makes a texture of its own and uploads the image
+ * with -replaceRegion: each time it changes. */
 - (id)newLinearTextureWithDescriptor:(MTLTextureDescriptor *)descriptor offset:(NSUInteger)offset bytesPerRow:(NSUInteger)bytesPerRow
 			bytesPerImage:(NSUInteger)bytesPerImage
 {
 	(void)bytesPerImage;
+	if (_callerBytes != NULL) {
+		HM_ONCE("refused: a linear texture over a no-copy buffer (%lux%lu): the buffer is a copy, not the caller's memory; nil, "
+			"so QuartzCore uploads the image itself\n", (unsigned long)[descriptor width], (unsigned long)[descriptor height]);
+		return nil;
+	}
 	return [self newTextureWithDescriptor:descriptor offset:offset bytesPerRow:bytesPerRow];
 }
 
@@ -4184,6 +5561,7 @@ HM_REFUSES_OUT_LOUD
 	_askedOptions = [descriptor resourceOptions];
 	_allowGPUOptimizedContents = [descriptor allowGPUOptimizedContents];
 	_uniqueIdentifier = hm_next_resource_id();
+	_shadowLock = [[NSLock alloc] init];
 	return self;
 }
 
@@ -4196,6 +5574,13 @@ HM_REFUSES_OUT_LOUD
 		CFRelease(_iosurface);
 	}
 	free(_shadowBase);
+	free(_ycbcrRows);
+	if (_ycbcrGPULuma != NULL) hakios_metal_texture_free(_ycbcrGPULuma);
+	if (_ycbcrGPUChroma != NULL) hakios_metal_texture_free(_ycbcrGPUChroma);
+	if (_ycbcrGPUParams != NULL) hakios_metal_buffer_free(_ycbcrGPUParams);
+	if (_ycbcrGPUKernel != NULL) hakios_metal_kernel_free(_ycbcrGPUKernel);
+	if (_ycbcrGPUQueue != NULL) hakios_metal_queue_free(_ycbcrGPUQueue);
+	[_shadowLock release];
 	if (_turnedSurface != NULL) {
 		hakios_metal_texture_free(_turnedSurface);
 	}
@@ -4251,10 +5636,32 @@ HM_REFUSES_OUT_LOUD
 
 /* --- <MTLResourceSPI> --- */
 
-/* complete the moment it exists: the memory is mapped and -replaceRegion: has copied when it returns; nothing is deferred
- * (CoreAnimation's finish_image waits on this, and NO would be a wait for ever) */
-- (BOOL)isComplete                               { return YES; }
-- (void)waitUntilComplete                        { }
+/* QuartzCore's finish_image waits on the texture, including render targets and other wrappers of its IOSurface.
+ * The core's backing-use list includes those writes; a per-Objective-C-object binding stamp does not. */
+- (BOOL)isComplete
+{
+	if (_parent != nil) return [_parent isComplete];
+	return hakios_metal_texture_is_complete(_texture) &&
+	       (!_shadow || hm_use_complete(_uses));
+}
+- (void)waitUntilComplete
+{
+	const BOOL profile = hm_fps_on();
+	const double began = profile ? hm_now() : 0;
+	if (hm_handoff_on()) hm_diag_add(&hm_diag.textureWaits);
+	if (hakios_metal_texture_sync(_texture) != 0) hm_print("texture completion failed: %s\n", hakios_metal_error());
+	/* A shadow's IOSurface is ready only after driver writeback, not at its GPU fence.
+	 * Its producer runs that publication inline, independently of CA's completion queue. */
+	HakiosMetalTexture *root = self;
+	while (root->_parent != nil) root = root->_parent;
+	if (root->_shadow) hm_use_wait(root->_uses);
+	if (profile) hm_fps_texture_waited(hm_now() - began);
+}
+- (void)hakiosUsedBy:(uint64_t)seq
+{
+	hm_use_mark(_uses, &_usesAt, seq);
+	if (_parent != nil) [_parent hakiosUsedBy:seq];
+}
 - (MTLResourceOptions)unfilteredResourceOptions  { return _askedOptions; }
 - (NSUInteger)protectionOptions                  { return 0; }   /* no protected memory on this port */
 - (BOOL)isPurgeable                              { return NO; }
@@ -4284,6 +5691,14 @@ HM_REFUSES_OUT_LOUD
 - (BOOL)isFramebufferOnly           { return NO; }    /* every texture here can be read back and written by the processor */
 - (BOOL)allowGPUOptimizedContents   { return _allowGPUOptimizedContents; }
 - (id)parentTexture                 { return _parent; }
+/* AppleMetalGLRenderer's glGenerateMipmap asks the texture first (Apple's GPU fills a level from the one above it in
+ * place); NO sends it to the blit encoder's -generateMipmapsForTexture:, which is served */
+- (BOOL)canGenerateMipmapLevels     { return NO; }
+- (void)generateMipmapLevel:(NSUInteger)level slice:(NSUInteger)slice
+{
+	HM_ONCE("gles: -generateMipmapLevel:%lu slice:%lu asked though -canGenerateMipmapLevels says NO; nothing is generated\n",
+		(unsigned long)level, (unsigned long)slice);
+}
 - (NSUInteger)parentRelativeLevel   { return _parentLevel; }
 - (NSUInteger)parentRelativeSlice   { return _parentSlice; }
 - (id)rootResource                  { return self; }
@@ -4297,7 +5712,7 @@ HM_REFUSES_OUT_LOUD
  * layout. The copy is made again whenever the surface's seed has moved, which IOSurface does on every unlock after a
  * write, at the moment the texture is bound for a draw -- so a draw sees the surface as it was when the draw was encoded,
  * which is what a sample of a surface another program is still writing could show anyway. */
-- (BOOL)hakiosIsShadow { return _shadow; }
+- (BOOL)hakiosIsShadow { return _parent != nil ? [_parent hakiosIsShadow] : _shadow; }
 - (BOOL)hakiosIsTurned { return _turnedSurface != NULL; }
 
 - (void)hakiosSetTurned:(hakios_metal_texture *)surface rotation:(unsigned)rotation
@@ -4322,6 +5737,10 @@ HM_REFUSES_OUT_LOUD
 		[_parent hakiosWriteBackShadow];
 		return;
 	}
+	if (_shadow && __atomic_load_n(&_shadowWrites, __ATOMIC_RELAXED) != 0) {
+		__atomic_sub_fetch(&_shadowWrites, 1, __ATOMIC_RELAXED);
+		if (_iosurface != NULL) hm_shadow_surface_done(IOSurfaceGetID(_iosurface));
+	}
 	if (!_shadow || _iosurface == NULL || (_usage & (MTLTextureUsageShaderWrite | MTLTextureUsageRenderTarget)) == 0) {
 		return;
 	}
@@ -4330,38 +5749,84 @@ HM_REFUSES_OUT_LOUD
 	 * when it is encoded -- before the last one's command buffer has written back when the GPU is busy. Writing a
 	 * whole copy back then put its stale rows over what the other pass drew: black bands that moved from frame to
 	 * frame. Against the base, each copy carries only its own drawing, and passes into different parts merge. */
-	const size_t bytes = IOSurfaceGetBytesPerRow(_iosurface) * IOSurfaceGetHeight(_iosurface);
+	const BOOL planar = IOSurfaceGetPlaneCount(_iosurface) > 1;
+	const size_t pitch = planar ? IOSurfaceGetBytesPerRowOfPlane(_iosurface, _iosurfacePlane) : IOSurfaceGetBytesPerRow(_iosurface);
+	const size_t bytes = pitch * hakios_metal_texture_height(_texture);
 	const double began = hm_now();
 	uint8_t *now = malloc(bytes);
 
+	/* under the copy's lock: a refresh between this lock's seed and the end of the write-back read the surface half
+	 * written back, replaced the copy this reads, and freed the base this compares with */
+	[_shadowLock lock];
 	if (now == NULL || IOSurfaceLock(_iosurface, 0, NULL) != kIOReturnSuccess) {
+		[_shadowLock unlock];
 		free(now);
 		return;
 	}
-	uint8_t *surface = IOSurfaceGetBaseAddress(_iosurface);
+	uint8_t *surface = planar ? IOSurfaceGetBaseAddressOfPlane(_iosurface, _iosurfacePlane) : IOSurfaceGetBaseAddress(_iosurface);
 
-	memcpy(now, _shadowBase != NULL ? _shadowBase : surface, bytes);
-	(void)hakios_metal_texture_read(_texture, 0, 0, hakios_metal_texture_width(_texture), hakios_metal_texture_height(_texture), now,
-					(uint64_t)IOSurfaceGetBytesPerRow(_iosurface));
+	/* A copy whose base was never taken from its surface (the refresh that makes one could not lock it) has rows of its
+	 * own that are whatever memory it was made in, so publishing the whole copy would put those over the surface: the
+	 * App Library's background, black, before the first write-back (v29u). Nothing is published; the next refresh takes
+	 * the surface and the next write-back merges into it. (Every copy a pass can draw into is given its base when it is
+	 * made -- -hakiosShadow: refreshes at once -- so this is the failure path, said once.) */
 	if (_shadowBase == NULL) {
-		memcpy(surface, now, bytes);
-	} else {
-		for (size_t i = 0; i < bytes; i++) {
-			if (now[i] != _shadowBase[i]) {
-				surface[i] = now[i];
-			}
+		HM_ONCE("a shadow copy was written back with no base taken from its surface: not published, its untouched rows are "
+			"not the surface's\n");
+		IOSurfaceUnlock(_iosurface, 0, NULL);
+		[_shadowLock unlock];
+		free(now);
+		return;
+	}
+	memcpy(now, _shadowBase, bytes);
+	(void)hakios_metal_texture_read(_texture, 0, 0, hakios_metal_texture_width(_texture), hakios_metal_texture_height(_texture), now,
+					(uint64_t)pitch);
+	for (size_t i = 0; i < bytes; i++) {
+		if (now[i] != _shadowBase[i]) {
+			surface[i] = now[i];
 		}
 	}
-	IOSurfaceUnlock(_iosurface, 0, NULL);
+	IOSurfaceUnlock(_iosurface, 0, &_shadowSeed);
 	free(_shadowBase);
 	_shadowBase = now;
-	_shadowSeed = IOSurfaceGetSeed(_iosurface);
+	[_shadowLock unlock];
 	hm_fps_shadow(NO, hm_now() - began);
+}
+
+- (void)hakiosShadowWriteQueued
+{
+	if (_parent != nil) {
+		[_parent hakiosShadowWriteQueued];
+		return;
+	}
+	if (_shadow) {
+		__atomic_add_fetch(&_shadowWrites, 1, __ATOMIC_RELAXED);
+		if (_iosurface != NULL) hm_shadow_surface_add(IOSurfaceGetID(_iosurface));   /* a sample of the surface waits for it */
+	}
+}
+
+/* A command buffer released without completing (never committed) queued a write it will never write back: without
+ * this the copy's pending count stays up and -hakiosRefreshShadow keeps the copy for good. */
+- (void)hakiosShadowWriteDropped
+{
+	if (_parent != nil) {
+		[_parent hakiosShadowWriteDropped];
+		return;
+	}
+	if (_shadow && __atomic_load_n(&_shadowWrites, __ATOMIC_RELAXED) != 0) {
+		__atomic_sub_fetch(&_shadowWrites, 1, __ATOMIC_RELAXED);
+		if (_iosurface != NULL) hm_shadow_surface_done(IOSurfaceGetID(_iosurface));
+	}
 }
 
 - (void)hakiosShadow:(IOSurfaceRef)surface
 {
-	[self hakiosSetIOSurface:surface plane:0];
+	[self hakiosShadow:surface plane:0];
+}
+
+- (void)hakiosShadow:(IOSurfaceRef)surface plane:(NSUInteger)plane
+{
+	[self hakiosSetIOSurface:surface plane:plane];
 	_shadow = YES;
 	_shadowSeed = IOSurfaceGetSeed(surface) + 1;   /* (not the surface's seed: the first refresh copies) */
 	[self hakiosRefreshShadow];
@@ -4369,73 +5834,144 @@ HM_REFUSES_OUT_LOUD
 
 /* A '420f' or '420v' surface sampled as Metal's private format 500. Apple's texture unit converts YCbCr to RGB as it
  * samples, and CoreAnimation's shader (fixed_frag_lph_cph) takes the sample as the colour: it does no conversion of
- * its own. The A6xx texture unit has no such conversion -- it returns (Y, Cb, Cr) as they are (probe 9m2), which drew
- * the home screen's wallpaper with its orange pink and its teal olive. So such a texture is an RGBA8 copy converted
- * here, from the surface's matrix (its IOSurfaceYCbCrMatrix attachment: BT.709 when it says so, BT.601 otherwise,
- * which is what the wallpaper's own HEIC declares) and range, made again when the surface's seed moves as the other
- * copies are. Each 2x2 block of luma takes its one chroma sample (the 4:2:0 siting). */
+ * its own (its own YCbCr path, fc_has_ycbcr_matrix with fc_plane_count 2, is for two textures, which nothing here asks
+ * for: every pipeline of logs/test-1109-215741 has plane count 1). The A6xx texture unit has no such conversion -- it
+ * returns (Y, Cb, Cr) as they are (probe 9m2), which drew the home screen's wallpaper with its orange pink and its teal
+ * olive. So such a texture is an RGBA8 copy converted here (HakiosMetalPixels.h: hm_ycc_convert), from the matrix the
+ * surface declares (CoreVideo's CVImageBufferYCbCrMatrix attachment -- BT.709 for an HD video -- or IOSurfaceYCbCrMatrix;
+ * BT.601 when it declares none, which is what the wallpaper's own HEIC gives) and its range, made again when the
+ * surface's seed moves as the other copies are. Each 2x2 block of luma takes its one chroma sample (the 4:2:0 siting). */
 - (void)hakiosShadowYCbCr:(IOSurfaceRef)surface format:(MTLPixelFormat)format
 {
-	CFTypeRef matrix = IOSurfaceCopyValue(surface, CFSTR("IOSurfaceYCbCrMatrix"));
+	const char *from;
+	const int matrix = hm_surface_ycc_matrix(surface, &from);
 
-	_ycbcr = 1;
+	_ycbcr = matrix != HM_YCC_UNKNOWN ? matrix : HM_YCC_601;
+	_ycbcrDeclared = matrix != HM_YCC_UNKNOWN;
 	_ycbcrFormat = format;
-	if (matrix != NULL) {
-		if (CFGetTypeID(matrix) == CFStringGetTypeID() && CFStringFind((CFStringRef)matrix, CFSTR("709"), 0).location != kCFNotFound) {
-			_ycbcr = 2;
-		}
-		CFRelease(matrix);
-	}
 	_ycbcrFull = IOSurfaceGetPixelFormat(surface) != 0x34323076;   /* not '420v' */
 	[self hakiosShadow:surface];
 }
 
-static uint8_t hm_clamp8(float v) { return v <= 0 ? 0 : v >= 255 ? 255 : (uint8_t)(v + 0.5f); }
+/* Copy each plane once using IOSurface's byte stride into an aligned GPU texture.
+ * No source pitch/offset restriction, and no use of the raw import's luma pitch. */
+- (BOOL)hakiosConvertYCbCrGPU:(const hm_ycc_planes *)planes width:(size_t)w height:(size_t)h
+{
+	if (_ycbcrFormat != (MTLPixelFormat)500 || (_ycbcr != HM_YCC_601 && _ycbcr != HM_YCC_709)) return NO;
+	const double began = hm_now();
+	if (_ycbcrGPUQueue == NULL) _ycbcrGPUQueue = hakios_metal_queue_new([_device hakiosDevice]);
+	if (_ycbcrGPUKernel == NULL) _ycbcrGPUKernel = hakios_metal_kernel_compile_bitcode(ycbcr_convert_bc, ycbcr_convert_bc_size);
+	if (_ycbcrGPUParams == NULL) _ycbcrGPUParams = hakios_metal_buffer_new([_device hakiosDevice], 32);
+	if (_ycbcrGPULuma == NULL) _ycbcrGPULuma = hakios_metal_texture_new_levels([_device hakiosDevice], 2, 10,
+		(unsigned)w, (unsigned)h, 1, MTLTextureUsageShaderRead);
+	if (_ycbcrGPUChroma == NULL) _ycbcrGPUChroma = hakios_metal_texture_new_levels([_device hakiosDevice], 2, 30,
+		(unsigned)planes->cw, (unsigned)planes->ch, 1, MTLTextureUsageShaderRead);
+	if (_ycbcrGPUQueue == NULL || _ycbcrGPUKernel == NULL || _ycbcrGPUParams == NULL ||
+	    _ycbcrGPULuma == NULL || _ycbcrGPUChroma == NULL) {
+		hm_print("ycbcr: GPU setup failed: %s; converting current frame on CPU\n", hakios_metal_error());
+		return NO;
+	}
+	if (hakios_metal_texture_replace(_ycbcrGPULuma, 0, 0, (unsigned)w, (unsigned)h, planes->luma, planes->lumaRow) != 0 ||
+	    hakios_metal_texture_replace(_ycbcrGPUChroma, 0, 0, (unsigned)planes->cw, (unsigned)planes->ch,
+		planes->chroma, planes->chromaRow) != 0) {
+		hm_print("ycbcr: GPU plane copy failed: %s; converting current frame on CPU\n", hakios_metal_error());
+		return NO;
+	}
+	struct { float yBias, yScale, cBias, cBiasCr, rCr, gCb, gCr, bCb; } p;
+	p.yBias = _ycbcrFull ? 0.0f : 16.0f / 255.0f;
+	p.yScale = _ycbcrFull ? 1.0f : 255.0f / 219.0f;
+	p.cBias = p.cBiasCr = 128.0f / 255.0f;
+	if (_ycbcr == HM_YCC_709) {
+		p.rCr = 1.574800f; p.gCb = 0.187324f; p.gCr = 0.468124f; p.bCb = 1.855600f;
+	} else {
+		p.rCr = 1.402000f; p.gCb = 0.344136f; p.gCr = 0.714136f; p.bCb = 1.772000f;
+	}
+	const float chromaScale = _ycbcrFull ? 1.0f : 255.0f / 224.0f;
+	p.rCr *= chromaScale; p.gCb *= chromaScale; p.gCr *= chromaScale; p.bCb *= chromaScale;
+	memcpy(hakios_metal_buffer_contents(_ycbcrGPUParams), &p, sizeof p);
+	hakios_metal_cb *cb = hakios_metal_cb_new(_ycbcrGPUQueue);
+	if (cb == NULL) {
+		hm_print("ycbcr: GPU command buffer failed: %s; converting current frame on CPU\n", hakios_metal_error());
+		return NO;
+	}
+	const unsigned groups[3] = {(unsigned)w, (unsigned)h, 1};
+	const unsigned threads[3] = {1, 1, 1};
+	hakios_metal_buffer *buffers[1] = {_ycbcrGPUParams};
+	const uint64_t offsets[1] = {0};
+	hakios_metal_texture *textures[3] = {_ycbcrGPULuma, _ycbcrGPUChroma, _texture};
+	const int refused = hakios_metal_cb_dispatch2(cb, _ycbcrGPUKernel, groups, threads, buffers, offsets, 1, textures, 3, NULL, 0);
+	if (refused == 0) {
+		hakios_metal_cb_commit(cb, NULL, NULL);
+		hakios_metal_cb_wait(cb);
+	}
+	const BOOL ok = refused == 0 && hakios_metal_cb_status(cb) == HAKIOS_METAL_COMPLETED;
+	if (!ok) {
+		hm_print("ycbcr: GPU conversion failed: %s; converting current frame on CPU\n",
+			refused != 0 ? hakios_metal_error() : hakios_metal_cb_error(cb));
+	} else {
+		if (!_ycbcrGPUReported) {
+			hm_print("ycbcr: GPU conversion v8: aligned plane copies, format 500 (BT.601/709, video/full range); IOSurface %u\n",
+				IOSurfaceGetID(_iosurface));
+			_ycbcrGPUReported = YES;
+		}
+		hm_fps_ycbcr_gpu(hm_now() - began);
+	}
+	hakios_metal_cb_free(cb);
+	return ok;
+}
 
-- (void)hakiosConvertYCbCr
+/* CA has received this surface from its producer. Convert its current pixels;
+ * pixel values are never used to infer whether a frame is ready. */
+- (BOOL)hakiosConvertYCbCr
 {
 	const size_t w = hakios_metal_texture_width(_texture), h = hakios_metal_texture_height(_texture);
-	const uint8_t *luma = IOSurfaceGetBaseAddressOfPlane(_iosurface, 0), *chroma = IOSurfaceGetBaseAddressOfPlane(_iosurface, 1);
-	const size_t lumaRow = IOSurfaceGetBytesPerRowOfPlane(_iosurface, 0), chromaRow = IOSurfaceGetBytesPerRowOfPlane(_iosurface, 1);
-	const size_t cw = IOSurfaceGetWidthOfPlane(_iosurface, 1), ch = IOSurfaceGetHeightOfPlane(_iosurface, 1);
-	/* Kr, Kb of the matrix; G from Y = Kr R + Kg G + Kb B */
-	const float kr = _ycbcr == 2 ? 0.2126f : 0.299f, kb = _ycbcr == 2 ? 0.0722f : 0.114f, kg = 1.0f - kr - kb;
-	const float ys = _ycbcrFull ? 1.0f : 255.0f / 219.0f, yo = _ycbcrFull ? 0.0f : 16.0f, cs = _ycbcrFull ? 1.0f : 255.0f / 224.0f;
-	uint8_t *rows = malloc(w * h * 4);
-
-	if (rows == NULL || luma == NULL || chroma == NULL || cw == 0 || ch == 0) {
-		free(rows);
-		return;
-	}
-	for (size_t j = 0; j < h; j++) {
-		const uint8_t *yl = luma + j * lumaRow, *cl = chroma + MIN(j / 2, ch - 1) * chromaRow;
-		uint8_t *out = rows + j * w * 4;
-
-		for (size_t i = 0; i < w; i++) {
-			const size_t c = MIN(i / 2, cw - 1) * 2;
-
-			/* RGB8_420_2P (540) is the planes as they are, the chroma at each pixel: R Cr, G Y, B Cb. VideoToolbox's
-			 * converter samples it, takes (G, B, R) as (Y, Cb, Cr) and applies the matrix itself; converted here
-			 * too, the live wallpaper came out in colours it never had. */
-			if (_ycbcrFormat == (MTLPixelFormat)540) {
-				out[4 * i] = cl[c + 1];
-				out[4 * i + 1] = yl[i];
-				out[4 * i + 2] = cl[c];
-				out[4 * i + 3] = 255;
-				continue;
-			}
-			const float y = (yl[i] - yo) * ys, cb = (cl[c] - 128.0f) * cs, cr = (cl[c + 1] - 128.0f) * cs;
-			const float r = y + 2.0f * (1.0f - kr) * cr, b = y + 2.0f * (1.0f - kb) * cb;
-			const float g = (y - kr * r - kb * b) / kg;
-
-			out[4 * i] = hm_clamp8(r);
-			out[4 * i + 1] = hm_clamp8(g);
-			out[4 * i + 2] = hm_clamp8(b);
-			out[4 * i + 3] = 255;
+	const BOOL raw = _ycbcrFormat == (MTLPixelFormat)540;
+	const hm_ycc_planes planes = {
+		IOSurfaceGetBaseAddressOfPlane(_iosurface, 0), IOSurfaceGetBytesPerRowOfPlane(_iosurface, 0),
+		IOSurfaceGetBaseAddressOfPlane(_iosurface, 1), IOSurfaceGetBytesPerRowOfPlane(_iosurface, 1),
+		IOSurfaceGetWidthOfPlane(_iosurface, 1), IOSurfaceGetHeightOfPlane(_iosurface, 1),
+	};
+	if (!_ycbcrDeclared) {
+		const char *from;
+		const int matrix = hm_surface_ycc_matrix(_iosurface, &from);
+		if (matrix != HM_YCC_UNKNOWN) {
+			_ycbcr = matrix;
+			_ycbcrDeclared = YES;
 		}
 	}
-	(void)hakios_metal_texture_replace(_texture, 0, 0, (unsigned)w, (unsigned)h, rows, (uint64_t)w * 4);
-	free(rows);
+	if (!_ycbcrTold) {
+		hm_print("ycbcr: IOSurface %u %zux%zu as format %lu: Y stride %zu, CbCr %zux%zu stride %zu at +%td; %s, %s range; current seed %u\n",
+			IOSurfaceGetID(_iosurface), w, h, (unsigned long)_ycbcrFormat, planes.lumaRow, planes.cw, planes.ch, planes.chromaRow,
+			planes.chroma - planes.luma, hm_ycc_matrix_name(_ycbcr), _ycbcrFull ? "full" : "video", IOSurfaceGetSeed(_iosurface));
+		_ycbcrTold = YES;
+	}
+	if (!_ycbcrFull) hm_ycc_report_unwritten(_iosurface, &planes, w, h, IOSurfaceGetSeed(_iosurface));
+	if ([self hakiosConvertYCbCrGPU:&planes width:w height:h]) {
+		hm_fps_ycbcr();
+		return YES;
+	}
+	const size_t bytes = w * h * 4;
+	if (_ycbcrRowsBytes < bytes) {
+		uint8_t *rows = realloc(_ycbcrRows, bytes);
+		if (rows == NULL) return NO;
+		_ycbcrRows = rows;
+		_ycbcrRowsBytes = bytes;
+	}
+	uint8_t *rows = _ycbcrRows;
+	if (h < 256) {
+		hm_ycc_convert(&planes, w, h, _ycbcr, _ycbcrFull, raw, rows, w * 4);
+	} else {
+		const size_t band = ((h + 3) / 4 + 1) & ~(size_t)1;
+		hm_ycc_lut lut;
+		hm_ycc_make_lut(&lut, _ycbcr, _ycbcrFull);
+		const hm_ycc_planes *const in = &planes;
+		dispatch_apply(4, dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^(size_t b) {
+			hm_ycc_convert_rows_lut(in, w, h, b * band, MIN((b + 1) * band, h), &lut, raw, rows, w * 4);
+		});
+	}
+	const BOOL replaced = hakios_metal_texture_replace(_texture, 0, 0, (unsigned)w, (unsigned)h, rows, (uint64_t)w * 4) == 0;
+	if (replaced) hm_fps_ycbcr();
+	return replaced;
 }
 
 - (void)hakiosRefreshShadow
@@ -4446,33 +5982,97 @@ static uint8_t hm_clamp8(float v) { return v <= 0 ? 0 : v >= 255 ? 255 : (uint8_
 	}
 	uint32_t seed;
 
-	if (!_shadow || _iosurface == NULL || (seed = IOSurfaceGetSeed(_iosurface)) == _shadowSeed) {
+    static int forceRefresh = -1;
+    if (forceRefresh < 0) forceRefresh = hm_ca_arg("metal_shadow_refresh=1");
+    const BOOL forceRead = forceRefresh && (_usage & (MTLTextureUsageRenderTarget | MTLTextureUsageShaderWrite)) == 0;
+    /* /var/db/hakios-metal-cache/shadow-refresh-old: the refresh as it was before the two rules below, for a bisect */
+    static int oldRule = -1;
+    if (oldRule < 0) oldRule = access("/var/db/hakios-metal-cache/shadow-refresh-old", F_OK) == 0;
+    if (!_shadow || _iosurface == NULL || ((seed = IOSurfaceGetSeed(_iosurface)) == _shadowSeed && !forceRead)) {
 		return;
 	}
-	if (IOSurfaceLock(_iosurface, kIOSurfaceLockReadOnly, NULL) != kIOReturnSuccess) {
+	/* This copy has GPU draws a command buffer writes back at its completion, and has not yet: it is newer than the
+	 * surface. Copying the surface over it loses them, and -hakiosWriteBackShadow's difference against the base then
+	 * calls those bytes unchanged, so they never reach the surface -- and CoreAnimation redraws only dirty rects while
+	 * the page is still, so they never come back (the App Library's black lower half). Written back here instead would
+	 * read the texture the GPU may still be drawing into, so the refresh is what gives way: the completion that writes
+	 * them back moves the surface's seed, and the next binding refreshes from it. */
+	if (!oldRule && __atomic_load_n(&_shadowWrites, __ATOMIC_RELAXED) != 0) {
+		hm_fps_shadow_kept(NO);
 		return;
 	}
+	if (_shadowLock != nil) {
+		[_shadowLock lock];
+	}
+	uint32_t lockSeed = 0;
 	const double began = hm_now();
-	if (_ycbcr != 0) {
-		[self hakiosConvertYCbCr];
-	} else {
-		(void)hakios_metal_texture_replace(_texture, 0, 0, hakios_metal_texture_width(_texture), hakios_metal_texture_height(_texture),
-						   IOSurfaceGetBaseAddress(_iosurface), (uint64_t)IOSurfaceGetBytesPerRow(_iosurface));
-		/* a copy something writes keeps what it took, for -hakiosWriteBackShadow to tell its own drawing from */
-		if ((_usage & (MTLTextureUsageShaderWrite | MTLTextureUsageRenderTarget)) != 0) {
-			const size_t bytes = IOSurfaceGetBytesPerRow(_iosurface) * IOSurfaceGetHeight(_iosurface);
+	seed = IOSurfaceGetSeed(_iosurface);
+	if ((forceRead || seed != _shadowSeed) && IOSurfaceLock(_iosurface, kIOSurfaceLockReadOnly, &lockSeed) == kIOReturnSuccess) {
+		BOOL copied;
+		{
+			/* flicker-diag: the copy taken over a copy the GPU is still drawing into (its write-back to come), or taken
+			 * from a surface a writer moved under it (see the seed test below; the old even-seed guess is not one: this
+			 * kernel's seed moves by one at each write lock and never at the unlock, so its parity counts write cycles
+			 * and does not mark a held lock -- MiniIOSurface.cpp's lockCommon) */
+			static unsigned torn, overdrawn;
+			const unsigned pending = __atomic_load_n(&_shadowWrites, __ATOMIC_RELAXED);
 
-			if (_shadowBase == NULL) {
-				_shadowBase = malloc(bytes);
+			if (!oldRule && lockSeed != seed && hm_flicker_say(&torn)) {
+				hm_print("flicker-diag: shadow copy of IOSurface %u (%zux%zu) not taken, written under it (seed %u, copy's %u); %u such\n",
+					 IOSurfaceGetID(_iosurface), IOSurfaceGetWidth(_iosurface), IOSurfaceGetHeight(_iosurface), lockSeed, seed, torn);
 			}
-			if (_shadowBase != NULL) {
-				memcpy(_shadowBase, IOSurfaceGetBaseAddress(_iosurface), bytes);
+			if (pending != 0 && hm_flicker_say(&overdrawn)) {
+				hm_print("flicker-diag: shadow copy of IOSurface %u (%zux%zu) replaced while %u GPU write(s) into it are not written "
+					 "back (seed %u, copy's %u); %u such\n", IOSurfaceGetID(_iosurface), IOSurfaceGetWidth(_iosurface),
+					 IOSurfaceGetHeight(_iosurface), pending, lockSeed, _shadowSeed, overdrawn);
 			}
 		}
+		/* The seed moved between the read above and the lock: a writer wrote the surface in between, and this kernel's
+		 * locks exclude nobody, so the rows we would take may be half written -- and half written rows become the base
+		 * -hakiosWriteBackShadow tells this copy's own drawing by. Take none: keep the copy, leave its seed where it is,
+		 * and the next binding tries again (a frame late is what the refresh is for; a torn base is permanent). */
+		if (!oldRule && lockSeed != seed) {
+			copied = NO;
+			hm_fps_shadow_kept(YES);
+		} else if (_ycbcr != 0) {
+			copied = [self hakiosConvertYCbCr];
+			hm_fps_ycbcr_time(hm_now() - began);
+		} else {
+			const BOOL planar = IOSurfaceGetPlaneCount(_iosurface) > 1;
+			const void *source = planar ? IOSurfaceGetBaseAddressOfPlane(_iosurface, _iosurfacePlane) : IOSurfaceGetBaseAddress(_iosurface);
+			const size_t pitch = planar ? IOSurfaceGetBytesPerRowOfPlane(_iosurface, _iosurfacePlane) : IOSurfaceGetBytesPerRow(_iosurface);
+			copied = hakios_metal_texture_replace(_texture, 0, 0, hakios_metal_texture_width(_texture), hakios_metal_texture_height(_texture),
+									source, (uint64_t)pitch) == 0;
+			/* a copy something writes keeps what it took, for -hakiosWriteBackShadow to tell its own drawing from */
+			if ((_usage & (MTLTextureUsageShaderWrite | MTLTextureUsageRenderTarget)) != 0) {
+				const size_t bytes = pitch * hakios_metal_texture_height(_texture);
+
+				if (_shadowBase == NULL) {
+					_shadowBase = malloc(bytes);
+				}
+				if (_shadowBase != NULL) {
+					memcpy(_shadowBase, source, bytes);
+				}
+			}
+		}
+		IOSurfaceUnlock(_iosurface, kIOSurfaceLockReadOnly, NULL);
+		if (copied) {
+			/* This texture retains one IOSurface. A changed seed always converts
+			 * again; never label these pixels with a newer post-copy seed. */
+			_shadowSeed = lockSeed;
+			if (_ycbcr != 0) {
+				static unsigned converted;
+				const unsigned n = __atomic_fetch_add(&converted, 1, __ATOMIC_RELAXED);
+				if (n < 32 || n % 128 == 0)
+					hm_print("ycbcr: converted IOSurface %u seed %u (current frame)\n", IOSurfaceGetID(_iosurface), lockSeed);
+			}
+			if (hm_handoff_on()) hm_diag_add(&hm_diag.shadowImports);
+			hm_fps_shadow(YES, hm_now() - began);
+		}
 	}
-	IOSurfaceUnlock(_iosurface, kIOSurfaceLockReadOnly, NULL);
-	_shadowSeed = seed;
-	hm_fps_shadow(YES, hm_now() - began);
+	if (_shadowLock != nil) {
+		[_shadowLock unlock];
+	}
 }
 
 - (void)hakiosSetIOSurface:(IOSurfaceRef)surface plane:(NSUInteger)plane
@@ -4485,6 +6085,7 @@ static uint8_t hm_clamp8(float v) { return v <= 0 ? 0 : v >= 255 ? 255 : (uint8_
 	}
 	_iosurface = surface;
 	_iosurfacePlane = plane;
+	_shadowSeed = surface != NULL ? IOSurfaceGetSeed(surface) + 1 : 0;
 }
 - (BOOL)isShareable                 { return NO; }
 - (BOOL)isSparse                    { return NO; }
@@ -4639,6 +6240,7 @@ static uint8_t hm_clamp8(float v) { return v <= 0 ? 0 : v >= 255 ? 255 : (uint8_
 	if (![self hakiosRegion:region level:level slice:slice bytes:bytes isFor:"replaceRegion"]) {
 		return;
 	}
+	if (hm_handoff_on()) hm_diag_add(&hm_diag.cpuWrites);
 	/* a 2D array's layer SLICE, or a cube's face: the core's slice copy, one slice at the layer */
 	if (hm_layered(hakios_metal_texture_type(_texture))) {
 		if (hakios_metal_texture_replace_3d(_texture, (unsigned)level, (unsigned)region.origin.x, (unsigned)region.origin.y, (unsigned)slice, (unsigned)region.size.width,
@@ -4656,7 +6258,7 @@ static uint8_t hm_clamp8(float v) { return v <= 0 ? 0 : v >= 255 ? 255 : (uint8_
 			hm_print("refused: replaceRegion of %lux%lux%lu of a 3D texture: %s; nothing is copied\n", (unsigned long)region.size.width,
 				 (unsigned long)region.size.height, (unsigned long)region.size.depth, hakios_metal_error());
 		}
-		return;
+			return;
 	}
 	/* BYTES_PER_ROW is the CALLER's stride for the caller's memory; the texture's rows are hakios-metal's pitch apart, and
 	 * the core copies row by row between the two (a region outside the texture, or a stride shorter than its rows, is
@@ -4666,6 +6268,9 @@ static uint8_t hm_clamp8(float v) { return v <= 0 ? 0 : v >= 255 ? 255 : (uint8_
 		hm_print("refused: replaceRegion of %lux%lu at (%lu, %lu), the caller's rows %lu bytes apart: %s; nothing is copied\n",
 			 (unsigned long)region.size.width, (unsigned long)region.size.height, (unsigned long)region.origin.x,
 			 (unsigned long)region.origin.y, (unsigned long)bytesPerRow, hakios_metal_error());
+	} else if (level == 0) {
+		hm_flat_census("replaceRegion", hakios_metal_texture_resource_id(_texture), hakios_metal_texture_format(_texture), region.size.width,
+			       region.size.height, bytes, bytesPerRow);
 	}
 }
 
@@ -4680,6 +6285,7 @@ static uint8_t hm_clamp8(float v) { return v <= 0 ? 0 : v >= 255 ? 255 : (uint8_
 	if (![self hakiosRegion:region level:level slice:slice bytes:bytes isFor:"getBytes"]) {
 		return;
 	}
+	if (hm_handoff_on()) hm_diag_add(&hm_diag.cpuReads);
 	if (hm_layered(hakios_metal_texture_type(_texture))) {
 		if (hakios_metal_texture_read_3d(_texture, (unsigned)level, (unsigned)region.origin.x, (unsigned)region.origin.y, (unsigned)slice, (unsigned)region.size.width,
 						 (unsigned)region.size.height, 1, bytes, bytesPerRow, bytesPerImage) != 0) {
@@ -4695,7 +6301,7 @@ static uint8_t hm_clamp8(float v) { return v <= 0 ? 0 : v >= 255 ? 255 : (uint8_
 			hm_print("refused: getBytes of %lux%lux%lu of a 3D texture: %s; nothing is copied\n", (unsigned long)region.size.width,
 				 (unsigned long)region.size.height, (unsigned long)region.size.depth, hakios_metal_error());
 		}
-		return;
+			return;
 	}
 	if (hakios_metal_texture_read_level(_texture, (unsigned)level, (unsigned)region.origin.x, (unsigned)region.origin.y,
 					    (unsigned)region.size.width, (unsigned)region.size.height, bytes, bytesPerRow) != 0) {
@@ -4710,7 +6316,15 @@ static uint8_t hm_clamp8(float v) { return v <= 0 ? 0 : v >= 255 ? 255 : (uint8_
 - (BOOL)isCompressed                      { return NO; }   /* linear rows; no lossless compression on this GPU's path */
 - (NSInteger)compressionFeedback          { return 0; }
 - (BOOL)isDrawable                        { return NO; }   /* no CAMetalLayer hands these out */
-- (unsigned)swizzleKey                    { return 0; }    /* the identity swizzle's key */
+/* the packed MTLTextureSwizzleChannels (red in the low byte), the field MTLTextureDescriptor's -swizzleKey and -swizzle
+ * share: 0x05040302 for the identity. AppleMetalGLRenderer compares it with the swizzle GL's state wants and makes a view
+ * (-newTextureViewWithPixelFormat:...swizzle:) when they differ, so a wrong identity key is a new view at every bind */
+- (unsigned)swizzleKey
+{
+	const MTLTextureSwizzleChannels c = [self swizzle];
+
+	return (unsigned)c.red | (unsigned)c.green << 8 | (unsigned)c.blue << 16 | (unsigned)c.alpha << 24;
+}
 - (NSUInteger)numFaces                    { return 1; }    /* a cube has six; this is not one */
 - (NSUInteger)rotation                    { return 0; }
 - (uint64_t)uniqueIdentifier              { return _uniqueIdentifier; }
@@ -4796,6 +6410,12 @@ static uint8_t hm_clamp8(float v) { return v <= 0 ? 0 : v >= 255 ? 255 : (uint8_
 - (unsigned)hakiosDepthCompare { return _compare; }
 - (BOOL)hakiosDepthWrite { return _write; }
 - (BOOL)hakiosStencil { return _stencil; }
+/* <MTLDepthStencilState>'s SPI, which AppleMetalGLRenderer asks to decide its load actions: a depth test that is not
+ * Always reads depth, one that writes writes it; a stencil test reads and (with a write mask) writes stencil */
+- (BOOL)readsDepth { return _compare != MTLCompareFunctionAlways || _write; }
+- (BOOL)writesDepth { return _write; }
+- (BOOL)readsStencil { return _stencil; }
+- (BOOL)writesStencil { return _stencil && (_front.write_mask != 0 || _back.write_mask != 0); }
 - (const struct hakios_metal_stencil_face *)hakiosStencilFront { return &_front; }
 - (const struct hakios_metal_stencil_face *)hakiosStencilBack { return &_back; }
 
@@ -4988,6 +6608,7 @@ HM_REFUSES_OUT_LOUD
 	}
 	[_device release];
 	[_completionQueue release];   /* only the plug-in's own copy; Apple's ivar is -[_MTLCommandQueue dealloc]'s */
+	[_pending release];
 	if (_deferred != NULL) {
 		dispatch_release(_deferred);   /* every block on it holds a command buffer, which holds this queue: none is left */
 	}
@@ -5088,29 +6709,181 @@ HM_REFUSES_OUT_LOUD
 	return ivar != NULL ? (dispatch_queue_t)object_getIvar(self, ivar) : _completionQueue;
 }
 
-/* A command buffer that waits for an event is committed to the GPU on _deferred once the value has come; every buffer
- * committed after it, while one is held, goes the same way, so that the queue's order is the order they reach the GPU
- * in (Metal's: a queue's buffers run in commit order). */
-- (BOOL)hakiosDeferring
-{
-	return __atomic_load_n(&_deferring, __ATOMIC_ACQUIRE) != 0;
-}
-
-- (void)hakiosDefer:(dispatch_block_t)commit
+/* Reserve at enqueue, not commit. Only a committed prefix may reach the GPU: B's commit must return without
+ * submitting B when A was enqueued first but is still being encoded. No worker waits for an uncommitted buffer. */
+- (void)hakiosEnqueue:(HakiosMetalCommandBuffer *)buffer
 {
 	@synchronized (self) {
-		if (_deferred == NULL) {
-			_deferred = dispatch_queue_create("hakios.metal.deferred-commits", DISPATCH_QUEUE_SERIAL);
+		if (_pending == nil) _pending = [[NSMutableArray alloc] init];
+		[_pending addObject:buffer];
+	}
+}
+
+/* The queue still reserves enqueue order. The core retains committed private work until a dependency drains it. */
+static void hm_completed(hakios_metal_cb *cb, void *context);
+static void hm_scheduled(hakios_metal_cb *cb, void *context)
+{
+    (void)cb;
+    @autoreleasepool { [(HakiosMetalCommandBuffer *)context hakiosDeliverScheduled]; }
+}
+
+/* Install on the actual committing thread, including secondary CA render runloops. No timer or frame inference. */
+static void hm_batch_idle(void)
+{
+    static _Thread_local BOOL armed;
+    if (armed) return;
+    armed = YES;
+    CFRunLoopObserverRef observer = CFRunLoopObserverCreateWithHandler(kCFAllocatorDefault,
+        kCFRunLoopBeforeWaiting | kCFRunLoopExit, false, LONG_MAX, ^(CFRunLoopObserverRef o, CFRunLoopActivity activity) {
+            (void)o; (void)activity;
+            armed = NO;
+            hakios_metal_drain_all(HAKIOS_METAL_DRAIN_IDLE);
+        });
+    CFRunLoopAddObserver(CFRunLoopGetCurrent(), observer, kCFRunLoopCommonModes);
+    CFRelease(observer);
+}
+
+/* a command buffer that presents a drawable: its work must be in the kernel before CoreAnimation's display can put
+ * the drawable on the panel (the framebuffer waits for the surface's fence, and a submission that is not in the
+ * kernel yet is not waited for: v29 App Library, the frame went to the panel half drawn and stayed). Off with
+ * /var/db/hakios-metal-cache/defer-present-off, the old behaviour */
+static BOOL hm_present_flush_off(void)
+{
+	static int off = -1;
+
+	if (off < 0) off = access("/var/db/hakios-metal-cache/defer-present-off", F_OK) == 0;
+	return off != 0;
+}
+
+- (void)hakiosDrain:(unsigned)reason
+{
+    @synchronized (self) { hakios_metal_queue_drain(_queue, reason); }
+}
+
+- (void)hakiosSendBuffers:(NSArray *)buffers
+{
+    @synchronized (self) {
+        const unsigned count = (unsigned)[buffers count];
+        struct hakios_metal_commit *entries = malloc(count * sizeof(*entries));
+        unsigned *reasons = malloc(count * sizeof(*reasons));
+        for (unsigned i = 0; i < count; i++) {
+            HakiosMetalCommandBuffer *buffer = [buffers objectAtIndex:i];
+            [buffer hakiosPrepareSend];
+            entries[i] = (struct hakios_metal_commit){[buffer hakiosCommandBuffer], hm_completed, buffer};
+            reasons[i] = [buffer hakiosDrainReason];
+        }
+        static BOOL off;
+        static dispatch_once_t once;
+        dispatch_once(&once, ^{ off = access("/var/db/hakios-metal-cache/batch-commit-off", F_OK) == 0; });
+        hm_perf_mark phase = hm_perf_begin();
+        if (off) {
+            for (unsigned i = 0; i < count; i++)
+                hakios_metal_cb_commit(entries[i].cb, entries[i].callback, entries[i].context);
+        } else {
+            hakios_metal_queue_stage_batch(_queue, entries, count, hm_scheduled, reasons);
+            CFStringRef mode = CFRunLoopCopyCurrentMode(CFRunLoopGetCurrent());
+            if (mode != NULL || pthread_main_np()) {
+                hm_batch_idle();
+            } else if (!_idlePending) {
+                /* PencilKit also commits from dispatch work items: those threads do not run a CFRunLoop. */
+                _idlePending = YES;
+                if (_deferred == NULL) _deferred = dispatch_queue_create("hakios.metal.ordered-submissions", DISPATCH_QUEUE_SERIAL);
+                dispatch_async(_deferred, ^{
+                    @autoreleasepool {
+                        @synchronized (self) {
+                            _idlePending = NO;
+                            hakios_metal_queue_drain(_queue, HAKIOS_METAL_DRAIN_IDLE);
+                        }
+                    }
+                });
+            }
+            if (mode != NULL) CFRelease(mode);
+        }
+        hm_perf_end(HM_PERF_COMMIT_CORE, phase, 0);
+        free(reasons);
+        free(entries);
+    }
+}
+
+- (void)hakiosCommit:(HakiosMetalCommandBuffer *)buffer
+{
+	NSArray *sent = nil;
+	dispatch_queue_t flush = NULL;
+
+	/* Before it is submitted, and before this queue's lock: a surface the buffer samples through a copy of its rows may
+	 * have an earlier command buffer's GPU writes still on their way back to it, and the copies this buffer samples are
+	 * taken again once they land (v29u: the App Library's background). The wait is bounded, and it is not held under
+	 * the lock that a submission made here takes once its buffer reaches the GPU. */
+	[buffer hakiosShadowSampleSync];
+	@synchronized (self) {
+		[buffer hakiosMarkReady];
+		if ([_pending firstObject] != buffer) {
+			HM_ONCE("queue-order: commit held behind an earlier enqueue\n");
+		}
+		if (_onDeferred == 0) {
+			NSMutableArray *ready = [NSMutableArray array];
+			while ([[_pending firstObject] hakiosReadyToSubmit] && ![[_pending firstObject] hakiosWaits]) {
+				[ready addObject:[_pending firstObject]];
+				[_pending removeObjectAtIndex:0];
+			}
+			if ([ready count] != 0) {
+				sent = [ready copy];
+				/* Submit under the queue lock so a concurrent commit cannot overtake this prefix. */
+				[self hakiosSendBuffers:sent];
+			}
+		}
+		if (_deferred == NULL) _deferred = dispatch_queue_create("hakios.metal.ordered-submissions", DISPATCH_QUEUE_SERIAL);
+		while ([[_pending firstObject] hakiosReadyToSubmit]) {
+			NSMutableArray *ready = [NSMutableArray arrayWithObject:[_pending firstObject]];
+			BOOL waits = [[_pending firstObject] hakiosWaits];
+			[_pending removeObjectAtIndex:0];
+			while (!waits && [[_pending firstObject] hakiosReadyToSubmit] && ![[_pending firstObject] hakiosWaits]) {
+				[ready addObject:[_pending firstObject]];
+				[_pending removeObjectAtIndex:0];
+			}
+			NSArray *batch = [ready copy];
+			_onDeferred++;
+			dispatch_async(_deferred, ^{
+				@autoreleasepool {
+					if (waits) [[batch firstObject] hakiosSubmit];
+					else {
+						[self hakiosSendBuffers:batch];
+						hakios_metal_queue_drain(_queue, HAKIOS_METAL_DRAIN_IDLE);
+                        for (HakiosMetalCommandBuffer *next in batch) [next hakiosSent];
+					}
+				}
+				@synchronized (self) { _onDeferred--; }
+			});
+			[batch release];
+		}
+		/*
+		 * A buffer that presents a drawable is submitted before -commit returns, whatever queue the batches above
+		 * were put on: the display is handed the drawable as soon as CoreAnimation presents it, and the kernel can
+		 * only wait for work it has. (The queue is serial and the flush is outside the lock the deferred blocks
+		 * take; the synchronous path above has sent it already, and then the empty block costs a wakeup.)
+		 */
+		if ([buffer hakiosDrainReason] == HAKIOS_METAL_DRAIN_SURFACE && !hm_present_flush_off()) {
+			flush = _deferred;
 		}
 	}
-	__atomic_add_fetch(&_deferring, 1, __ATOMIC_ACQ_REL);
-	dispatch_async(_deferred, ^{
-		commit();
-		__atomic_sub_fetch(&_deferring, 1, __ATOMIC_ACQ_REL);
-	});
+	/* hm_ca_sync and rollback scheduling run outside the queue lock. Staged callbacks run on the core worker. */
+	for (HakiosMetalCommandBuffer *next in sent) [next hakiosSent];
+	[sent release];
+	if (flush != NULL) dispatch_sync(flush, ^{});
 }
 
 @end
+
+/* flicker-diag, in the window server alone: the surfaces it samples straight from their rows (applications' drawing),
+ * looked at when the command buffer goes to the GPU and when the GPU is done with it */
+static BOOL
+hm_read_race_on(void)
+{
+	static int on = -1;
+
+	if (on < 0) on = strcmp(getprogname(), "backboardd") == 0;
+	return on != 0;
+}
 
 /* ============================================================================================================
  * The command buffer: hakios-metal's, with Metal's handlers and slot bookkeeping around it
@@ -5129,25 +6902,32 @@ HM_REFUSES_OUT_LOUD
 
 - (instancetype)initWithHakiosQueue:(HakiosMetalCommandQueue *)queue
 {
+	hm_big_hint();
 	/* what IOGPUMetalCommandBuffer sends to super. THIS CALL BLOCKS when the queue's semaphore is empty, so by the
 	 * time it returns a slot is held and owed (see -hakiosPaySlot) */
+	hm_perf_mark slotBegan = hm_perf_begin();
 	self = [super initWithQueue:queue retainedReferences:YES synchronousDebugMode:NO];
+	hm_perf_end(HM_PERF_CB_SLOT, slotBegan, 0);
 	if (self == nil) {
 		return nil;
 	}
 	_queue = [queue retain];
 	_cb = hakios_metal_cb_new([queue hakiosQueue]);
 	_createdAt = hm_now();
+	_useSeq = hm_use_begin();
 	if (_cb != NULL) {
 		hakios_metal_cb_skip_refused(_cb, !hm_strict());
 		hakios_metal_cb_set_profile(_cb, hm_fps_on());
 		hakios_metal_cb_set_gmem(_cb, hm_gmem_on() || hm_gmem_draws() != 0);
 		hakios_metal_cb_set_gmem_min_draws(_cb, hm_gmem_draws());
 		hakios_metal_cb_set_gmem_binning(_cb, (hm_gmem_off() & 16) == 0);   /* metal_gmem_off's 16: every draw in every tile */
+		/* 64: multisample and depth/stencil passes left in sysmem (otherwise tiled when memoryless, the resolve from the tiles) */
+		hakios_metal_cb_set_gmem_msaa_zs(_cb, (hm_gmem_off() & 64) == 0);
 		hakios_metal_cb_set_null_fs_textures(_cb, (hm_gmem_off() & 32) != 0);   /* 32: no texture reads, to time the shaders alone */
 		hakios_metal_cb_set_gmem_off(_cb, hm_gmem_off());
 		hakios_metal_cb_set_gmem_tuned(_cb, (hm_gmem_off() & 8) == 0);   /* metal_gmem_off's 8: GMEM wherever a pass can have it */
 		hakios_metal_cb_set_profile_draws(_cb, hm_fps_draws());
+		hakios_metal_cb_set_pass_wfi(_cb, hm_pass_wfi());
 	}
 	_owesSlot = YES;
 	return self;
@@ -5189,9 +6969,15 @@ HM_REFUSES_OUT_LOUD
 	}
 	[_scheduled release];
 	[_completed release];
+	for (HakiosMetalTexture *texture in _shadowTargets) [texture hakiosShadowWriteDropped];   /* completed ones were emptied */
+	[_shadowTargets release];
+	[_shadowSamples release];
+	[_probeReads release];
+	[_probeWrites release];
 	[_signals release];
 	[_turned release];
 	[_waits release];
+	for (unsigned i = 0; i < _readCount; i++) CFRelease(_reads[i]);   /* (never sent) */
 	if (_sent != NULL) {
 		dispatch_release(_sent);
 	}
@@ -5201,6 +6987,17 @@ HM_REFUSES_OUT_LOUD
 }
 
 - (hakios_metal_cb *)hakiosCommandBuffer { return _cb; }
+- (uint64_t)hakiosUseSeq { return _useSeq; }
+
+/* AppleMetalGLRenderer's profiling pass (a GL renderer property, after -[device mapShaderSampleBufferWithBuffer:...], which
+ * says NO here): the program-info buffer is Apple's shader sampler's; the pass is an ordinary one */
+- (id)sampledRenderCommandEncoderWithDescriptor:(MTLRenderPassDescriptor *)descriptor programInfoBuffer:(void *)buffer capacity:(NSUInteger)capacity
+{
+	(void)buffer;
+	(void)capacity;
+	HM_ONCE("a sampled render encoder (Apple's shader sampling) was asked for: an ordinary one is given\n");
+	return [self renderCommandEncoderWithDescriptor:descriptor];
+}
 
 - (id)device               { return [_queue device]; }
 - (id)commandQueue         { return _queue; }
@@ -5209,7 +7006,12 @@ HM_REFUSES_OUT_LOUD
 
 /* Metal's own numbers, which hakios_metal_status copies: not enqueued 0, enqueued 1, committed 2, scheduled 3,
  * completed 4, error 5 */
-- (MTLCommandBufferStatus)status { return (MTLCommandBufferStatus)hakios_metal_cb_status(_cb); }
+- (MTLCommandBufferStatus)status
+{
+	MTLCommandBufferStatus status = (MTLCommandBufferStatus)hakios_metal_cb_status(_cb);
+	if (status >= MTLCommandBufferStatusCommitted) return status;
+	return _committed ? MTLCommandBufferStatusCommitted : _enqueued ? MTLCommandBufferStatusEnqueued : status;
+}
 
 - (NSError *)error
 {
@@ -5292,7 +7094,10 @@ hm_store_of(MTLRenderPassColorAttachmentDescriptor *c, NSUInteger i, unsigned *s
 
 	if (r != nil || resolves) {
 		if (r == nil || ![r isKindOfClass:[HakiosMetalTexture class]] || [r sampleCount] != 1 || [t sampleCount] < 2 ||
-		    [c resolveSlice] != 0 || [c resolveDepthPlane] != 0 || [r width] != [t width] || [r height] != [t height]) {
+		    [c resolveSlice] != 0 || [c resolveDepthPlane] != 0 || [r pixelFormat] != [t pixelFormat] ||
+		    [c resolveLevel] >= [r mipmapLevelCount] ||
+		    MAX((NSUInteger)1, [r width] >> [c resolveLevel]) != [t width] ||
+		    MAX((NSUInteger)1, [r height] >> [c resolveLevel]) != [t height]) {
 			snprintf(why, size, "colour attachment %lu asks for a resolve (store action %lu) %s; a multisample attachment resolved into a "
 				 "texture of this device of one sample, its size, one slice, is what is served", (unsigned long)i, (unsigned long)a,
 				 r == nil ? "with no resolveTexture" : "of an attachment or into a texture that does not fit");
@@ -5302,6 +7107,84 @@ hm_store_of(MTLRenderPassColorAttachmentDescriptor *c, NSUInteger i, unsigned *s
 	*store = a == MTLStoreActionMultisampleResolve ? (unsigned)MTLStoreActionDontCare
 	       : a == MTLStoreActionStoreAndMultisampleResolve || a == MTLStoreActionUnknown ? (unsigned)MTLStoreActionStore : (unsigned)a;
 	return YES;
+}
+
+/*
+ * OpenGL ES's passes: AppleMetalGLRenderer sets the pass's (and each pipeline's) private openGLModeEnabled, and GL's
+ * clip volume comes with it -- z from -w to w (HAKIOS_METAL_GL_DEPTH). GL's y is not the pass's business: the renderer
+ * turns a GL framebuffer over itself, drawing through a viewport of negative height (its viewport function, 0x2093b8e24:
+ * originY = GL's top edge, height = -GL's, unless the drawable is yInverted, when it hands the rectangle top-down), and
+ * flips the scissor and the front face to match; every value is taken as given (v26 measured the negative heights:
+ * "a viewport of 1125 x 0", refused before the core took them). What turns a drawable the right way up for the
+ * compositor is its attachment's yInvert, which Apple's GPU applies when it stores the target: hm_yinvert_size.
+ */
+static unsigned
+hm_gl_mode(MTLRenderPassDescriptor *d)
+{
+	SEL gl = sel_getUid("openGLModeEnabled");
+
+	if (d == nil || ![d respondsToSelector:gl] || !((BOOL (*)(id, SEL))objc_msgSend)(d, gl)) {
+		return 0;
+	}
+	HM_ONCE("gles: an OpenGL ES pass (openGLModeEnabled): GL's clip depth\n");
+	return HAKIOS_METAL_GL_DEPTH;
+}
+
+/*
+ * A yInverted attachment (the private yInvert of MTLRenderPass{Color,Depth}AttachmentDescriptorInternal, which
+ * AppleMetalGLRenderer sets from its texture's flag, 0x2093ae050). Apple's GPU stores such a target upside down: AGX's
+ * pass setup hands pbeState (the tile store) a mask of the yInverted colour attachments (AGXMetalA11 0x20928d75c..790),
+ * as -setColorResolveTexture:...yInvert: hands it its own yInvert (0x2092f2a50). The renderer draws every GL framebuffer
+ * the same way, bottom-up through a viewport of negative height (0x2093b8e24), and marks the drawable that the compositor
+ * reads top row first -- a CAEAGLLayer's -- yInverted, for the GPU to turn it on the way out. Without that turn an app's
+ * GL view is shown upside down (bilibili's ijkplayer video, v27). Here there is no store to turn, so the pass is drawn
+ * turned instead -- each draw's viewport and scissor about the target's height, its front face the other way -- which
+ * leaves the rows in memory where Apple's GPU leaves them. Not served the same: a draw in window coordinates
+ * (-setViewportTransformEnabled:NO, the renderer's own blits and clears) is drawn as it lies, and gl_FragCoord.y and
+ * dFdy read the turned rows. /var/db/hakios-metal-cache/gles-yinvert-off takes yInvert as it was taken before (not at all).
+ * SIZE: the target's width and height at its level, or 0 x 0 when the pass is not turned.
+ */
+#define HM_YINVERT_OFF HM_CACHE_DIR "/gles-yinvert-off"
+
+static void
+hm_yinvert_size(MTLRenderPassDescriptor *d, unsigned size[2])
+{
+	static int off = -1;
+	static unsigned said;
+	SEL yi = sel_getUid("yInvert");
+	id attachment, texture;
+	NSUInteger level;
+
+	size[0] = size[1] = 0;
+	if (d == nil) {
+		return;
+	}
+	attachment = [[d colorAttachments] objectAtIndexedSubscript:0];
+	if (attachment == nil || [attachment texture] == nil) {
+		attachment = [d depthAttachment];   /* (a pass of depth alone: its first attachment is what the viewport covers) */
+	}
+	texture = attachment != nil ? [attachment texture] : nil;
+	if (texture == nil || ![attachment respondsToSelector:yi] || !((BOOL (*)(id, SEL))objc_msgSend)(attachment, yi)) {
+		return;
+	}
+	if (off < 0) {
+		off = access(HM_YINVERT_OFF, F_OK) == 0;
+		hm_print("gles: a yInverted attachment (%lux%lu, %s): %s\n", (unsigned long)[texture width], (unsigned long)[texture height],
+			 [d respondsToSelector:sel_getUid("openGLModeEnabled")] &&
+				 ((BOOL (*)(id, SEL))objc_msgSend)(d, sel_getUid("openGLModeEnabled")) ? "an OpenGL ES pass" : "not an OpenGL ES pass",
+			 off ? HM_YINVERT_OFF " exists: drawn as it lies, not turned (the old way)"
+			     : "drawn turned about its height, as Apple's GPU stores it");
+	}
+	if (off) {
+		return;
+	}
+	level = [attachment level];
+	size[0] = (unsigned)MAX((NSUInteger)1, [texture width] >> level);
+	size[1] = (unsigned)MAX((NSUInteger)1, [texture height] >> level);
+	if (said < 4) {
+		said++;
+		hm_print("gles: yInvert pass %u: %ux%u (level %lu) turned about its height\n", said, size[0], size[1], (unsigned long)level);
+	}
 }
 
 static BOOL
@@ -5319,6 +7202,7 @@ hm_read_render_pass(MTLRenderPassDescriptor *d, struct hakios_metal_render_pass 
 	}
 	c0 = [[d colorAttachments] objectAtIndexedSubscript:0];
 	t0 = c0 != nil ? [c0 texture] : nil;   /* nil: a pass of depth alone, or one whose first target is a later index */
+	pass->gl_mode = hm_gl_mode(d);
 	/* the targets past 0, read as attachment 0 is (hakios-metal draws into the ones the function writes and clears the
 	 * ones that ask for a Clear; the ones it does not write it leaves as they are) */
 	for (NSUInteger i = 1; i < 8; i++) {
@@ -5377,9 +7261,12 @@ hm_read_render_pass(MTLRenderPassDescriptor *d, struct hakios_metal_render_pass 
 	}
 	depth = [[d depthAttachment] texture];
 	stencil = [[d stencilAttachment] texture];
-	if (stencil != nil && stencil != depth) {
-		snprintf(why, size, "a stencil attachment (%s) that is not the depth attachment's texture; the stencil served is the S8 "
-			 "plane of the one Depth32Float_Stencil8 texture both name", class_getName(object_getClass(stencil)));
+	if (stencil != nil && ![stencil isKindOfClass:[HakiosMetalTexture class]]) {
+		snprintf(why, size, "the stencil attachment is not a texture of this device");
+		return NO;
+	}
+	if (stencil != nil && ([[d stencilAttachment] level] != 0 || [[d stencilAttachment] slice] != 0 || [[d stencilAttachment] depthPlane] != 0)) {
+		snprintf(why, size, "a stencil attachment requires level 0, slice 0");
 		return NO;
 	}
 	if (depth != nil && ![depth isKindOfClass:[HakiosMetalTexture class]]) {
@@ -5399,10 +7286,6 @@ hm_read_render_pass(MTLRenderPassDescriptor *d, struct hakios_metal_render_pass 
 		snprintf(why, size, "renderTargetArrayLength %lu (layered rendering); one layer is served", (unsigned long)[d renderTargetArrayLength]);
 		return NO;
 	}
-	if ([d defaultRasterSampleCount] > 1) {
-		snprintf(why, size, "defaultRasterSampleCount %lu; one sample is served", (unsigned long)[d defaultRasterSampleCount]);
-		return NO;
-	}
 	if ([d rasterizationRateMap] != nil) {
 		snprintf(why, size, "a rasterization rate map is set (variable rate shading); not served");
 		return NO;
@@ -5414,7 +7297,7 @@ hm_read_render_pass(MTLRenderPassDescriptor *d, struct hakios_metal_render_pass 
 	}
 	/* Unknown (4) is Metal's "decided later by -setColorStoreAction:"; until then it is a store, which is what sysmem does
 	 * anyway: the RB writes the memory as it draws, there is no tile to store from */
-	if (t0 == nil && depth == nil && pass->more[0].texture == NULL && pass->more[1].texture == NULL && pass->more[2].texture == NULL &&
+	if (t0 == nil && depth == nil && stencil == nil && pass->more[0].texture == NULL && pass->more[1].texture == NULL && pass->more[2].texture == NULL &&
 	    pass->more[3].texture == NULL && pass->more[4].texture == NULL && pass->more[5].texture == NULL && pass->more[6].texture == NULL) {
 		snprintf(why, size, "the pass has no attachment at all (no colour texture, no depth); nothing to draw into");
 		return NO;
@@ -5476,6 +7359,19 @@ hm_read_render_pass(MTLRenderPassDescriptor *d, struct hakios_metal_render_pass 
 		pass->stencil_store_action = [sa storeAction] == MTLStoreActionUnknown ? (unsigned)MTLStoreActionStore : (unsigned)[sa storeAction];
 		pass->clear_stencil = [sa clearStencil] & 0xff;
 	}
+	if (hm_maps_trace() && [t0 sampleCount] > 1 && [t0 width] >= 1000) {
+		static unsigned said;
+		const unsigned n = __atomic_fetch_add(&said, 1, __ATOMIC_RELAXED);
+		if (n < 24) {
+			hm_print("maps-pass %u: colour %p %lux%lu samples %lu storage %lu load %u store %lu clear %.4g %.4g %.4g %.4g resolve %p; "
+				 "depth %p load/store %u/%u clear %.4g; stencil %p load/store %u/%u clear %u; GL %u yInvert %u\n", n,
+				 t0, (unsigned long)[t0 width], (unsigned long)[t0 height], (unsigned long)[t0 sampleCount], (unsigned long)[t0 storageMode],
+				 pass->load_action, (unsigned long)[c0 storeAction], clear.red, clear.green, clear.blue, clear.alpha, [c0 resolveTexture],
+				 depth, pass->depth_load_action, pass->depth_store_action, pass->clear_depth,
+				 stencil, pass->stencil_load_action, pass->stencil_store_action, pass->clear_stencil, pass->gl_mode,
+				 [c0 respondsToSelector:sel_getUid("yInvert")] ? (unsigned)((BOOL(*)(id,SEL))objc_msgSend)(c0, sel_getUid("yInvert")) : 0);
+		}
+	}
 	*texture = t0;
 	return YES;
 }
@@ -5514,25 +7410,23 @@ static void
 hm_shadow_targets(MTLRenderPassDescriptor *d, id<MTLCommandBuffer> cb)
 {
 	for (NSUInteger i = 0; i < 8; i++) {
-		id t = [[[d colorAttachments] objectAtIndexedSubscript:i] texture];
-
-		if (t != nil && [t isKindOfClass:[HakiosMetalTexture class]] && [(HakiosMetalTexture *)t hakiosIsTurned]) {
+		MTLRenderPassColorAttachmentDescriptor *a = [[d colorAttachments] objectAtIndexedSubscript:i];
+		id t = [a texture];
+		/* only this driver's own textures are asked anything: an attachment may be a view, a
+		 * placeholder or another device's texture */
+		if (t == nil || ![t isKindOfClass:[HakiosMetalTexture class]]) continue;
+		id resolve = [a resolveTexture];
+		[(HakiosMetalCommandBuffer *)cb hakiosTrackTexture:t write:YES];
+		if ([a loadAction] == MTLLoadActionLoad) [(HakiosMetalCommandBuffer *)cb hakiosTrackTexture:t write:NO];
+		if ([resolve isKindOfClass:[HakiosMetalTexture class]]) [(HakiosMetalCommandBuffer *)cb hakiosTrackTexture:resolve write:YES];
+		if (hm_handoff_on()) hm_diag_add(&hm_diag.passAttachments);
+		if ([(HakiosMetalTexture *)t hakiosIsTurned]) {
 			[(HakiosMetalCommandBuffer *)cb hakiosTurnAtCommit:t];
 			continue;
 		}
-		if (t == nil || ![t isKindOfClass:[HakiosMetalTexture class]] || ![(HakiosMetalTexture *)t hakiosIsShadow]) {
-			continue;
-		}
+		if (![(HakiosMetalTexture *)t hakiosIsShadow]) continue;
 		[(HakiosMetalTexture *)t hakiosRefreshShadow];
-		{
-			HakiosMetalTexture *drawn = [(HakiosMetalTexture *)t retain];
-
-			[cb addCompletedHandler:^(id<MTLCommandBuffer> done) {
-				(void)done;
-				[drawn hakiosWriteBackShadow];
-				[drawn release];
-			}];
-		}
+		[(HakiosMetalCommandBuffer *)cb hakiosWriteShadowAtCompletion:t];
 	}
 }
 
@@ -5554,9 +7448,13 @@ hm_shadow_targets(MTLRenderPassDescriptor *d, id<MTLCommandBuffer> cb)
 		HakiosMetalRenderCommandEncoder *encoder = [[[HakiosMetalRenderCommandEncoder alloc] initWithHakiosCommandBuffer:self pass:&pass
 													     colorTexture:texture] autorelease];
 
+		unsigned turned[2];
+
 		hm_shadow_targets(descriptor, (id<MTLCommandBuffer>)self);
 
 		[encoder hakiosTakeResolves:descriptor];   /* hm_read_render_pass judged them */
+		hm_yinvert_size(descriptor, turned);
+		[encoder hakiosSetYInvertWidth:turned[0] height:turned[1]];
 		return encoder;
 	}
 }
@@ -5592,22 +7490,20 @@ hm_shadow_targets(MTLRenderPassDescriptor *d, id<MTLCommandBuffer> cb)
 
 /* --- ordering --- */
 
-/* Metal's -enqueue reserves this buffer's place in the queue's order before it is committed. hakios-metal runs
- * command buffers in COMMIT order, so a buffer enqueued first and committed second runs second: said once, because
- * that is the one case where the order an application asked for is not the order it gets. */
+/* Explicit enqueue and commit's implicit enqueue share the same reservation. */
 - (void)enqueue
 {
-	HM_ONCE("a command buffer was enqueued; this plug-in runs command buffers in the order they are COMMITTED, so a "
-		"place reserved by enqueue is not kept\n");
+	@synchronized (self) {
+		if (_enqueued) return;
+		_enqueued = YES;
+		_sent = dispatch_semaphore_create(0);
+		[_queue hakiosEnqueue:self];
+	}
+	HM_ONCE("queue-order: enqueue reservations honoured; scheduled handlers precede completion\n");
 }
 
-/*
- * The work goes to the GPU here. hakios_metal_cb_commit submits synchronously (the status is 'scheduled' when it
- * returns) and runs the one callback on the queue's thread after completion or error -- or on THIS thread, inside
- * the call, for a buffer whose recording already failed, which is why nothing after the call assumes the callback has
- * not run yet. The object is retained across its own flight and released by the callback, so a buffer an application
- * released right after -commit lives until its handlers have run, as Metal's do.
- */
+/* Private commits are retained until a dependency or idle drain. Surface writes publish a real fence before
+ * returning. Completion/error callbacks run in queue order and release the object's flight reference. */
 /*
  * boot-arg metal_fps (a diagnostic): every two seconds of a process's command buffers, how many frames it presented, how
  * many buffers it committed, how long the GPU was busy with them, how long -commit kept the caller's thread and how
@@ -5643,7 +7539,65 @@ static struct {
 	uint64_t lastTpidr;
 	double sampledBytes[6];   /* metal_fps=timeline: the bound fragment textures' sizes, by hakiosStorageKind */
 	struct { unsigned w, h, origin; double bytes; } bySize[16];
+	unsigned flushes, barriers, warWaits, chained;   /* the passes' synchronization (hakios_metal_cb_sync_counts) */
+	unsigned ycbcrFrames;   /* successfully converted current frames */
+	unsigned shadowKeptWrites, shadowKeptTorn;   /* refreshes that took no copy: GPU writes pending, surface written under it */
+	/* samples of a shadow copy that found GPU writes into its surface still queued, the waits that drained them and the
+	 * waits that ran out (-[HakiosMetalCommandBuffer hakiosShadowSampleSync]) */
+	unsigned shadowSamplePending, shadowSampleWaits, shadowSampleTimeouts;
 } hm_fps = { PTHREAD_MUTEX_INITIALIZER, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, {{0, 0, 0, 0, 0, 0}}, 0, "", {{"", 0, 0}}, NO, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, {0}, {0}, 0, {0}, {{0, 0, 0, 0}} };
+static struct {
+    unsigned textureCalls, blitSources, blitDestinations;
+    double textureWall, textureMax;
+} hm_handoff;
+static unsigned hm_ycbcrAttempts;
+static double hm_ycbcrCpu;
+static unsigned hm_ycbcrGPUCount;
+static double hm_ycbcrGPUTime;
+static double hm_ycbcrSummarySince;
+static unsigned hm_ycbcrSummaryGPUCount;
+static double hm_ycbcrSummaryGPUTime;
+
+/* The words the three GMEM switches below are read from: the boot-args, then a file -- /var/db/hakios-metal-cache/gmem-args
+ * if it is there and readable (written over SSH; a sandboxed app may not reach /var/db), else
+ * /redwood/share/metal-gmem/args if the payload has it (EXTRA_SHARE=<dir named metal-gmem>) -- so that a bisect of
+ * metal_gmem, metal_gmem_draws and metal_gmem_off needs no room in the boot-args (XNU keeps 607 characters, and they
+ * are full). A switch in the boot-args wins: it is found first. Read once a process: a new file takes effect when the
+ * process starts again (killall backboardd). */
+static const char *
+hm_gmem_args(void)
+{
+	static char args[1536];
+	static int done = 0;
+
+	if (!done) {
+		size_t size = 1023;
+		int fd;
+
+		if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) != 0) {
+			size = 0;
+		}
+		args[size < 1023 ? size : 1023] = '\0';
+		const char *path = "/var/db/hakios-metal-cache/gmem-args";
+		fd = open(path, O_RDONLY);
+		if (fd < 0) {
+			path = "/redwood/share/metal-gmem/args";
+			fd = open(path, O_RDONLY);
+		}
+		if (fd >= 0) {
+			size_t at = strlen(args);
+			ssize_t n;
+
+			args[at++] = ' ';
+			n = read(fd, args + at, sizeof(args) - at - 1);
+			args[at + (n > 0 ? (size_t)n : 0)] = '\0';
+			close(fd);
+			hm_print("gmem: switches from %s: %s\n", path, args + at);
+		}
+		done = 1;
+	}
+	return args;
+}
 
 /* boot-arg metal_gmem=1: tiled rendering (render::Options::gmem) for a pass that can have it, GMEM or sysmem chosen by
  * what each cost such passes before (hakios_metal_cb_set_gmem_tuned). Off by default: for CoreAnimation it won nothing
@@ -5656,17 +7610,17 @@ hm_gmem_on(void)
 	static int on = -1;
 
 	if (on < 0) {
-		char args[1024] = {0};
-		size_t size = sizeof(args) - 1;
-
-		on = sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && strstr(args, "metal_gmem=1") != NULL;
+		on = strstr(hm_gmem_args(), "metal_gmem=1") != NULL;
 	}
 	return on != 0;
 }
 
-/* metal_fps=draws: each draw of a sysmem pass timed alone, by program (only sysmem passes are: without metal_gmem=1) */
+/* boot-arg metal_pass_wfi=1: every pass with its own full tail and batch start, each a wait for idle on the GPU, as
+ * before 9 November (hakios_metal_cb_set_pass_wfi). Without it draw passes are chained: the full tail once before
+ * anything else and the barriers their hazards ask for (a CCU flush, CACHE_INVALIDATE and a WFI where a pass samples
+ * what an earlier one wrote; a WFI where it writes what an earlier one sampled). For an A/B on the phone. */
 static BOOL
-hm_fps_draws(void)
+hm_pass_wfi(void)
 {
 	static int on = -1;
 
@@ -5674,7 +7628,21 @@ hm_fps_draws(void)
 		char args[1024] = {0};
 		size_t size = sizeof(args) - 1;
 
-		on = sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && strstr(args, "metal_fps=draws") != NULL;
+		on = sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && strstr(args, "metal_pass_wfi=1") != NULL;
+	}
+	return on != 0;
+}
+
+/* metal_fps=draws: each draw of a sysmem pass timed alone, by program (only sysmem passes are: without metal_gmem=1).
+ * In the boot-args or the GMEM switches' file (hm_gmem_args): with metal_gmem_draws=0 beside it there, which full-screen
+ * draws cost v25's 10 ms passes of 18 draws, with no room taken in the boot-args. */
+static BOOL
+hm_fps_draws(void)
+{
+	static int on = -1;
+
+	if (on < 0) {
+		on = strstr(hm_gmem_args(), "metal_fps=draws") != NULL;
 	}
 	return on != 0;
 }
@@ -5682,19 +7650,18 @@ hm_fps_draws(void)
 /* boot-arg metal_gmem_off=N: GMEM's refinements off by the bits of N (hakios_metal_cb_set_gmem_off; 8: the choice of GMEM
  * or sysmem by what each costs, hakios_metal_cb_set_gmem_tuned; 16: the hardware's binning,
  * hakios_metal_cb_set_gmem_binning; 32: every fragment texture the null one, wrong pictures but each draw's time without
- * its texture reads, hakios_metal_cb_set_null_fs_textures), for a bisect */
+ * its texture reads, hakios_metal_cb_set_null_fs_textures; 64: multisample and depth/stencil passes kept in sysmem,
+ * hakios_metal_cb_set_gmem_msaa_zs), for a bisect */
 static unsigned
 hm_gmem_off(void)
 {
 	static int bits = -1;
 
 	if (bits < 0) {
-		char args[1024] = {0};
-		size_t size = sizeof(args) - 1;
 		const char *at;
 
 		bits = 0;
-		if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && (at = strstr(args, "metal_gmem_off=")) != NULL) {
+		if ((at = strstr(hm_gmem_args(), "metal_gmem_off=")) != NULL) {
 			bits = atoi(at + strlen("metal_gmem_off="));
 		}
 	}
@@ -5711,12 +7678,14 @@ hm_gmem_draws(void)
 	static int draws = -1;
 
 	if (draws < 0) {
-		char args[1024] = {0};
-		size_t size = sizeof(args) - 1;
 		const char *at;
 
-		draws = 56;
-		if (sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && (at = strstr(args, "metal_gmem_draws=")) != NULL) {
+#ifdef HAKIOS_UMI
+        draws = 0;   /* A650 GMEM hung on the first unlock; explicit opt-in only. */
+#else
+        draws = 56;
+#endif
+		if ((at = strstr(hm_gmem_args(), "metal_gmem_draws=")) != NULL) {
 			draws = atoi(at + strlen("metal_gmem_draws="));
 		}
 	}
@@ -5737,11 +7706,22 @@ hm_fps_on(void)
 	return on != 0;
 }
 
+static BOOL
+hm_panel_presents(uint64_t *count)
+{
+	/* Other clients' drawable rates must not include the window server's frames. */
+	if (strcmp(getprogname(), "backboardd") != 0) return NO;
+	size_t size = sizeof(*count);
+	return sysctlbyname("kern.hakios.fb_presented", count, &size, NULL, 0) == 0 && size == sizeof(*count);
+}
+
 /* one buffer done (GPU seconds, commit-to-completion seconds, what it held) or one frame presented (present set) */
 static void
 hm_fps_note(BOOL present, double gpu, double latency, hakios_metal_cb *cb)
 {
 	const double now = hm_now();
+	static uint64_t panelLast;
+	static BOOL panelValid;
 
 	if (!hm_fps_on()) {
 		return;
@@ -5749,6 +7729,7 @@ hm_fps_note(BOOL present, double gpu, double latency, hakios_metal_cb *cb)
 	pthread_mutex_lock(&hm_fps.lock);
 	if (hm_fps.since == 0) {
 		hm_fps.since = now;
+		panelValid = hm_panel_presents(&panelLast);
 	}
 	if (present) {
 		hm_fps.presents++;
@@ -5762,6 +7743,15 @@ hm_fps_note(BOOL present, double gpu, double latency, hakios_metal_cb *cb)
 
 			hakios_metal_cb_counts(cb, &passes, &draws, &dispatches, &copies, &clears);
 			hm_fps.passes += passes + copies + clears + dispatches;
+			{
+				unsigned fl = 0, ba = 0, wa = 0, ch = 0;
+
+				hakios_metal_cb_sync_counts(cb, &fl, &ba, &wa, &ch);
+				hm_fps.flushes += fl;
+				hm_fps.barriers += ba;
+				hm_fps.warWaits += wa;
+				hm_fps.chained += ch;
+			}
 			hm_fps.draws += draws;
 			hm_fps.dispatches += dispatches;
 			hm_fps.copies += copies + clears;
@@ -5781,9 +7771,8 @@ hm_fps_note(BOOL present, double gpu, double latency, hakios_metal_cb *cb)
 				static int passesOn = -1;
 				static unsigned seen;
 				if (passesOn < 0) {
-					char args[1024] = "";
-					size_t size = sizeof(args) - 1;
-					passesOn = sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && strstr(args, "metal_fps=passes") != NULL;
+					/* (read where the GMEM switches are, so that the args file can turn it on without boot-arg room) */
+					passesOn = strstr(hm_gmem_args(), "metal_fps=passes") != NULL;
 				}
 				int n = passesOn ? hakios_metal_cb_pass_time(cb, 0, NULL, NULL, NULL, NULL, NULL) : 0;
 				double total = 0, us;
@@ -5912,24 +7901,97 @@ hm_fps_note(BOOL present, double gpu, double latency, hakios_metal_cb *cb)
 		const double span = now - hm_fps.since;
 
 		const double per = hm_fps.buffers ? (double)hm_fps.buffers : 1.0;
+		uint64_t panelNow = 0, presented = hm_fps.presents;
+		const BOOL havePanel = hm_panel_presents(&panelNow);
+		const BOOL usePanel = havePanel && panelValid && panelNow >= panelLast;
+		if (usePanel) presented = panelNow - panelLast;
+		panelLast = panelNow;
+		panelValid = havePanel;
 
-		hm_print("fps: %.1f frames/s over %.1f s (%u presented, %u command buffers); GPU busy %.0f ms (%.0f%%), -commit on the "
+		hm_print("fps: %.1f frames/s over %.1f s (%llu presented via %s, %u drawable presents, %u command buffers); commit-to-fence wall %.0f ms (%.0f%% of window, not GPU occupancy), -commit on the "
 			 "caller's thread %.0f ms, commit to completion %.1f ms on average, %.1f at most; a buffer holds %.1f passes "
-			 "(each with its flush and wait for idle), %.1f draws, %.1f dispatches, %.1f copies or clears; %.1f passes in GMEM "
-			 "(%.1f tiles)\n",
-			 hm_fps.presents / span, span, hm_fps.presents, hm_fps.buffers, hm_fps.gpu * 1e3, 100.0 * hm_fps.gpu / span,
+			 "(%.1f full flushes with a wait for idle, %.1f barriers, %.1f WAR waits, %.1f chained%s), %.1f draws, %.1f dispatches, "
+			 "%.1f copies or clears; %.1f passes in GMEM (%.1f tiles)\n",
+			 presented / span, span, (unsigned long long)presented,
+			 usePanel ? "panel" : "command-buffer presentDrawable only (panel count unavailable)", hm_fps.presents, hm_fps.buffers,
+			 hm_fps.gpu * 1e3, 100.0 * hm_fps.gpu / span,
 			 hm_fps.commit * 1e3, hm_fps.buffers ? hm_fps.latency * 1e3 / hm_fps.buffers : 0.0, hm_fps.latencyMax * 1e3,
-			 hm_fps.passes / per, hm_fps.draws / per, hm_fps.dispatches / per, hm_fps.copies / per, hm_fps.gmemPasses / per,
-			 hm_fps.tiles / per);
+			 hm_fps.passes / per, hm_fps.flushes / per, hm_fps.barriers / per, hm_fps.warWaits / per, hm_fps.chained / per,
+			 hm_pass_wfi() ? ", metal_pass_wfi=1" : "", hm_fps.draws / per, hm_fps.dispatches / per, hm_fps.copies / per,
+			 hm_fps.gmemPasses / per, hm_fps.tiles / per);
+		hm_drawables_report();
+		hm_refusal_report();   /* the period's refused draws, counted: the lines themselves are deduplicated */
+		if (hm_handoff_on()) {
+			/* every handoff probe of the period, in one line: per-frame and per-texture
+			 * events are counted, never printed one by one */
+			hm_print("handoff: cb=%u encode=%u/%u submit=%u/%u fence=%u/%u visible=%u shadow=%u/%u pass-attach=%u "
+				 "imports=%u/%u/%u cpu=%u/%u waits=%u notes=%u/%u/%u tx=%u/%u/%u signals=%u pool=%u "
+				 "drawable=%u/%u/%u/%u/%u/%u/%u/%u/%u/%u\n",
+				 hm_diag_take(&hm_diag.cb), hm_diag_take(&hm_diag.encodeReads), hm_diag_take(&hm_diag.encodeWrites),
+				 hm_diag_take(&hm_diag.submitReads), hm_diag_take(&hm_diag.submitWrites),
+				 hm_diag_take(&hm_diag.fenceReads), hm_diag_take(&hm_diag.fenceWrites), hm_diag_take(&hm_diag.visibleWrites),
+				 hm_diag_take(&hm_diag.shadowQueued), hm_diag_take(&hm_diag.shadowPublished),
+				 hm_diag_take(&hm_diag.passAttachments),
+				 hm_diag_take(&hm_diag.imports), hm_diag_take(&hm_diag.planeImports), hm_diag_take(&hm_diag.shadowImports),
+				 hm_diag_take(&hm_diag.cpuWrites), hm_diag_take(&hm_diag.cpuReads), hm_diag_take(&hm_diag.textureWaits),
+				 hm_diag_take(&hm_diag.contentsChanges), hm_diag_take(&hm_diag.dirtyMarks), hm_diag_take(&hm_diag.appearanceChanges),
+				 hm_diag_take(&hm_diag.txBegin), hm_diag_take(&hm_diag.txCommit), hm_diag_take(&hm_diag.txFlush),
+				 hm_diag_take(&hm_diag.signals), hm_diag_take(&hm_diag.poolReuses),
+				 hm_diag_take(&hm_diag.steps[0]), hm_diag_take(&hm_diag.steps[1]), hm_diag_take(&hm_diag.steps[2]),
+				 hm_diag_take(&hm_diag.steps[3]), hm_diag_take(&hm_diag.steps[4]), hm_diag_take(&hm_diag.steps[5]),
+				 hm_diag_take(&hm_diag.steps[6]), hm_diag_take(&hm_diag.steps[7]), hm_diag_take(&hm_diag.steps[8]),
+				 hm_diag_take(&hm_diag.steps[9]));
+		}
+		hm_print("texture-completion: calls=%u wall=%.1f ms max=%.1f ms; shadow-blit: sources=%u destinations=%u\n",
+		         hm_handoff.textureCalls, hm_handoff.textureWall * 1e3, hm_handoff.textureMax * 1e3,
+		         hm_handoff.blitSources, hm_handoff.blitDestinations);
+		memset(&hm_handoff, 0, sizeof(hm_handoff));
 		if (hm_fps.gapsOnTime + hm_fps.gapsLate + hm_fps.gapsStall != 0) {
-			hm_print("fps: ... gaps between commits while something moves: %u on time (20 ms at most), %u a frame late (to 50 ms), "
-				 "%u stalls (past 50); a buffer made to committed %.1f ms on average, %.1f at most; %u held for an event; "
+			hm_print("fps: ... gaps between commits (includes idle updates): %u <=20 ms, %u 20..50 ms, "
+				 "%u >50 ms; a buffer made to committed %.1f ms on average, %.1f at most; %u held for an event; "
 				 "%u waits for completion, %.0f ms in them; %u draw calls, %.0f us of ours each (%.0f of them the core's)\n",
 				 hm_fps.gapsOnTime, hm_fps.gapsLate, hm_fps.gapsStall, hm_fps.encode * 1e3 / per, hm_fps.encodeMax * 1e3, hm_fps.held,
 				 hm_fps.waits, hm_fps.waited * 1e3, hm_fps.drawCalls, hm_fps.drawCalls ? hm_fps.drawCpu * 1e6 / hm_fps.drawCalls : 0.0,
 				 hm_fps.drawCalls ? hm_fps.coreCpu * 1e6 / hm_fps.drawCalls : 0.0);
 		}
 		if (hm_sampling()) hm_sample_report();
+		{
+			static const char *names[HM_PERF_COUNT] = {
+				"newBo", "new-ioctl", "iova", "map", "pool-hit", "pool-miss",
+				"closePass", "commandBo", "upload", "queue-lock", "fault-query", "Gpu-submit",
+				"queue-submit", "bo-list", "submit-ioctl", "turn", "events", "commit-core", "sync",
+				"scheduled", "commit-total", "render-pipeline", "compute-pipeline", "cb-slot"
+			};
+			hm_perf_stat p[HM_PERF_COUNT];
+			hakios_metal_perf_take(p);
+			for (unsigned i = 0; i < HM_PERF_COUNT; i += 4) {
+				char line[900] = ""; size_t used = 0;
+				for (unsigned j = i; j < MIN(i + 4, HM_PERF_COUNT); ++j) {
+					if (!p[j].count) continue;
+					used += (size_t)snprintf(line + used, sizeof(line) - used, " %s=%llu/%.1f/%.1f/%.1f/%llu", names[j],
+					    (unsigned long long)p[j].count, p[j].wall / 1e6, p[j].cpu / 1e6, p[j].max / 1e6,
+					    (unsigned long long)(p[j].bytes >> 10));
+				}
+				if (used) hm_print("fps: perf count/wall-ms/cpu-ms/max-ms/KB:%s\n", line);
+			}
+		}
+		{
+			hakios_metal_stage_cache_stats s;
+			hakios_metal_stage_cache_take_stats(&s);
+			hm_print("fps: ... stage-cache: %llu disk hits, %llu seed hits, %llu compiled (%llu failed); "
+				 "lookup %.1f ms, compiler wait %.1f ms, compile %.1f ms (max %.1f); %llu saved, %llu save failures\n",
+				 (unsigned long long)s.hits, (unsigned long long)s.seed_hits, (unsigned long long)s.misses,
+				 (unsigned long long)s.failures, s.lookup_ns / 1e6, s.wait_ns / 1e6, s.compile_ns / 1e6, s.compile_max_ns / 1e6,
+				 (unsigned long long)s.writes, (unsigned long long)s.write_failures);
+			hm_print("pipeline-queue: foreground-wait-ms=%.1f queue-depth=%llu queue-peak=%llu prewarm-hits=%llu "
+			         "prewarm-loaded=%llu prewarm-compiles=%llu prewarm-failures=%llu recipe-write-failures=%llu "
+			         "recipes-written=%llu recipes-skipped=%llu\n",
+			         s.foreground_wait_ns / 1e6, (unsigned long long)s.queue_depth, (unsigned long long)s.queue_peak,
+			         (unsigned long long)s.prewarm_hits, (unsigned long long)s.prewarm_loaded,
+			         (unsigned long long)s.prewarm_compiles, (unsigned long long)s.prewarm_failures,
+			         (unsigned long long)s.warm_write_failures, (unsigned long long)s.warm_writes,
+			         (unsigned long long)s.warm_write_skips);
+		}
 		if (hm_timeline_on() && hm_fps.sampledBytes[0] + hm_fps.sampledBytes[1] + hm_fps.sampledBytes[2] + hm_fps.sampledBytes[3] + hm_fps.sampledBytes[4] +
 		    hm_fps.sampledBytes[5] > 0) {
 			hm_print("fps: ... textures bound to draws (MB, by their size): surfaces %.0f, shared %.0f, over buffers %.0f, private %.0f, memoryless %.0f, "
@@ -5944,11 +8006,20 @@ hm_fps_note(BOOL present, double gpu, double latency, hakios_metal_cb *cb)
 			memset(hm_fps.bySize, 0, sizeof(hm_fps.bySize));
 		}
 		{
-			unsigned made, reused;
-			unsigned long long bytes;
+			unsigned made, reused, attachments;
+			unsigned long long bytes, attachmentBytes;
 
 			hakios_metal_buffer_counts(&made, &reused, &bytes);
-			hm_print("fps: ... buffers: %u made (%llu KB), %u taken again from the pool\n", made, bytes >> 10, reused);
+			hakios_metal_attachment_counts(&attachments, &attachmentBytes);
+			hm_print("fps: ... logical buffer requests: %u (%llu KB), %u queue-pool reuses; %u attachment requests "
+				 "(%llu KB, includes BO-cache hits; not live memory); actual BO allocations/reuses in bo-cache\n",
+				 made, bytes >> 10, reused, attachments, attachmentBytes >> 10);
+			{
+				unsigned longest, cut;
+
+				hakios_metal_stream_counts(&longest, &cut);
+				hm_print("fps: ... command streams: the longest %u words, %u cut into pieces of at most 0xfffff words\n", longest, cut);
+			}
 		}
 		if (hm_fps.drawCalls != 0) {
 			char by[200] = "";
@@ -6009,10 +8080,35 @@ hm_fps_note(BOOL present, double gpu, double latency, hakios_metal_cb *cb)
 		memset(hm_fps.slowest, 0, sizeof(hm_fps.slowest));
 		hm_fps.passUs = 0;
 		if (hm_fps.shadowIns + hm_fps.shadowOuts != 0) {
-			hm_print("fps: ... surface copies on the processor: %u taken from their surfaces in %.0f ms, %u written back in %.0f ms\n",
-				 hm_fps.shadowIns, hm_fps.shadowIn * 1e3, hm_fps.shadowOuts, hm_fps.shadowOut * 1e3);
+			hm_print("fps: ... surface copies on the processor: %u taken from their surfaces in %.0f ms, %u written back in %.0f ms; "
+				 "YCbCr frames: %u converted\n",
+				 hm_fps.shadowIns, hm_fps.shadowIn * 1e3, hm_fps.shadowOuts, hm_fps.shadowOut * 1e3, hm_fps.ycbcrFrames);
 		}
+		if (hm_fps.shadowKeptWrites + hm_fps.shadowKeptTorn != 0) {
+			hm_print("fps: ... shadow refreshes kept back: %u with GPU writes not yet written back, %u for a surface written under the copy\n",
+				 hm_fps.shadowKeptWrites, hm_fps.shadowKeptTorn);
+			hm_fps.shadowKeptWrites = hm_fps.shadowKeptTorn = 0;
+		}
+		if (hm_fps.shadowSamplePending + hm_fps.shadowSampleWaits + hm_fps.shadowSampleTimeouts != 0) {
+			hm_print("fps: ... shadow-sampled pending=%u waited=%u timeouts=%u\n", hm_fps.shadowSamplePending,
+				 hm_fps.shadowSampleWaits, hm_fps.shadowSampleTimeouts);
+			hm_fps.shadowSamplePending = hm_fps.shadowSampleWaits = hm_fps.shadowSampleTimeouts = 0;
+		}
+		if (hm_ycbcrAttempts != 0) {
+			hm_print("fps: ... YCbCr conversion wall time: %u attempts, %.1f ms total (%.2f ms each)\n", hm_ycbcrAttempts, hm_ycbcrCpu * 1e3,
+				 hm_ycbcrCpu * 1e3 / hm_ycbcrAttempts);
+			hm_ycbcrAttempts = 0;
+			hm_ycbcrCpu = 0;
+		}
+		if (hm_ycbcrGPUCount != 0) {
+			hm_print("fps: ... YCbCr GPU path: %u conversions, %.1f ms total (%.2f ms each)\n", hm_ycbcrGPUCount,
+				 hm_ycbcrGPUTime * 1e3, hm_ycbcrGPUTime * 1e3 / hm_ycbcrGPUCount);
+			hm_ycbcrGPUCount = 0;
+			hm_ycbcrGPUTime = 0;
+		}
+		hm_fps.ycbcrFrames = 0;
 		hm_fps.passes = hm_fps.draws = hm_fps.dispatches = hm_fps.copies = hm_fps.gmemPasses = hm_fps.tiles = 0;
+		hm_fps.flushes = hm_fps.barriers = hm_fps.warWaits = hm_fps.chained = 0;
 		hm_fps.shadowIn = hm_fps.shadowOut = 0;
 		hm_fps.shadowIns = hm_fps.shadowOuts = 0;
 		hm_fps.since = now;
@@ -6022,6 +8118,48 @@ hm_fps_note(BOOL present, double gpu, double latency, hakios_metal_cb *cb)
 		hm_fps.encode = hm_fps.encodeMax = hm_fps.waited = 0;
 		hm_fps.waits = hm_fps.drawCalls = 0;
 		hm_fps.drawCpu = hm_fps.coreCpu = 0;
+	}
+	pthread_mutex_unlock(&hm_fps.lock);
+}
+
+static void
+hm_fps_ycbcr(void)
+{
+	if (!hm_fps_on()) return;
+	pthread_mutex_lock(&hm_fps.lock);
+	hm_fps.ycbcrFrames++;
+	pthread_mutex_unlock(&hm_fps.lock);
+}
+
+static void
+hm_fps_ycbcr_time(double seconds)
+{
+	if (!hm_fps_on()) {
+		return;
+	}
+	pthread_mutex_lock(&hm_fps.lock);
+	hm_ycbcrAttempts++;
+	hm_ycbcrCpu += seconds;
+	pthread_mutex_unlock(&hm_fps.lock);
+}
+
+static void
+hm_fps_ycbcr_gpu(double seconds)
+{
+	if (!hm_fps_on()) return;
+	pthread_mutex_lock(&hm_fps.lock);
+	hm_ycbcrGPUCount++;
+	hm_ycbcrGPUTime += seconds;
+	hm_ycbcrSummaryGPUCount++;
+	hm_ycbcrSummaryGPUTime += seconds;
+	const double now = hm_now();
+	if (hm_ycbcrSummarySince == 0) hm_ycbcrSummarySince = now;
+	if (now - hm_ycbcrSummarySince >= 1.0) {
+		hm_print("ycbcr: GPU conversions %u, %.1f ms\n", hm_ycbcrSummaryGPUCount,
+				hm_ycbcrSummaryGPUTime * 1e3);
+		hm_ycbcrSummaryGPUCount = 0;
+		hm_ycbcrSummaryGPUTime = 0;
+		hm_ycbcrSummarySince = now;
 	}
 	pthread_mutex_unlock(&hm_fps.lock);
 }
@@ -6041,6 +8179,39 @@ hm_fps_shadow(BOOL in, double seconds)
 		hm_fps.shadowOut += seconds;
 		hm_fps.shadowOuts++;
 	}
+	pthread_mutex_unlock(&hm_fps.lock);
+}
+
+/* a refresh that took no copy: the copy has GPU writes not yet written back (NO), or a writer moved the surface's
+ * seed under the copy (YES) -- see -[HakiosMetalTexture hakiosRefreshShadow] */
+static void
+hm_fps_shadow_kept(BOOL torn)
+{
+	if (!hm_fps_on()) {
+		return;
+	}
+	pthread_mutex_lock(&hm_fps.lock);
+	if (torn) {
+		hm_fps.shadowKeptTorn++;
+	} else {
+		hm_fps.shadowKeptWrites++;
+	}
+	pthread_mutex_unlock(&hm_fps.lock);
+}
+
+/* a sample of a shadow copy found GPU writes into its surface still queued: PENDING such samples, WAITED of them
+ * drained before the write-back (and their copies taken again), TIMEOUTS that ran out -- see
+ * -[HakiosMetalCommandBuffer hakiosShadowSampleSync] */
+static void
+hm_fps_shadow_sample(unsigned pending, unsigned waited, unsigned timeouts)
+{
+	if (!hm_fps_on()) {
+		return;
+	}
+	pthread_mutex_lock(&hm_fps.lock);
+	hm_fps.shadowSamplePending += pending;
+	hm_fps.shadowSampleWaits += waited;
+	hm_fps.shadowSampleTimeouts += timeouts;
 	pthread_mutex_unlock(&hm_fps.lock);
 }
 
@@ -6173,6 +8344,26 @@ hm_fps_core(double seconds)
 	pthread_mutex_unlock(&hm_fps.lock);
 }
 
+/* Separate from CB waits: QuartzCore finish_image and the CA surface handoff
+ * wait through the resource SPI. Wall includes dependency/lock work, not GPU occupancy. */
+static void hm_fps_texture_waited(double seconds)
+{
+    pthread_mutex_lock(&hm_fps.lock);
+    hm_handoff.textureCalls++;
+    hm_handoff.textureWall += seconds;
+    hm_handoff.textureMax = MAX(hm_handoff.textureMax, seconds);
+    pthread_mutex_unlock(&hm_fps.lock);
+}
+
+static void hm_fps_shadow_blit(BOOL write)
+{
+    if (!hm_fps_on()) return;
+    pthread_mutex_lock(&hm_fps.lock);
+    if (write) hm_handoff.blitDestinations++;
+    else hm_handoff.blitSources++;
+    pthread_mutex_unlock(&hm_fps.lock);
+}
+
 /* time a client spent in -waitUntilCompleted: a renderer that waits there cannot draw its next frame meanwhile */
 static void
 hm_fps_waited(double seconds)
@@ -6274,6 +8465,12 @@ hm_completed(hakios_metal_cb *cb, void *context)
 		}
 	}
 	hm_fps_note(NO, (double)hakios_metal_cb_gpu_nanoseconds(cb) / 1e9, hm_now() - [self GPUStartTime], cb);
+	/* every program's, not only those that log a command buffer's error themselves (CoreAnimation does, Impeller
+	 * does not): which program's work a GPU reset gave up -- the one the GPU hung on -- or any other that ended so */
+	if (hakios_metal_cb_status(cb) == HAKIOS_METAL_ERROR) {
+		hm_print("command buffer '%s' ended in error: %s\n", [[self label] UTF8String] ?: "", hakios_metal_cb_error(cb));
+	}
+	[self hakiosCheckReads:YES];
 	/* hakios-metal's queue thread has no autorelease pool of its own, and the NSError built here and whatever a
 	 * handler autoreleases would otherwise leak, silently, once per command buffer */
 	@autoreleasepool {
@@ -6288,50 +8485,135 @@ hm_completed(hakios_metal_cb *cb, void *context)
 	if (![_turned containsObject:texture]) [_turned addObject:texture];
 }
 
+- (void)hakiosNoteRead:(IOSurfaceRef)surface
+{
+	@synchronized (self) {   /* (a parallel encoder's sub-encoders draw on several threads) */
+		for (unsigned i = 0; i < _readCount; i++) {
+			if (_reads[i] == surface) return;
+		}
+		if (_readCount < 8) {
+			_reads[_readCount] = (IOSurfaceRef)CFRetain(surface);
+			_readSeeds[_readCount++] = IOSurfaceGetSeed(surface);
+		}
+	}
+}
+
+/* flicker-diag: at the send (done NO), a writer inside its lock of a surface this buffer samples; at completion (done
+ * YES), a seed that moved between the send and the end of the GPU's work: the surface written while it was read */
+- (void)hakiosCheckReads:(BOOL)done
+{
+	static unsigned inside, moved;
+
+	for (unsigned i = 0; i < _readCount; i++) {
+		IOSurfaceRef s = _reads[i];
+		const uint32_t seed = IOSurfaceGetSeed(s);
+
+		if (!done) {
+			if ((seed & 1) == 0 && hm_flicker_say(&inside)) {
+				hm_print("flicker-diag: IOSurface %u (%zux%zu, %zu bytes a row) sent to the GPU to be sampled while a writer holds it "
+					 "(seed %u, %u when sampled); in use %d; %u such\n", IOSurfaceGetID(s), IOSurfaceGetWidth(s), IOSurfaceGetHeight(s),
+					 IOSurfaceGetBytesPerRow(s), seed, _readSeeds[i], hm_surface_in_use(s), inside);
+			}
+			_readSeeds[i] = seed;
+			continue;
+		}
+		if (seed != _readSeeds[i] && hm_flicker_say(&moved)) {
+			hm_print("flicker-diag: IOSurface %u (%zux%zu, %zu bytes a row) written while the GPU sampled it: seed %u when sent, %u at "
+				 "completion %.1f ms later; in use %d; %u such\n", IOSurfaceGetID(s), IOSurfaceGetWidth(s), IOSurfaceGetHeight(s),
+				 IOSurfaceGetBytesPerRow(s), _readSeeds[i], seed, (hm_now() - _sentAt) * 1e3, hm_surface_in_use(s), moved);
+		}
+		CFRelease(s);
+	}
+	if (done) _readCount = 0;
+}
+
+- (BOOL)hakiosReadyToSubmit { return _readyToSubmit; }   /* under the queue's lock */
+- (void)hakiosMarkReady { _readyToSubmit = YES; }
+- (BOOL)hakiosWaits { return [_waits count] != 0; }
+
 - (void)commit
 {
-	BOOL met = YES;
-
 	if (_committed) {
 		HM_ONCE("a command buffer was committed twice; Metal asserts on that, this plug-in does nothing the second time\n");
 		return;
 	}
+	const double beganAt = hm_now();
+	hm_perf_mark began = hm_perf_begin();
+	[self enqueue];
 	_committed = YES;
 	_committedAt = hm_now();
-	/* each turned framebuffer drawn into, laid into its surface by the 2D engine after everything that drew it */
-	for (HakiosMetalTexture *t in _turned) {
-		[t hakiosTurnInto:_cb];
-	}
-	[self retain];
+	/* Finish recording before publishing readiness to the queue. */
+	hm_perf_mark phase = hm_perf_begin();
+	for (HakiosMetalTexture *t in _turned) [t hakiosTurnInto:_cb];
+	hm_perf_end(HM_PERF_TURN, phase, 0);
+	hm_fps_encoded(_committedAt - _createdAt, [_waits count] != 0);
+	[self retain];   /* hm_completed releases the flight reference, even for a synchronous error */
+	hm_use_set(_useSeq, HM_USE_COMMITTED);   /* before the queue can complete it */
+	[_queue hakiosCommit:self];
+	hm_fps_commit(hm_now() - beganAt);
+	hm_perf_end(HM_PERF_COMMIT, began, 0);
+}
+
+/* Only the queue's committed prefix gets here, serially, in enqueue order. Event waits hold later submissions too. */
+- (void)hakiosSubmit
+{
+	hm_perf_mark phase = hm_perf_begin();
 	for (NSArray *w in _waits) {
-		met = met && [[w objectAtIndex:0] hakiosReached:[[w objectAtIndex:1] unsignedLongLongValue]];
+		[[w objectAtIndex:0] hakiosWaitFor:[[w objectAtIndex:1] unsignedLongLongValue]];
 	}
-	hm_fps_encoded(_committedAt - _createdAt, !met || [_queue hakiosDeferring]);
-	if (!met || [_queue hakiosDeferring]) {
-		/* held: committed to the GPU from the queue's own serial queue once every value it waits for has come */
-		NSArray *waits = [_waits copy];
+	hm_perf_end(HM_PERF_EVENTS, phase, 0);
+	[self hakiosSend];
+	[self hakiosSent];
+}
 
-		_sent = dispatch_semaphore_create(0);
-		[self retain];
-		[_queue hakiosDefer:^{
-			for (NSArray *w in waits) {
-				[[w objectAtIndex:0] hakiosWaitFor:[[w objectAtIndex:1] unsignedLongLongValue]];
-			}
-			[waits release];
-			hakios_metal_cb_commit(_cb, hm_completed, self);
-			dispatch_semaphore_signal(_sent);
-			[self hakiosDeliverScheduled];
-			[self release];
-		}];
-		return;
-	}
-	{
-		const double began = hm_now();
+- (unsigned)hakiosDrainReason
+{
+    const unsigned reason = __atomic_load_n(&_drainReason, __ATOMIC_ACQUIRE);
+    return reason ? reason - 1 : hm_ca_sync() ? HAKIOS_METAL_DRAIN_CPU_SYNC : HAKIOS_METAL_DRAIN_IDLE;
+}
 
-		hakios_metal_cb_commit(_cb, hm_completed, self);
-		hm_fps_commit(hm_now() - began);
+- (void)hakiosRequireSync:(unsigned)reason
+{
+    if (reason == HAKIOS_METAL_DRAIN_SURFACE) {
+        __atomic_store_n(&_drainReason, reason + 1, __ATOMIC_RELEASE);
+    } else {
+        unsigned expected = 0;
+        __atomic_compare_exchange_n(&_drainReason, &expected, reason + 1, false, __ATOMIC_RELEASE, __ATOMIC_RELAXED);
+    }
+    if (_committed) [_queue hakiosDrain:reason];
+}
+
+- (void)hakiosPrepareSend
+{
+	if (hm_handoff_on()) {
+		__atomic_fetch_add(&hm_diag.submitReads, (unsigned)[_probeReads count], __ATOMIC_RELAXED);
+		__atomic_fetch_add(&hm_diag.submitWrites, (unsigned)[_probeWrites count], __ATOMIC_RELAXED);
 	}
-	[self hakiosDeliverScheduled];
+	if (_readCount != 0) {
+		_sentAt = hm_now();
+		[self hakiosCheckReads:NO];
+	}
+}
+
+- (void)hakiosSend
+{
+	hm_perf_mark phase = hm_perf_begin();
+	[self hakiosPrepareSend];
+	hakios_metal_cb_commit(_cb, hm_completed, self);
+	hm_perf_end(HM_PERF_COMMIT_CORE, phase, 0);
+}
+
+- (void)hakiosSent
+{
+	/* Completion may already have delivered these (including a synchronous submission error). */
+	hm_perf_mark phase = hm_perf_begin();
+	if (hakios_metal_cb_status(_cb) >= HAKIOS_METAL_SCHEDULED) [self hakiosDeliverScheduled];
+	hm_perf_end(HM_PERF_SCHEDULED, phase, 0);
+	if (hm_ca_sync()) {
+		phase = hm_perf_begin();
+		hakios_metal_cb_wait(_cb);
+		hm_perf_end(HM_PERF_SYNC, phase, 0);
+	}
 }
 
 /* abstract in _MTLCommandBuffer (its body is doesNotRecognizeSelector:), so inheriting it aborts. The deadline is
@@ -6349,8 +8631,11 @@ hm_completed(hakios_metal_cb *cb, void *context)
 	if (!_committed) {
 		HM_ONCE("a command buffer was waited on for scheduling before it was committed; Metal would wait for ever, "
 			"this plug-in returns\n");
+		return;
 	}
-	/* committed: hakios_metal_cb_commit returned with it scheduled, so there is nothing left to wait for */
+	[self hakiosRequireSync:HAKIOS_METAL_DRAIN_CPU_SYNC];
+	dispatch_semaphore_wait(_sent, DISPATCH_TIME_FOREVER);
+	dispatch_semaphore_signal(_sent);
 }
 
 - (void)waitUntilCompleted
@@ -6359,11 +8644,7 @@ hm_completed(hakios_metal_cb *cb, void *context)
 		HM_ONCE("a command buffer was waited on before it was committed; Metal would wait for ever, this plug-in returns\n");
 		return;
 	}
-	if (_sent != NULL) {
-		/* a held commit: first that it has reached the GPU (passed on to the next waiter) */
-		dispatch_semaphore_wait(_sent, DISPATCH_TIME_FOREVER);
-		dispatch_semaphore_signal(_sent);
-	}
+	[self waitUntilScheduled];
 	{
 		const double began = hm_now();
 
@@ -6388,30 +8669,156 @@ hm_completed(hakios_metal_cb *cb, void *context)
 
 - (void)hakiosDeliverScheduled
 {
-	NSArray *scheduled;
-
+	/* Serialize both delivery attempts, not just taking the array: completion must not overtake its handlers. */
 	@synchronized (self) {
-		scheduled = _scheduled;
+		if (_scheduledDelivered) return;
+		_scheduledDelivered = YES;
+		NSArray *scheduled = _scheduled;
 		_scheduled = nil;
+        dispatch_semaphore_signal(_sent);
+		if (hakios_metal_cb_status(_cb) != HAKIOS_METAL_ERROR)
+            for (id handler in scheduled) [self hakiosDeliver:(MTLCommandBufferHandler)handler];
+		[scheduled release];
 	}
-	for (id handler in scheduled) {
-		[self hakiosDeliver:(MTLCommandBufferHandler)handler];
+}
+
+- (void)hakiosTrackTexture:(HakiosMetalTexture *)texture write:(BOOL)write
+{
+	/* anything but this driver's own texture is not asked a thing: a view, a placeholder,
+	 * another device's texture */
+	if (!hm_handoff_on() || texture == nil || ![texture isKindOfClass:[HakiosMetalTexture class]]) return;
+	@synchronized (self) {
+		NSMutableSet **set = write ? &_probeWrites : &_probeReads;
+		if (*set == nil) *set = [[NSMutableSet alloc] init];
+		if ([*set containsObject:texture]) return;
+		[*set addObject:texture];
+		hm_diag_add(write ? &hm_diag.encodeWrites : &hm_diag.encodeReads);
 	}
-	[scheduled release];
+}
+
+- (void)hakiosWriteShadowAtCompletion:(HakiosMetalTexture *)texture
+{
+	while ([texture parentTexture] != nil) texture = [texture parentTexture];
+	@synchronized (self) {
+		if (_shadowTargets == nil) _shadowTargets = [[NSMutableArray alloc] init];
+		if ([_shadowTargets containsObject:texture]) return;
+		[_shadowTargets addObject:texture];
+		[texture hakiosUsedBy:_useSeq];
+		[texture hakiosShadowWriteQueued];
+		if (hm_handoff_on()) hm_diag_add(&hm_diag.shadowQueued);
+	}
+}
+
+/* A texture bound to be sampled: one that is a copy of a surface's rows is the surface as of its last refresh, and
+ * another command buffer may have drawn into that surface through a copy of its own since -- those rows reach the
+ * surface only when that buffer completes. The copies this buffer samples are kept (the root copy: the write-back is
+ * the root's work) for -hakiosShadowSampleSync, which is run before this buffer is submitted. */
+- (void)hakiosTrackSample:(HakiosMetalTexture *)texture
+{
+	if (texture == nil || ![texture isKindOfClass:[HakiosMetalTexture class]] || ![texture hakiosIsShadow] ||
+	    [texture iosurface] == NULL) {
+		return;
+	}
+	while ([texture parentTexture] != nil) texture = [texture parentTexture];
+	@synchronized (self) {
+		if (_shadowSamples == nil) _shadowSamples = [[NSMutableArray alloc] init];
+		if ([_shadowSamples containsObject:texture]) return;
+		[_shadowSamples addObject:texture];
+	}
+}
+
+/* Before this buffer is submitted: a surface it samples through a copy may have GPU writes into it still queued -- a
+ * pass of an earlier command buffer drew into a copy of the same surface, and those rows reach the surface only when
+ * that buffer completes (-hakiosWriteBackShadow). Wait for them, bounded, and take the copies this buffer samples from
+ * the surface the write-back leaves. A sample of the surface before that is the App Library's background, black or a
+ * frame old (v29u).
+ *
+ * Called before the queue's lock is taken and before the submission: the wait is for a completion, delivered on
+ * hakios-metal's own thread, which needs neither this queue's lock nor anything postponed here (completion handlers go
+ * to CoreAnimation's queue). This buffer's own queued writes are not waited for: it is not submitted yet, and its own
+ * passes run in order within it. /var/db/hakios-metal-cache/shadow-sample-sync-off returns the old behaviour. */
+- (void)hakiosShadowSampleSync
+{
+	static int off = -1;
+	IOSurfaceID ids[8];
+	unsigned own[8] = {0}, count = 0, pending = 0, waited = 0, timeouts = 0;
+	NSArray *samples = nil;
+
+	if (_shadowSamples == nil) return;
+	if (off < 0) off = access("/var/db/hakios-metal-cache/shadow-sample-sync-off", F_OK) == 0;
+	if (off != 0) return;
+	@synchronized (self) {
+		samples = [[_shadowSamples copy] autorelease];
+		/* what this buffer writes back itself: a copy is one queued write, and those are not waited for */
+		for (HakiosMetalTexture *t in _shadowTargets) {
+			IOSurfaceRef s = [t iosurface];
+			unsigned i = 0;
+
+			if (s == NULL) continue;
+			const IOSurfaceID id = IOSurfaceGetID(s);
+			while (i < count && ids[i] != id) i++;
+			if (i == count) {
+				if (count == 8) continue;
+				ids[count++] = id;
+				own[i] = 0;
+			}
+			own[i]++;
+		}
+	}
+	for (HakiosMetalTexture *t in samples) {
+		IOSurfaceRef s = [t iosurface];
+		unsigned i = 0, ownHere = 0, queued;
+
+		if (s == NULL) continue;
+		{
+			const IOSurfaceID id = IOSurfaceGetID(s);
+
+			while (i < count && ids[i] != id) i++;
+			if (i < count) ownHere = own[i];
+			queued = hm_shadow_surface_pending(id);
+			if (queued <= ownHere) continue;   /* nothing another command buffer owes this surface */
+			pending++;
+			if (hm_shadow_surface_wait(id, ownHere, 0.020)) {
+				waited++;
+				[t hakiosRefreshShadow];   /* the write-back moved the surface's seed: take it again, before submission */
+			} else {
+				timeouts++;                /* no copy taken: a half-written surface is never a base (today's behaviour) */
+			}
+		}
+	}
+	if (pending != 0) hm_fps_shadow_sample(pending, waited, timeouts);
 }
 
 - (void)hakiosCompletedNow
 {
 	NSArray *completed;
 
+	/* These copies are part of the driver's work, not application completion handlers.
+	 * CA's completion queue may itself be waiting for this image's completion/event.
+	 * The probes are counters: this is the completion thread, and it lets go at once. */
+	if (hm_handoff_on()) {
+		hm_diag_add(&hm_diag.cb);
+		__atomic_fetch_add(&hm_diag.fenceWrites, (unsigned)[_probeWrites count], __ATOMIC_RELAXED);
+		__atomic_fetch_add(&hm_diag.fenceReads, (unsigned)[_probeReads count], __ATOMIC_RELAXED);
+		__atomic_fetch_add(&hm_diag.visibleWrites, (unsigned)[_probeWrites count], __ATOMIC_RELAXED);
+		__atomic_fetch_add(&hm_diag.shadowPublished, (unsigned)[_shadowTargets count], __ATOMIC_RELAXED);
+	}
+	for (HakiosMetalTexture *texture in _shadowTargets) [texture hakiosWriteBackShadow];
+	[_shadowTargets removeAllObjects];
+	[_probeWrites removeAllObjects];
+	[_probeReads removeAllObjects];
+	hm_use_set(_useSeq, HM_USE_DONE);   /* its resources' -isComplete, before any handler runs */
+	[self hakiosDeliverScheduled];
 	[self error];   /* built now, on the completing thread, so that a handler reading -error gets the sentence */
 	/* the events this buffer signals, now that its work is done: before its handlers, which may read them */
 	for (NSArray *sg in _signals) {
+		if (hm_handoff_on()) hm_diag_add(&hm_diag.signals);
 		[[sg objectAtIndex:0] hakiosSignal:[[sg objectAtIndex:1] unsignedLongLongValue]];
 	}
 	@synchronized (self) {
 		completed = _completed;
 		_completed = nil;
+        _completedDelivered = YES;
 	}
 	for (id handler in completed) {
 		[self hakiosDeliver:(MTLCommandBufferHandler)handler];
@@ -6424,36 +8831,32 @@ hm_completed(hakios_metal_cb *cb, void *context)
  * undefined, and losing it would be exactly the kind of silence this file exists to stop having. */
 - (void)addScheduledHandler:(MTLCommandBufferHandler)handler
 {
-	if (handler == NULL) {
-		return;
-	}
-	@synchronized (self) {
-		if (!_committed) {
-			if (_scheduled == nil) {
-				_scheduled = [[NSMutableArray alloc] init];
-			}
-			[_scheduled addObject:[[handler copy] autorelease]];
-			return;
-		}
-	}
-	[self hakiosDeliver:handler];
+    if (handler == NULL) return;
+    BOOL deliver;
+    @synchronized (self) {
+        deliver = _scheduledDelivered;
+        if (!deliver) {
+            if (_scheduled == nil) _scheduled = [[NSMutableArray alloc] init];
+            [_scheduled addObject:[[handler copy] autorelease]];
+        }
+    }
+    [self hakiosRequireSync:HAKIOS_METAL_DRAIN_CPU_SYNC];
+    if (deliver && hakios_metal_cb_status(_cb) != HAKIOS_METAL_ERROR) [self hakiosDeliver:handler];
 }
 
 - (void)addCompletedHandler:(MTLCommandBufferHandler)handler
 {
-	if (handler == NULL) {
-		return;
-	}
-	@synchronized (self) {
-		if (hakios_metal_cb_status(_cb) < HAKIOS_METAL_COMPLETED) {
-			if (_completed == nil) {
-				_completed = [[NSMutableArray alloc] init];
-			}
-			[_completed addObject:[[handler copy] autorelease]];
-			return;
-		}
-	}
-	[self hakiosDeliver:handler];
+    if (handler == NULL) return;
+    BOOL deliver;
+    @synchronized (self) {
+        deliver = _completedDelivered;
+        if (!deliver) {
+            if (_completed == nil) _completed = [[NSMutableArray alloc] init];
+            [_completed addObject:[[handler copy] autorelease]];
+        }
+    }
+    [self hakiosRequireSync:HAKIOS_METAL_DRAIN_CPU_SYNC];
+    if (deliver) [self hakiosDeliver:handler];
 }
 
 /* --- presenting --- */
@@ -6472,6 +8875,7 @@ hm_completed(hakios_metal_cb *cb, void *context)
 		hm_print("refused: -presentDrawable: of a %s, which does not answer -present; nothing is presented\n", class_getName(object_getClass(drawable)));
 		return;
 	}
+	[self hakiosRequireSync:HAKIOS_METAL_DRAIN_SURFACE];
 	[drawable retain];
 	[self addCompletedHandler:^(id<MTLCommandBuffer> cb) {
 		(void)cb;
@@ -6505,6 +8909,7 @@ hm_completed(hakios_metal_cb *cb, void *context)
 	}
 	if (_signals == nil) _signals = [[NSMutableArray alloc] init];
 	[_signals addObject:@[ event, @(value) ]];
+    [self hakiosRequireSync:HAKIOS_METAL_DRAIN_CPU_SYNC];
 }
 
 - (void)encodeWaitForEvent:(id)event value:(uint64_t)value
@@ -6559,6 +8964,22 @@ HM_REFUSES_OUT_LOUD
 }
 
 - (id)device { return [_commandBuffer device]; }
+- (uint64_t)hakiosUseSeq { return [_commandBuffer hakiosUseSeq]; }
+
+/* the SPI form with MTLBlitOptions (AppleMetalGLRenderer's resolves and texture copies send it): a texture copy's
+ * options name row-linear PVRTC and depth/stencil planes, none of which a texture here has */
+- (void)copyFromTexture:(id)sourceTexture sourceSlice:(NSUInteger)sourceSlice sourceLevel:(NSUInteger)sourceLevel
+	   sourceOrigin:(MTLOrigin)sourceOrigin sourceSize:(MTLSize)sourceSize toTexture:(id)destinationTexture
+       destinationSlice:(NSUInteger)destinationSlice destinationLevel:(NSUInteger)destinationLevel
+      destinationOrigin:(MTLOrigin)destinationOrigin options:(MTLBlitOption)options
+{
+	if (options != MTLBlitOptionNone) {
+		HM_ONCE("a texture copy with blit options %#lx: copied without them\n", (unsigned long)options);
+	}
+	[self copyFromTexture:sourceTexture sourceSlice:sourceSlice sourceLevel:sourceLevel sourceOrigin:sourceOrigin sourceSize:sourceSize
+		    toTexture:destinationTexture destinationSlice:destinationSlice destinationLevel:destinationLevel
+		destinationOrigin:destinationOrigin];
+}
 
 /* a buffer of another device, or an object standing in for one, cannot be bound here; said by name */
 static hakios_metal_buffer *
@@ -6572,6 +8993,7 @@ hm_buffer_of(id self, id object, const char *what)
 		hm_print("refused: the %s buffer is a %s, not a buffer of this device\n", what, class_getName(object_getClass(object)));
 		return NULL;
 	}
+	[(HakiosMetalBuffer *)object hakiosUsedBy:[self hakiosUseSeq]];
 	return [(HakiosMetalBuffer *)object hakiosBuffer];
 }
 
@@ -6608,12 +9030,14 @@ hm_buffer_of(id self, id object, const char *what)
 /* Correct as nothing, and a statement about this device rather than a shortcut: a fence orders passes within a queue,
  * and this queue runs every command buffer, and every command in it, in order -- hakios-metal invalidates the GPU's
  * caches before a dispatch and flushes them after it, so what a blit wrote is what the next dispatch reads. */
-- (void)updateFence:(id)fence  { (void)fence; }
-- (void)waitForFence:(id)fence { (void)fence; }
+- (void)updateFence:(id)fence  { (void)fence; [_commandBuffer hakiosRequireSync:HAKIOS_METAL_DRAIN_CPU_SYNC]; }
+- (void)waitForFence:(id)fence { (void)fence; [_commandBuffer hakiosRequireSync:HAKIOS_METAL_DRAIN_CPU_SYNC]; }
 
-/* a texture of this device, or a refusal by name (the command buffer ends in error) */
+/* A blit reads the same refreshed IOSurface rows as a sampled binding. Partial
+ * writes first preserve the other pixels, then publish the shadow at completion,
+ * as render and compute encoders do. PencilKit uses this for its canvas snapshot. */
 static hakios_metal_texture *
-hm_blit_texture(hakios_metal_cb *cb, id object, const char *what)
+hm_blit_texture(id self, HakiosMetalCommandBuffer *commandBuffer, hakios_metal_cb *cb, id object, const char *what, BOOL write)
 {
 	if (object == nil || ![object isKindOfClass:[HakiosMetalTexture class]]) {
 		char why[160];
@@ -6624,7 +9048,16 @@ hm_blit_texture(hakios_metal_cb *cb, id object, const char *what)
 		hakios_metal_cb_refuse(cb, why);
 		return NULL;
 	}
-	return [(HakiosMetalTexture *)object hakiosTexture];
+	HakiosMetalTexture *texture = object;
+	[texture hakiosRefreshShadow];
+	if ([texture hakiosIsShadow]) hm_fps_shadow_blit(write);
+	if (write && [texture hakiosIsShadow]) {
+		[commandBuffer hakiosWriteShadowAtCompletion:texture];
+	}
+	if (!write) [commandBuffer hakiosTrackSample:texture];   /* a surface another buffer may still be writing back */
+	[commandBuffer hakiosTrackTexture:texture write:write];
+	[texture hakiosUsedBy:[self hakiosUseSeq]];
+	return [texture hakiosTexture];
 }
 
 /* Texture copies are hakios-metal's 2D engine (hakios_metal_cb_blit: turnip's r2d copy, one pixel format, texel for
@@ -6635,8 +9068,8 @@ hm_blit_texture(hakios_metal_cb *cb, id object, const char *what)
       destinationOrigin:(MTLOrigin)destinationOrigin
 {
 	hakios_metal_cb *cb = [_commandBuffer hakiosCommandBuffer];
-	hakios_metal_texture *from = hm_blit_texture(cb, sourceTexture, "source");
-	hakios_metal_texture *to = from != NULL ? hm_blit_texture(cb, destinationTexture, "destination") : NULL;
+	hakios_metal_texture *from = hm_blit_texture(self, _commandBuffer, cb, sourceTexture, "source", NO);
+	hakios_metal_texture *to = from != NULL ? hm_blit_texture(self, _commandBuffer, cb, destinationTexture, "destination", YES) : NULL;
 
 	if (to == NULL) {
 		return;
@@ -6695,7 +9128,7 @@ hm_blit_texture(hakios_metal_cb *cb, id object, const char *what)
 - (void)generateMipmapsForTexture:(id)texture
 {
 	hakios_metal_cb *cb = [_commandBuffer hakiosCommandBuffer];
-	hakios_metal_texture *t = hm_blit_texture(cb, texture, "texture");
+	hakios_metal_texture *t = hm_blit_texture(self, _commandBuffer, cb, texture, "texture", YES);
 
 	if (t != NULL && hakios_metal_cb_generate_mipmaps(cb, t) != 0) {
 		hm_print("refused: generateMipmaps of a %lux%lu texture of %lu levels: %s\n", (unsigned long)[texture width],
@@ -6757,7 +9190,7 @@ hm_rows_texture(HakiosMetalBlitCommandEncoder *self, hakios_metal_cb *cb, hakios
 {
 	hakios_metal_cb *cb = [_commandBuffer hakiosCommandBuffer];
 	hakios_metal_buffer *from = hm_buffer_of(self, sourceBuffer, "source");
-	hakios_metal_texture *to = from != NULL ? hm_blit_texture(cb, destinationTexture, "destination") : NULL;
+	hakios_metal_texture *to = from != NULL ? hm_blit_texture(self, _commandBuffer, cb, destinationTexture, "destination", YES) : NULL;
 	hakios_metal_buffer *staging;
 	hakios_metal_texture *rows;
 	uint64_t pitch;
@@ -6824,6 +9257,9 @@ hm_rows_texture(HakiosMetalBlitCommandEncoder *self, hakios_metal_cb *cb, hakios
 					 (unsigned long)sourceSize.height, (unsigned long)destinationOrigin.x, (unsigned long)destinationOrigin.y, format,
 					 base == NULL ? "the buffer is mapped nowhere" : hakios_metal_error());
 				hakios_metal_cb_refuse(cb, "a buffer-to-texture copy into a block-compressed texture");
+			} else if (destinationLevel == 0) {
+				hm_flat_census("a buffer-to-texture copy", hakios_metal_texture_resource_id(to), format, sourceSize.width, sourceSize.height,
+					       base + sourceOffset, sourceBytesPerRow);
 			}
 			return;
 		}
@@ -6869,7 +9305,7 @@ hm_rows_texture(HakiosMetalBlitCommandEncoder *self, hakios_metal_cb *cb, hakios
     destinationBytesPerImage:(NSUInteger)destinationBytesPerImage
 {
 	hakios_metal_cb *cb = [_commandBuffer hakiosCommandBuffer];
-	hakios_metal_texture *from = hm_blit_texture(cb, sourceTexture, "source");
+	hakios_metal_texture *from = hm_blit_texture(self, _commandBuffer, cb, sourceTexture, "source", NO);
 	hakios_metal_buffer *to = from != NULL ? hm_buffer_of(self, destinationBuffer, "destination") : NULL;
 	hakios_metal_buffer *staging;
 	hakios_metal_texture *rows;
@@ -7100,13 +9536,9 @@ hm_rows_texture(HakiosMetalBlitCommandEncoder *self, hakios_metal_cb *cb, hakios
 	/* a surface read through a copy: the copy as the surface is now, and what a kernel writes back into the surface
 	 * once the command buffer is done */
 	[(HakiosMetalTexture *)texture hakiosRefreshShadow];
+	[_commandBuffer hakiosTrackSample:texture];   /* a surface another buffer may still be writing back */
 	if ([(HakiosMetalTexture *)texture hakiosIsShadow] && ([(HakiosMetalTexture *)texture usage] & MTLTextureUsageShaderWrite) != 0) {
-		HakiosMetalTexture *written = [(HakiosMetalTexture *)texture retain];
-		[_commandBuffer addCompletedHandler:^(id<MTLCommandBuffer> cb) {
-			(void)cb;
-			[written hakiosWriteBackShadow];
-			[written release];
-		}];
+		[_commandBuffer hakiosWriteShadowAtCompletion:texture];
 	}
 	if (texture != nil && index + 1 > _highestTexture) {
 		_highestTexture = (unsigned)index + 1;
@@ -7219,10 +9651,22 @@ hm_rows_texture(HakiosMetalBlitCommandEncoder *self, hakios_metal_cb *cb, hakios
 	}
 	for (unsigned i = 0; i < _highest; i++) {
 		buffers[i] = _buffers[i] != nil ? [_buffers[i] hakiosBuffer] : NULL;
+		[_buffers[i] hakiosUsedBy:[_commandBuffer hakiosUseSeq]];
 		offsets[i] = _offsets[i];
 	}
 	for (unsigned i = 0; i < _highestTexture; i++) {
 		textures[i] = _textures[i] != nil ? [_textures[i] hakiosTexture] : NULL;
+		[_textures[i] hakiosUsedBy:[_commandBuffer hakiosUseSeq]];
+	}
+	if (hm_handoff_on()) {
+		hakios_metal_kernel *kernel = [_pipeline hakiosKernel];
+		for (unsigned i = 0; i < hakios_metal_kernel_resource_count(kernel); i++) {
+			unsigned kind, index, type, access;
+			hakios_metal_kernel_resource(kernel, i, &kind, &index, NULL);
+			if (hakios_metal_kernel_resource_texture(kernel, i, &type, NULL, &access) != 0 || type == ~0u || index >= _highestTexture) continue;
+			if (access & 1) [_commandBuffer hakiosTrackTexture:_textures[index] write:NO];
+			if (access & 2) [_commandBuffer hakiosTrackTexture:_textures[index] write:YES];
+		}
 	}
 	for (unsigned i = 0; i < _highestSampler; i++) {
 		samplers[i] = _samplers[i] != nil ? [_samplers[i] hakiosSampler] : NULL;
@@ -7281,8 +9725,8 @@ hm_rows_texture(HakiosMetalBlitCommandEncoder *self, hakios_metal_cb *cb, hakios
  */
 - (void)memoryBarrierWithScope:(MTLBarrierScope)scope { (void)scope; }
 - (void)memoryBarrierWithResources:(const id *)resources count:(NSUInteger)count { (void)resources; (void)count; }
-- (void)updateFence:(id)fence  { (void)fence; }
-- (void)waitForFence:(id)fence { (void)fence; }
+- (void)updateFence:(id)fence  { (void)fence; [_commandBuffer hakiosRequireSync:HAKIOS_METAL_DRAIN_CPU_SYNC]; }
+- (void)waitForFence:(id)fence { (void)fence; [_commandBuffer hakiosRequireSync:HAKIOS_METAL_DRAIN_CPU_SYNC]; }
 - (void)useResource:(id)resource usage:(MTLResourceUsage)usage { (void)resource; (void)usage; }
 - (void)useResources:(const id *)resources count:(NSUInteger)count usage:(MTLResourceUsage)usage { (void)resources; (void)count; (void)usage; }
 - (void)useHeap:(id)heap { (void)heap; }
@@ -7355,6 +9799,11 @@ hm_rows_texture(HakiosMetalBlitCommandEncoder *self, hakios_metal_cb *cb, hakios
 
 HM_REFUSES_OUT_LOUD
 
+/* AppleMetalGLRenderer's shader debug info (with -[device setShaderDebugInfoCaching:YES], a GL renderer property): Apple's
+ * compiler's; there is none here */
+- (id)newVertexShaderDebugInfo   { return nil; }
+- (id)newFragmentShaderDebugInfo { return nil; }
+
 - (instancetype)initWithHakiosDevice:(HakiosMetalDevice *)device program:(hakios_metal_program *)program
 			  descriptor:(MTLRenderPipelineDescriptor *)descriptor
 {
@@ -7368,6 +9817,10 @@ HM_REFUSES_OUT_LOUD
 	}
 	_hakiosDevice = [device retain];
 	_program = program;
+	/* no buffer decides this pipeline's program until -hakiosKeepFragment: says one does. Left at the allocator's 0, every
+	 * draw of a pipeline it was never called for (the exact CA ones: fixed_vert_lph_spc+fixed_frag_lph_cph, 611 draws in
+	 * logs/test-1111-100715-umi-v21) queued a specialisation with no bitcode that failed and printed a line */
+	_specBinding = -1;
 	_hakiosUniqueIdentifier = hm_next_resource_id();
 	return self;
 }
@@ -7422,6 +9875,7 @@ hm_spec_off(void)
 		}
 	}
 	if (_specBinding < 0) return;
+	hakios_metal_program_constant_reads(_program, 1, (unsigned)_specBinding, _specMask, _specLength);
 	_fsAir = [air retain];
 	_fsConstantCount = count < 64 ? count : 64;
 	memcpy(_fsConstants, constants, _fsConstantCount * sizeof(*constants));
@@ -7430,7 +9884,10 @@ hm_spec_off(void)
 
 /* the program for a draw whose fragment buffers are BUFFERS: the one compiled for what the deciding buffer holds, or
  * the pipeline's own while that one compiles (on a queue of its own: a compilation is 0.4 s on the host, and a frame
- * must not wait for it). 64 contents at most a pipeline; past them the pipeline's own. */
+ * must not wait for it). 64 contents at most a pipeline; past them the pipeline's own. A content seen for the first time
+ * whose stage an earlier boot compiled (the stage cache in /var/db, or the image's seed) is taken from there at once,
+ * here: queued, it waited behind the queue's real compiles (200 to 380 ms each) while its draws ran the 31 000-word uber
+ * shader -- the 33 to 39 ms passes of the windows with specialisations in v21. */
 - (hakios_metal_program *)hakiosProgramFor:(hakios_metal_buffer *const *)buffers offsets:(const uint64_t *)offsets count:(unsigned)count
 {
 	static dispatch_queue_t compiling;
@@ -7440,7 +9897,11 @@ hm_spec_off(void)
 	const uint8_t *bytes = (const uint8_t *)hakios_metal_buffer_contents(buffers[_specBinding]);
 	const uint64_t length = hakios_metal_buffer_length(buffers[_specBinding]), at = offsets[_specBinding];
 	if (bytes == NULL || at > length || length - at < _specLength) return _program;
-	NSData *key = [NSData dataWithBytes:bytes + at length:_specLength];
+	/* the bytes the stage never reads (CoreAnimation's FragmentShaderConfig: 18 of its 52, padding) are whatever the
+	 * buffer held before: in the key they made one configuration many, compiled again every boot under new names */
+	uint8_t content[256];
+	for (unsigned i = 0; i < _specLength; i++) content[i] = bytes[at + i] & _specMask[i];
+	NSData *key = [NSData dataWithBytes:content length:_specLength];
 	hakios_metal_program *found = _program;
 	BOOL start = NO;
 
@@ -7455,29 +9916,49 @@ hm_spec_off(void)
 		}
 	}
 	if (start) {
+		hakios_metal_program *cached = hakios_metal_program_specialize_cached(_program, [_fsAir bytes], [_fsAir length], _fsConstants,
+										      _fsConstantCount, (unsigned)_specBinding, [key bytes], _specMask,
+										      [key length]);
+
+		if (cached != NULL) {
+			@synchronized(self) {
+				[_specialised setObject:[NSValue valueWithPointer:cached] forKey:key];
+			}
+			if (hm_fps_on()) hm_print("specialise: %s from the stage cache at its first draw\n", hakios_metal_program_name(_program));
+			return cached;
+		}
 		dispatch_once(&once, ^{
-			compiling = dispatch_queue_create("hakios.metal.specialise", DISPATCH_QUEUE_SERIAL);
+			compiling = dispatch_queue_create("hakios.metal.specialise",
+				dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_UTILITY, 0));
 		});
 		[self retain];
 		dispatch_async(compiling, ^{
-			struct timespec t0, t1;
+			@autoreleasepool {
+				struct timespec t0, t1;
 
-			clock_gettime(CLOCK_MONOTONIC, &t0);
-			hakios_metal_program *p = hakios_metal_program_specialize(_program, [_fsAir bytes], [_fsAir length], _fsConstants, _fsConstantCount,
-										 (unsigned)_specBinding, [key bytes], [key length]);
-			clock_gettime(CLOCK_MONOTONIC, &t1);
-			if (p == NULL) {
-				hm_print("specialise: %s for its buffer %d: %s; its own program goes on\n", hakios_metal_program_name(_program), _specBinding,
-					 hakios_metal_error());
-			} else if (hm_fps_on()) {
-				hm_print("specialise: %s for %u bytes of its buffer %d: %u instruction words, not %u, in %.0f ms\n", hakios_metal_program_name(_program),
-					 _specLength, _specBinding, hakios_metal_program_stage_words(p, 1), hakios_metal_program_stage_words(_program, 1),
-					 (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6);
+				const bool previousPriority = hakios_metal_compiler_set_background(true);
+				clock_gettime(CLOCK_MONOTONIC, &t0);
+				hakios_metal_program *p = hakios_metal_program_specialize(_program, [_fsAir bytes], [_fsAir length], _fsConstants, _fsConstantCount,
+											 (unsigned)_specBinding, [key bytes], _specMask, [key length]);
+				hakios_metal_compiler_set_background(previousPriority);
+				clock_gettime(CLOCK_MONOTONIC, &t1);
+				if (p == NULL) {
+					hm_print("specialise: %s for its buffer %d: %s; its own program goes on\n", hakios_metal_program_name(_program), _specBinding,
+						 hakios_metal_error());
+				} else if (hm_fps_on()) {
+					unsigned read = 0;
+
+					for (unsigned i = 0; i < _specLength; i++) read += _specMask[i] != 0;
+					hm_print("specialise: %s for %u bytes (%u read) of its buffer %d: %u instruction words, not %u, in %.0f ms\n",
+						 hakios_metal_program_name(_program), _specLength, read, _specBinding, hakios_metal_program_stage_words(p, 1),
+						 hakios_metal_program_stage_words(_program, 1),
+						 (t1.tv_sec - t0.tv_sec) * 1e3 + (t1.tv_nsec - t0.tv_nsec) / 1e6);
+				}
+				@synchronized(self) {
+					if (p != NULL) [_specialised setObject:[NSValue valueWithPointer:p] forKey:key];
+				}
+				[self release];
 			}
-			@synchronized(self) {
-				if (p != NULL) [_specialised setObject:[NSValue valueWithPointer:p] forKey:key];
-			}
-			[self release];
 		});
 	}
 	return found;
@@ -7565,6 +10046,12 @@ hm_spec_off(void)
 	_pass = *pass;
 	_frontFacingWinding = MTLWindingClockwise;   /* Metal's default */
 	return self;
+}
+
+- (void)hakiosSetYInvertWidth:(unsigned)width height:(unsigned)height
+{
+	_flipWidth = width;
+	_flipHeight = width != 0 ? height : 0;
 }
 
 - (void)hakiosTakeResolves:(MTLRenderPassDescriptor *)descriptor
@@ -7795,6 +10282,7 @@ hm_spec_off(void)
 	[table[index] release];
 	table[index] = texture;
 	[(HakiosMetalTexture *)texture hakiosRefreshShadow];
+	[_commandBuffer hakiosTrackSample:texture];   /* a surface another buffer may still be writing back */
 	if (texture != nil && index + 1 > *highest) {
 		*highest = (unsigned)index + 1;
 	}
@@ -7906,6 +10394,73 @@ hm_spec_off(void)
 {
 	_frontFacingWinding = winding;
 	_pass.winding = (unsigned)winding;
+}
+
+/* --- OpenGL ES's encoder SPI (AppleMetalGLRenderer sends these to Apple's encoder; each is a selector of a protocol that
+ * is not in this process, so without a method here it would raise) --- */
+
+/* NO for the renderer's own blits and clears (its default.metallib's clearVertex/texturedVertex2D over setVertexBytes):
+ * the positions are window coordinates, drawn with the clipper, the viewport transform and the division off */
+- (void)setViewportTransformEnabled:(BOOL)enabled
+{
+	_glNoTransform = !enabled;
+}
+
+/* lines are not drawn here (step one serves triangles), so their width is nothing to keep */
+- (void)setLineWidth:(float)width
+{
+	if (width != 1.0f) {
+		HM_ONCE("gles: a line width of %g; lines are not served here\n", (double)width);
+	}
+}
+
+/* an indexed draw restarts at the all-ones index already (hakios-metal, as Metal has it): GL ES 3's fixed-index restart */
+- (void)setPrimitiveRestartEnabled:(BOOL)enabled { (void)enabled; }
+
+/* GL's flat varyings take a primitive's LAST vertex's value (mode 1, as the renderer sends it for GL; 0 is Metal's first):
+ * PC_PRIMITIVE_CNTL_0.PROVOKING_VTX_LAST, HAKIOS_METAL_GL_PROVOKING_LAST at each draw */
+- (void)setProvokingVertexMode:(NSUInteger)mode
+{
+	if (mode > 1) {
+		HM_ONCE("gles: provoking vertex mode %lu: taken as the last vertex\n", (unsigned long)mode);
+	}
+	_glProvokingLast = mode != 0;
+}
+
+/* hints that the attachment was just cleared (Apple's tile memory skips a load); the load action already says it here */
+- (void)setDepthCleared { }
+- (void)setStencilCleared { }
+
+/* GL ES 1's alpha test: the pipeline's flag is said not served (hakiosRenderPipelineWhy), its reference with it */
+- (void)setAlphaTestReferenceValue:(float)value { (void)value; }
+
+/* a debugging mode of Apple's command stream */
+- (void)setCommandDataCorruptModeSPI:(NSUInteger)mode { (void)mode; }
+
+/* glBlitFramebuffer's multisample resolve, named while the pass is open: resolved at -endEncoding, as a pass descriptor's
+ * resolveTexture is (-hakiosTakeResolves:). Colour 0, the one attachment GL's resolves name, is served. */
+- (void)setColorResolveTexture:(id)texture slice:(NSUInteger)slice depthPlane:(NSUInteger)plane level:(NSUInteger)level
+		       yInvert:(BOOL)yInvert atIndex:(NSUInteger)index
+{
+	if (index != 0 || slice != 0 || plane != 0 || _colorTexture == nil || (texture != nil && ![texture isKindOfClass:[HakiosMetalTexture class]])) {
+		hm_print("refused: a resolve into %s at colour %lu, slice %lu, plane %lu: colour 0 of a pass with one, into a texture of this "
+			 "device, is served; nothing is resolved\n", texture != nil ? class_getName(object_getClass(texture)) : "nothing",
+			 (unsigned long)index, (unsigned long)slice, (unsigned long)plane);
+		return;
+	}
+	if (yInvert) {
+		HM_ONCE("gles: a resolve with yInvert: resolved as it lies\n");
+	}
+	[_resolveTo[0] release];
+	_resolveTo[0] = [(HakiosMetalTexture *)texture retain];
+	if (_resolveFrom[0] == nil) _resolveFrom[0] = [_colorTexture retain];
+	_resolveLevel[0] = (unsigned)level;
+	_resolving[0] = texture != nil;
+}
+
+- (void)setColorResolveTexture:(id)texture slice:(NSUInteger)slice depthPlane:(NSUInteger)plane level:(NSUInteger)level atIndex:(NSUInteger)index
+{
+	[self setColorResolveTexture:texture slice:slice depthPlane:plane level:level yInvert:NO atIndex:index];
 }
 
 - (void)setTriangleFillMode:(MTLTriangleFillMode)fillMode
@@ -8112,7 +10667,10 @@ hm_tracing(void)
 		char args[1024] = "";
 		size_t size = sizeof(args) - 1;
 
-		on = sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && strstr(args, "metal_trace=1") != NULL;
+		/* (hakios) PosterBoard always: its home-screen preview's black blocks (WALLPAPER-umi.md) are traced from the
+		 * log alone, the boot-args having no room for metal_trace=1 */
+		on = (sysctlbyname("kern.bootargs", args, &size, NULL, 0) == 0 && strstr(args, "metal_trace=1") != NULL) ||
+		     strcmp(getprogname(), "PosterBoard") == 0;
 	}
 	return on == 1;
 }
@@ -8161,6 +10719,11 @@ hm_dump_config(const char *program, hakios_metal_buffer *const *buffers, const u
 			at += strlen("metal_dump=cfg:");
 			for (size_t i = 0; i + 1 < sizeof(name) && at[i] != '\0' && at[i] != ' '; i++) name[i] = at[i];
 			state = name[0] != '\0';
+			seen = [[NSMutableSet alloc] init];
+		} else if (strcmp(getprogname(), "PosterBoard") == 0) {
+			/* (hakios) PosterBoard's every program, as hm_tracing: the material passes' constants (edr_scale, the
+			 * colour ops' uniforms) beside the trace of its home-screen preview */
+			state = 1;
 			seen = [[NSMutableSet alloc] init];
 		}
 	}
@@ -8296,14 +10859,26 @@ hm_trace_draw(const void *which, const char *program, const struct hakios_metal_
 		hakios_metal_cb_refuse(cb, _refused);
 		return;
 	}
+	/* every resource the draw binds is in this command buffer (-isComplete) */
+	const uint64_t useSeq = [_commandBuffer hakiosUseSeq];
+	if (indexBuffer != nil && [indexBuffer respondsToSelector:@selector(hakiosUsedBy:)]) [(HakiosMetalBuffer *)indexBuffer hakiosUsedBy:useSeq];
+	if (indirectArgs != nil && [indirectArgs respondsToSelector:@selector(hakiosUsedBy:)]) [(HakiosMetalBuffer *)indirectArgs hakiosUsedBy:useSeq];
 	for (unsigned i = 0; i < _vsHighest; i++) {
 		vs[i] = _vsBuffers[i] != nil ? [_vsBuffers[i] hakiosBuffer] : NULL;
+		[_vsBuffers[i] hakiosUsedBy:useSeq];
 	}
 	for (unsigned i = 0; i < _fsHighest; i++) {
 		fs[i] = _fsBuffers[i] != nil ? [_fsBuffers[i] hakiosBuffer] : NULL;
+		[_fsBuffers[i] hakiosUsedBy:useSeq];
 	}
 	for (unsigned i = 0; i < _fsHighestTexture; i++) {
 		fsTex[i] = _fsTextures[i] != nil ? [_fsTextures[i] hakiosTexture] : NULL;
+		[_fsTextures[i] hakiosUsedBy:useSeq];
+		[_commandBuffer hakiosTrackTexture:_fsTextures[i] write:NO];
+		if (_fsTextures[i] != nil && hm_read_race_on() && [_fsTextures[i] iosurface] != NULL && ![_fsTextures[i] hakiosIsShadow] &&
+		    IOSurfaceGetPlaneCount([_fsTextures[i] iosurface]) <= 1) {
+			[_commandBuffer hakiosNoteRead:[_fsTextures[i] iosurface]];   /* flicker-diag */
+		}
 		if (_fsTextures[i] != nil && hm_timeline_on()) {
 			unsigned kind = [_fsTextures[i] hakiosStorageKind];
 			const unsigned origin = hakios_metal_texture_origin([_fsTextures[i] hakiosTexture]);
@@ -8330,6 +10905,8 @@ hm_trace_draw(const void *which, const char *program, const struct hakios_metal_
 	}
 	for (unsigned i = 0; i < _vsHighestTexture; i++) {
 		vsTex[i] = _vsTextures[i] != nil ? [_vsTextures[i] hakiosTexture] : NULL;
+		[_vsTextures[i] hakiosUsedBy:useSeq];
+		[_commandBuffer hakiosTrackTexture:_vsTextures[i] write:NO];
 	}
 	for (unsigned i = 0; i < _vsHighestSampler; i++) {
 		vsSamp[i] = _vsSamplers[i] != nil ? [_vsSamplers[i] hakiosSampler] : NULL;
@@ -8363,27 +10940,80 @@ hm_trace_draw(const void *which, const char *program, const struct hakios_metal_
 		}
 		hakios_metal_cb_set_indirect(cb, [(HakiosMetalBuffer *)indirectArgs hakiosBuffer], (uint64_t)indirectOffset);
 	}
+	/* OpenGL ES (hm_gl_mode): window coordinates for the renderer's blits, and GL's provoking vertex; the viewport (of
+	 * negative height for a GL framebuffer), the scissor and the front face are the renderer's, as it set them */
+	_pass.gl_mode = (_pass.gl_mode & HAKIOS_METAL_GL_DEPTH) | (_glNoTransform && _pass.gl_mode != 0 ? HAKIOS_METAL_GL_NO_XFORM : 0u) |
+			(_glProvokingLast ? HAKIOS_METAL_GL_PROVOKING_LAST : 0u);
+	if (_glNoTransform && (_pass.gl_mode & HAKIOS_METAL_GL_DEPTH) == 0) {
+		HM_ONCE("gles: -setViewportTransformEnabled:NO outside an OpenGL ES pass: drawn with the transform\n");
+	}
+	/* a yInverted attachment (hm_yinvert_size): the draw turned about the target's height, as Apple's GPU stores it --
+	 * the viewport (Metal's default, the whole target, when none was set) with its origin at H - y and its height
+	 * negated, the scissor's rows mirrored, and the front face the other way, since the turn mirrors every triangle */
+	struct hakios_metal_viewport viewport = _viewport;
+	struct hakios_metal_scissor scissor = _scissor;
+	BOOL hasViewport = _hasViewport;
+	const unsigned winding = _pass.winding;
+
+	if (_flipHeight != 0) {
+		if (!hasViewport) {
+			viewport = (struct hakios_metal_viewport){ 0.0, 0.0, (double)_flipWidth, (double)_flipHeight, 0.0, 1.0 };
+			hasViewport = YES;
+		}
+		viewport.y = (double)_flipHeight - viewport.y;
+		viewport.height = -viewport.height;
+		if (_hasScissor && scissor.width != 0) {
+			scissor.y = scissor.y + scissor.height <= _flipHeight ? _flipHeight - scissor.y - scissor.height : 0;
+		}
+		_pass.winding = winding ^ 1u;
+		if ((_pass.gl_mode & HAKIOS_METAL_GL_NO_XFORM) != 0) {
+			HM_ONCE("gles: a draw in window coordinates (-setViewportTransformEnabled:NO) into a yInverted attachment: its "
+				"positions are drawn as they lie, not turned\n");
+		}
+	}
 	const double coreBegan = hm_fps_on() ? hm_now() : 0;
+	if (hm_maps_trace() && [_colorTexture sampleCount] > 1 && [_colorTexture width] >= 1000) {
+		static unsigned said;
+		const unsigned n = __atomic_fetch_add(&said, 1, __ATOMIC_RELAXED);
+		if (n < 96) hm_print("maps-draw %u: %s colour %p load %u fetch %u depth %u/%u stencil %u refs %u/%u "
+				     "front compare/fail/zfail/pass %u/%u/%u/%u masks %x/%x back %u/%u/%u/%u masks %x/%x\n", n,
+				     hakios_metal_program_name(program), _colorTexture, _pass.load_action, hakios_metal_program_framebuffer_fetch(program),
+				     _pass.depth_compare, _pass.depth_write, _pass.stencil_state_set, _pass.stencil_front_reference, _pass.stencil_back_reference,
+				     _pass.stencil_front.compare, _pass.stencil_front.stencil_fail, _pass.stencil_front.depth_fail, _pass.stencil_front.pass,
+				     _pass.stencil_front.read_mask, _pass.stencil_front.write_mask,
+				     _pass.stencil_back.compare, _pass.stencil_back.stencil_fail, _pass.stencil_back.depth_fail, _pass.stencil_back.pass,
+				     _pass.stencil_back.read_mask, _pass.stencil_back.write_mask);
+	}
 	if (indexBuffer != nil) {
-		drawn = hakios_metal_cb_draw_indexed(cb, program, &_pass, _hasViewport ? &_viewport : NULL, _hasScissor ? &_scissor : NULL,
+		drawn = hakios_metal_cb_draw_indexed(cb, program, &_pass, hasViewport ? &viewport : NULL, _hasScissor ? &scissor : NULL,
 						     (unsigned)primitive, (unsigned)count, (unsigned)indexType, [(HakiosMetalBuffer *)indexBuffer hakiosBuffer],
 						     (uint64_t)indexOffset, (unsigned)instances, (int)baseVertex, (unsigned)baseInstance, vs, _vsOffsets, _vsHighest, fs,
 						     _fsOffsets, _fsHighest, fsTex, _fsHighestTexture, fsSamp, _fsHighestSampler);
 	} else {
-		drawn = hakios_metal_cb_draw3(cb, program, &_pass, _hasViewport ? &_viewport : NULL, _hasScissor ? &_scissor : NULL,
+		drawn = hakios_metal_cb_draw3(cb, program, &_pass, hasViewport ? &viewport : NULL, _hasScissor ? &scissor : NULL,
 					      (unsigned)primitive, (unsigned)start, (unsigned)count, (unsigned)instances, (unsigned)baseInstance,
 					      vs, _vsOffsets, _vsHighest, fs, _fsOffsets, _fsHighest, fsTex, _fsHighestTexture, fsSamp, _fsHighestSampler);
 	}
 	if (coreBegan != 0) hm_fps_core(hm_now() - coreBegan);
+	_pass.winding = winding;   /* (the encoder's own, for the next draw: the turn is per draw) */
 	if (drawn == 0 && _pass.visibility_mode != 0) {
 		[_visibilityCounted addIndex:(NSUInteger)(_pass.visibility_offset / 8)];
 	}
 	if (drawn != 0) {
-		hm_print("refused: a draw of %s, primitive %lu, %lu vertices from %lu, %lu instance(s), load %u store %u, %u vertex and %u fragment "
-			 "buffer slots: %s\n", hakios_metal_program_name([_pipeline hakiosProgram]), (unsigned long)primitive, (unsigned long)count,
-			 (unsigned long)start, (unsigned long)instances, _pass.load_action, _pass.store_action, _vsHighest, _fsHighest, hakios_metal_error());
+		/* one line the first time this program is refused for this reason (and when another reason follows it): the
+		 * count of the period is in the two-second "refused: total ..." line, never a line a draw */
+		if (hm_refusal_first([_pipeline hakiosProgram], hakios_metal_error())) {
+			hm_print("refused: a draw of %s, primitive %lu, %lu vertices from %lu, %lu instance(s), load %u store %u, %u vertex and %u fragment "
+				 "buffer slots: %s\n", hakios_metal_program_name([_pipeline hakiosProgram]), (unsigned long)primitive, (unsigned long)count,
+				 (unsigned long)start, (unsigned long)instances, _pass.load_action, _pass.store_action, _vsHighest, _fsHighest, hakios_metal_error());
+		}
 		hakios_metal_cb_refuse(cb, hakios_metal_error());
 		return;
+	}
+	if (_pass.depth != NULL || _pass.stencil != NULL) {
+		hakios_metal_texture *zs = _pass.depth != NULL ? _pass.depth : _pass.stencil;
+		HM_ONCE("depth-msaa: encoded sysmem depth/stencil draw, samples=%u, depth=%u, stencil=%u\n",
+			hakios_metal_texture_samples(zs), _pass.depth != NULL, _pass.stencil != NULL);
 	}
 	hm_spend_clears(&_pass);   /* the fills are recorded: the pass's later draws load what they left */
 }
@@ -8553,8 +11183,8 @@ hm_trace_draw(const void *which, const char *program, const struct hakios_metal_
  * in commit order, and every allocation is resident for its whole life. A barrier, a fence or a residency request asks
  * for an ordering that is already the only one there is.
  */
-- (void)updateFence:(id)fence afterStages:(MTLRenderStages)stages  { (void)fence; (void)stages; }
-- (void)waitForFence:(id)fence beforeStages:(MTLRenderStages)stages { (void)fence; (void)stages; }
+- (void)updateFence:(id)fence afterStages:(MTLRenderStages)stages  { (void)fence; (void)stages; [_commandBuffer hakiosRequireSync:HAKIOS_METAL_DRAIN_CPU_SYNC]; }
+- (void)waitForFence:(id)fence beforeStages:(MTLRenderStages)stages { (void)fence; (void)stages; [_commandBuffer hakiosRequireSync:HAKIOS_METAL_DRAIN_CPU_SYNC]; }
 - (void)memoryBarrierWithScope:(MTLBarrierScope)scope afterStages:(MTLRenderStages)after beforeStages:(MTLRenderStages)before
 {
 	(void)scope; (void)after; (void)before;
@@ -8607,8 +11237,9 @@ hm_trace_draw(const void *which, const char *program, const struct hakios_metal_
 		hakios_metal_cb_refuse([self hakiosCb], hakios_metal_error());
 	}
 	hm_spend_clears(&_pass);
-	/* the resolves, after the pass: each multisample attachment's samples into its resolveTexture, pixel for pixel (the
-	 * blit closes the pass first, so it reads what the draws wrote) */
+	/* the resolves, after the pass: each multisample attachment's samples into its resolveTexture, pixel for pixel. The
+	 * core hands a resolve that follows a tiled pass to the pass, which does it from its tiles (the samples never reach
+	 * memory: hakios_metal_cb_set_gmem_msaa_zs); otherwise the blit closes the pass first and reads what the draws wrote */
 	for (unsigned i = 0; i < 8; i++) {
 		if (!_resolving[i] || hakios_metal_cb_error([self hakiosCb])[0] != '\0') {
 			continue;
@@ -8618,6 +11249,8 @@ hm_trace_draw(const void *which, const char *program, const struct hakios_metal_
 					 (unsigned)[_resolveFrom[i] width], (unsigned)[_resolveFrom[i] height], 0) != 0) {
 			hm_print("refused: the resolve of colour attachment %u: %s\n", i, hakios_metal_error());
 			hakios_metal_cb_refuse([self hakiosCb], hakios_metal_error());
+		} else {
+			HM_ONCE("depth-msaa: encoded colour resolve, samples=%lu\n", (unsigned long)[_resolveFrom[i] sampleCount]);
 		}
 	}
 	/* the bindings were handed to hakios-metal at each draw, which holds them until the GPU is done */
@@ -8672,7 +11305,18 @@ HM_REFUSES_OUT_LOUD
 	struct hakios_metal_render_pass pass = _pass;
 	hakios_metal_cb *sub = hakios_metal_cb_new([(HakiosMetalCommandQueue *)[_commandBuffer commandQueue] hakiosQueue]);
 	if (sub != NULL) {
-		hakios_metal_cb_skip_refused(sub, !hm_strict());
+		hakios_metal_cb *parent = [_commandBuffer hakiosCommandBuffer];
+
+		/* everything the parent was given at creation -- GMEM/sysmem (metal_gmem=0 must reach these passes too: a new
+		 * buffer is GMEM-eligible by default, and GMEM hung the GPU on this phone), pass-wfi, the timing (the
+		 * sub-encoders record the passes Maps' summary names) and the refusal policy */
+		if (parent != NULL) {
+			hakios_metal_cb_inherit_settings(sub, parent);
+		} else {
+			hakios_metal_cb_skip_refused(sub, !hm_strict());
+			hakios_metal_cb_set_profile(sub, hm_fps_on());
+			hakios_metal_cb_set_profile_draws(sub, hm_fps_draws());
+		}
 	}
 
 	[_lock lock];
@@ -8689,8 +11333,13 @@ HM_REFUSES_OUT_LOUD
 	pass.depth_store_action = MTLStoreActionStore;
 	pass.stencil_store_action = MTLStoreActionStore;
 	for (unsigned i = 0; i < 7; i++) pass.more[i].store_action = MTLStoreActionStore;
-	return [[[HakiosMetalRenderCommandEncoder alloc] initWithHakiosCommandBuffer:_commandBuffer pass:&pass colorTexture:_colorTexture
-										  sub:sub] autorelease];
+	HakiosMetalRenderCommandEncoder *encoder = [[[HakiosMetalRenderCommandEncoder alloc] initWithHakiosCommandBuffer:_commandBuffer pass:&pass
+													     colorTexture:_colorTexture sub:sub] autorelease];
+	unsigned turned[2];
+
+	hm_yinvert_size(_descriptor, turned);   /* (each sub-encoder draws into the same attachment, turned as the pass is) */
+	[encoder hakiosSetYInvertWidth:turned[0] height:turned[1]];
+	return encoder;
 }
 
 /* every sub-encoder stores (above); a resolve asked for here is read from the descriptor's store action at the end */
@@ -8739,6 +11388,8 @@ HM_REFUSES_OUT_LOUD
 					 (unsigned)[c resolveLevel], 0, 0, (unsigned)[from width], (unsigned)[from height], 0) != 0) {
 			hm_print("refused: the resolve of colour attachment %lu: %s\n", (unsigned long)i, hakios_metal_error());
 			hakios_metal_cb_refuse(cb, hakios_metal_error());
+		} else {
+			HM_ONCE("depth-msaa: encoded parallel colour resolve, samples=%lu\n", (unsigned long)[from sampleCount]);
 		}
 	}
 	[super endEncoding];   /* MUST: the base class retains the command buffer and this is what releases it */
