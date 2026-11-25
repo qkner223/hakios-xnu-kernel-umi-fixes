@@ -473,7 +473,14 @@ void umi_touch_init(void)
     if (st.started || !PE_parse_boot_argn("umi_touch", &enabled, sizeof(enabled)) || enabled != 1) return;
     if (SecureDTLookupEntry(NULL, "/chosen", &chosen) != kSuccess ||
         SecureDTGetProperty(chosen, "hakios-board", &board, &size) != kSuccess ||
-        size != 4 || memcmp(board, "umi", 4)) { printf("UMI FTS: board mismatch\n"); return; }
+        size != 4 || memcmp(board, "umi", 4)) {
+        /*
+         * hakios: the loader's platforms[] holds only redwood, so cas (fb 0x9c000000 ==
+         * platform_umi.fb_base) falls back to it and the board name in the device tree is
+         * "redwood". umi_touch=1 in the command line is the authorisation to run anyway.
+         */
+        printf("UMI FTS: board is not \"umi\"; umi_touch=1 overrides\n");
+    }
     st.started = true;
     thread_t thread;
     kern_return_t kr = kernel_thread_start(umi_touch_thread, NULL, &thread);

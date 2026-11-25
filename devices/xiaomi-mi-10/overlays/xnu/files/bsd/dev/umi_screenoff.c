@@ -124,7 +124,9 @@ umi_pm_init(void)
 	pm_initialized = true; /* called once by framebuffer startup */
 	if (SecureDTLookupEntry(NULL, "/chosen", &chosen) != kSuccess ||
 	    SecureDTGetProperty(chosen, "hakios-board", &board, &size) != kSuccess ||
-	    size != 4 || memcmp(board, "umi", 4)) return;
+	    size != 4 || memcmp(board, "umi", 4)) {
+		/* hakios: see umi_touch.c -- screenoff_pm=/idle= are the explicit switches. */
+	}
 	PE_parse_boot_argn("screenoff_pm", &enabled, sizeof(enabled));
 	PE_parse_boot_argn("idle", &pm_idle, sizeof(pm_idle));
 	pm_idle = pm_idle == 1;

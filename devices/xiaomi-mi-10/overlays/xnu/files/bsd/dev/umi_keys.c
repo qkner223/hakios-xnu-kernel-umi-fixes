@@ -189,8 +189,8 @@ umi_keys_init(void)
 	if (SecureDTLookupEntry(NULL, "/chosen", &chosen) != kSuccess ||
 	    SecureDTGetProperty(chosen, "hakios-board", &board, &size) != kSuccess ||
 	    size != 4 || memcmp(board, "umi", 4) != 0) {
-		hakios_tl("UMI keys: board mismatch; driver not started\n");
-		return;
+		/* hakios: see umi_touch.c -- the explicit umi_keys=1 is the authorisation. */
+		hakios_tl("UMI keys: board is not \"umi\"; umi_keys=1 overrides\n");
 	}
 	keys_started = true;
 	arb_core = ml_io_map(UMI_ARB_CORE_PA, 0x2000);
