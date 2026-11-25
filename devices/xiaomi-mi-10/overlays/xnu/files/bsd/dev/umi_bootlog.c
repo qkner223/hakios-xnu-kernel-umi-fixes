@@ -699,6 +699,23 @@ hakios_bootlog_resume(uint64_t base, uint64_t phys, uint32_t width, uint32_t hei
 void
 hakios_bootlog_feed(const char *text, int len)
 {
+	/*
+	 * hakios: bootlog=0 on the command line keeps the kernel's boot log off the
+	 * panel entirely. The painter is meant to end at the first UI frame
+	 * (IOMobileFramebuffer::show() -> hakios_bootlog_stop()), but on this port
+	 * that frame never arrives, so the log keeps painting over the screen the
+	 * system is already composing.  One relaxed load per line.
+	 */
+	static int bootlog_off = -1;
+	if (__improbable(bootlog_off != 0)) {
+		if (bootlog_off < 0) {
+			int value = 1;
+			bootlog_off = (PE_parse_boot_argn("bootlog", &value, sizeof(value)) && value == 0);
+		}
+		if (bootlog_off != 0) {
+			return;
+		}
+	}
 	if (__improbable(text == NULL)) {
 		return;
 	}
